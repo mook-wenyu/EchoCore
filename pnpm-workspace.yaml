@@ -1,0 +1,6 @@
+packages:
+  - packages/*
+
+# pnpm 11：仅允许 esbuild 执行构建脚本（vitest 依赖其平台二进制）
+allowBuilds:
+  esbuild: true
