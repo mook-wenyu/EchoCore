@@ -17,6 +17,7 @@ import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
 import { MemoryInjector, type InjectorConfig } from './injector.js'
 import { MEMORY_TABLE, memoryDomainSpec } from './memory-domain.js'
 import { MemoryStore } from './store.js'
+import { registerMemoryTools } from './tools.js'
 
 export const name = 'memory'
 export const inject = ['storageDomain', 'llm']
@@ -52,6 +53,9 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
     injectBudgetChars: config.injectBudgetChars ?? 4096,
   }
   new MemoryInjector({ store, logger, config: injectorConfig }).install(ctx)
+
+  // 模型工具：recall / search / note / forget / audit / status
+  registerMemoryTools(ctx, { store })
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }

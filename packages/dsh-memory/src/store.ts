@@ -23,22 +23,27 @@ import {
   type MemoryEntry,
   type MemoryKind,
   type MemoryStats,
+  type MemoryStatus,
   type NewMemoryInput,
 } from './types.js'
 
 /** 检索选项 */
 export interface SearchOptions {
-  /** 查询文本（空串返回空结果，避免无差别注入） */
+  /** 查询文本（空串时若存在过滤条件则按创建时间倒序返回，否则空结果） */
   query: string
   /** workspace 过滤（跨会话聚合时限定当前会话所属 workspace） */
   workspace?: string
   /** 分类过滤（可选） */
   kind?: MemoryKind
+  /** 标签过滤（命中任一标签，可选） */
+  tag?: string
+  /** 状态过滤（可选；缺省仅 active，除非 includeArchived） */
+  status?: MemoryStatus
   /** 返回条数上限 */
   limit?: number
-  /** 最低综合分（默认 0.15） */
+  /** 最低综合分（默认 0.15；仅在有查询文本时生效） */
   minScore?: number
-  /** 是否包含归档条目（默认否） */
+  /** 是否包含归档条目（默认否；与 status 互斥时以 status 为准） */
   includeArchived?: boolean
 }
 
@@ -196,26 +201,47 @@ export class MemoryStore {
   }
 
   /**
-   * 评分检索（同步返回，按综合分降序）。
+   * 检索（同步返回）。
+   * - 有查询文本：综合评分降序（最低分过滤）；
+   * - 无查询文本但有过滤条件：按创建时间倒序（工具浏览场景）；
+   * - 两者皆无：空结果。
    * 命中条目异步回写 lastAccessAt/accessCount（尽力而为，失败仅告警）。
    */
   search(options: SearchOptions): MemoryEntry[] {
     const query = options.query.trim()
-    if (query === '') return []
     const limit = options.limit ?? 8
     const minScore = options.minScore ?? 0.15
     const now = this.now()
 
-    const scored: Array<{ entry: MemoryEntry; score: number }> = []
+    const matches: MemoryEntry[] = []
     for (const [, entry] of this.table.entries()) {
-      if (entry.status !== 'active' && !(options.includeArchived && entry.status === 'archived')) continue
+      if (options.status !== undefined) {
+        if (entry.status !== options.status) continue
+      } else if (entry.status !== 'active' && !(options.includeArchived && entry.status === 'archived')) {
+        continue
+      }
       if (options.kind !== undefined && entry.kind !== options.kind) continue
+      if (options.tag !== undefined && !entry.tags.includes(options.tag)) continue
       if (options.workspace !== undefined && entry.workspace !== options.workspace) continue
-      const score = scoreEntry(entry, query, now)
-      if (score >= minScore) scored.push({ entry, score })
+      matches.push(entry)
     }
-    scored.sort((a, b) => b.score - a.score)
-    const top = scored.slice(0, limit).map((item) => item.entry)
+
+    let top: MemoryEntry[]
+    if (query === '') {
+      if (options.kind === undefined && options.tag === undefined && options.status === undefined && options.workspace === undefined) {
+        return [] // 无查询也无过滤：不返回无差别结果
+      }
+      matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      top = matches.slice(0, limit)
+    } else {
+      const scored: Array<{ entry: MemoryEntry; score: number }> = []
+      for (const entry of matches) {
+        const score = scoreEntry(entry, query, now)
+        if (score >= minScore) scored.push({ entry, score })
+      }
+      scored.sort((a, b) => b.score - a.score)
+      top = scored.slice(0, limit).map((item) => item.entry)
+    }
 
     // 访问追踪：异步回写，不阻塞检索调用方（注入/工具热路径）
     for (const entry of top) {
