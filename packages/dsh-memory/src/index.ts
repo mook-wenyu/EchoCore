@@ -16,6 +16,7 @@ import { Config, type Config as ConfigType } from './config.js'
 import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
 import { MemoryInjector, type InjectorConfig } from './injector.js'
 import { MEMORY_TABLE, memoryDomainSpec } from './memory-domain.js'
+import { registerSnapshot } from './snapshot.js'
 import { MemoryStore } from './store.js'
 import { registerMemoryTools } from './tools.js'
 
@@ -56,6 +57,9 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
 
   // 模型工具：recall / search / note / forget / audit / status
   registerMemoryTools(ctx, { store })
+
+  // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
+  registerSnapshot(ctx, { store, logger })
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }
