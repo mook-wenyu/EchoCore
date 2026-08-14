@@ -1,0 +1,177 @@
+/**
+ * @module @echocore/dsh-memory/extract
+ *
+ * 记忆提取：对话事件 → 摘录文本 → LLM 结构化提取 → 记忆条目（解析）。
+ *
+ * 设计要点：
+ * - 提取调用复用会话当前模型路由（决策 D11）：从最新 request/header 解析，
+ *   回退 agent.options；不设置 GenerateOptions.purpose（该联合为封闭集合，
+ *   不冒充 compaction/session-title 语义）；
+ * - 输出要求严格 JSON，解析失败整批丢弃（fail-soft，绝不阻塞主循环）；
+ * - 摘录渲染跳过工具结果（噪声）与记忆插件自身的注入消息（防反馈循环）。
+ */
+
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import {
+  BlockAssembler,
+  createUserMessage,
+  type LlmRuntime,
+  type Message,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+
+import { MEMORY_PLUGIN_ID } from './constants.js'
+import type { ExtractedMemory, MemoryKind } from './types.js'
+
+/** 提取系统提示词（角色界定 + 分类规则 + 输出格式约束） */
+export const EXTRACTION_SYSTEM_PROMPT = `你是一个记忆提取器，为 AI 编码助手从对话摘录中提取值得长期记住的信息。
+
+分类规则：
+- fact:       客观事实（技术栈、路径、约束、版本、环境、API 行为）
+- preference: 用户偏好与工作习惯（"我不喜欢 X"、"总是用 Y"）
+- decision:   已做出的决定及其理由
+- todo:       尚未完成的明确任务（用户明确要求但未完成）
+- insight:    有价值的分析、洞察或结论
+
+提取规则：
+1. 只提取耐久信息；忽略寒暄、临时过程、工具输出细节与无关闲聊
+2. 保留精确标识符、路径、命令、数值、函数签名，不得改写
+3. 不编造原文没有的信息；信息不完整时如实摘录并标注不确定
+4. 同一摘录中重复信息合并为一条
+5. 重要性 importance（1-10）：该信息对未来决策的影响程度
+
+输出严格 JSON（不要输出任何其他文字）：
+{"memories":[{"kind":"fact","content":"...","importance":7,"tags":["标签"]}]}
+没有可提取内容时输出：{"memories":[]}`
+
+/** 提取用户消息尾部指令 */
+const EXTRACTION_USER_RULES = `
+请依据上述规则从对话摘录中提取记忆，只输出 JSON。`
+
+/** 有效分类集合（解析校验用） */
+const MEMORY_KINDS = new Set<string>(['fact', 'preference', 'decision', 'todo', 'insight'])
+
+/** 从内容块中拼接纯文本（只取 text 块） */
+function textOf(blocks: ReadonlyArray<{ type: string; text?: string }>): string {
+  return blocks
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text as string)
+    .join('\n')
+}
+
+/**
+ * 从事件列表渲染提取用的摘录文本。
+ * 只取 user/message 与 assistant/message 的文本块；跳过工具结果（噪声）
+ * 与记忆插件自身的注入消息（防"从注入内容再提取记忆"的反馈循环）。
+ */
+export function renderEventsText(events: readonly SessionEvent[]): string {
+  const parts: string[] = []
+  for (const event of events) {
+    if (event.type === 'user/message') {
+      const source = event.data.source
+      if (source.kind === 'plugin' && source.plugin === MEMORY_PLUGIN_ID) continue
+      parts.push(textOf(event.data.content))
+    } else if (event.type === 'assistant/message') {
+      parts.push(textOf(event.data.message.content))
+    }
+  }
+  return parts.filter((part) => part.length > 0).join('\n')
+}
+
+/**
+ * 解析 LLM 结构化输出为记忆列表。
+ * 严格模式：非 JSON / 形状不符 / 分类非法 / 内容为空的条目一律丢弃；
+ * 返回 [] 而非抛错（调用方据此判定"无可提取"）。
+ */
+export function parseExtractionOutput(text: string): ExtractedMemory[] {
+  const match = text.match(/\{[\s\S]*\}/)
+  if (!match) return []
+  let raw: unknown
+  try {
+    raw = JSON.parse(match[0])
+  } catch {
+    return []
+  }
+  if (typeof raw !== 'object' || raw === null || !Array.isArray((raw as { memories?: unknown }).memories)) {
+    return []
+  }
+  const result: ExtractedMemory[] = []
+  for (const item of (raw as { memories: unknown[] }).memories) {
+    if (typeof item !== 'object' || item === null) continue
+    const record = item as Record<string, unknown>
+    if (typeof record.kind !== 'string' || !MEMORY_KINDS.has(record.kind)) continue
+    if (typeof record.content !== 'string' || record.content.trim() === '') continue
+    const importance =
+      typeof record.importance === 'number' && Number.isFinite(record.importance)
+        ? Math.min(Math.max(Math.round(record.importance), 0), 10)
+        : undefined
+    const tags = Array.isArray(record.tags) ? record.tags.filter((tag): tag is string => typeof tag === 'string') : undefined
+    result.push({
+      kind: record.kind as MemoryKind,
+      content: record.content.trim(),
+      importance,
+      tags,
+    })
+  }
+  return result
+}
+
+/**
+ * 解析会话的当前模型路由：最新 request/header → agent.options 回退。
+ * 无路由返回 undefined（调用方跳过提取并告警）。
+ */
+export function resolveRoute(session: Session, agent: Agent | undefined): { provider: string; model: string } | undefined {
+  const header = [...session.events].reverse().find((event) => event.type === 'request/header')
+  if (header !== undefined) {
+    const config = header.data.header.config
+    if (config.provider && config.model) return { provider: config.provider, model: config.model }
+  }
+  if (agent !== undefined && agent.options.provider && agent.options.model) {
+    return { provider: agent.options.provider, model: agent.options.model }
+  }
+  return undefined
+}
+
+/** 一次提取调用所需的依赖与参数（便于测试注入假 llm） */
+export interface ExtractionCallOptions {
+  llm: Pick<LlmRuntime, 'stream'>
+  provider: string
+  model: string
+  maxTokens: number
+  signal?: AbortSignal
+}
+
+/**
+ * 执行一次提取调用：构建消息 → 流式调用 → 组装 → 解析。
+ * 流以非正常 finish（aborted/error）结束时抛错，由调用方收容重试。
+ */
+export async function runExtraction(options: ExtractionCallOptions, transcript: string): Promise<ExtractedMemory[]> {
+  const userText = `以下是需要提取记忆的对话摘录：\n\n${transcript}\n\n${EXTRACTION_USER_RULES}`
+  const userMessage: Message = createUserMessage({
+    content: [{ type: 'text', text: userText }],
+    source: { kind: 'plugin', plugin: MEMORY_PLUGIN_ID },
+  })
+
+  const assembler = new BlockAssembler()
+  for await (const chunk of options.llm.stream({
+    provider: options.provider,
+    model: options.model,
+    system: EXTRACTION_SYSTEM_PROMPT,
+    messages: [userMessage],
+    maxTokens: options.maxTokens,
+    signal: options.signal,
+  })) {
+    assembler.push(chunk)
+  }
+  const finishKind = assembler.finish.kind
+  if (finishKind === 'aborted' || finishKind === 'error') {
+    throw new Error(`记忆提取调用未正常完成（${finishKind} finish）`)
+  }
+  const text = assembler
+    .blocks()
+    .filter((block) => block.type === 'text')
+    .map((block) => (block as { text: string }).text)
+    .join('')
+  return parseExtractionOutput(text)
+}

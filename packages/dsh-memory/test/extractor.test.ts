@@ -1,0 +1,240 @@
+/**
+ * 提取器编排单元测试：双通道触发、水位推进、阈值累计、失败重试、开关。
+ */
+
+import { describe, expect, it } from 'vitest'
+import type { Context } from '@deepseek-ai/cordis'
+import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+
+import { MemoryExtractor, type ExtractorConfig } from '../src/extractor.js'
+import { MemoryStore } from '../src/store.js'
+import { FakeTable, settle } from './helpers.js'
+
+/** 假 ctx：捕获事件监听器，供测试直接驱动 */
+class FakeCtx {
+  readonly listeners = new Map<string, (session: Session, event: SessionEvent) => void>()
+  on(type: string, listener: (session: Session, event: SessionEvent) => void): void {
+    this.listeners.set(type, listener)
+  }
+  get(): undefined {
+    return undefined
+  }
+}
+
+/** 假 llm：记录调用次数与摘录文本，按设定返回 JSON 或抛错 */
+class FakeLlm {
+  calls = 0
+  lastTranscript = ''
+  constructor(private readonly output: string | Error) {}
+  async *stream(options: Record<string, unknown>): AsyncIterable<StreamChunk> {
+    this.calls++
+    const transcript = (options.messages as Array<{ content: Array<{ text: string }> }>)[0]?.content[0]?.text ?? ''
+    this.lastTranscript = transcript
+    if (this.output instanceof Error) throw this.output
+    yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+    yield { type: 'text-delta', index: 0, text: this.output } as StreamChunk
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: this.output } } as StreamChunk
+    yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+  }
+}
+
+/** 构造会话（header 带 cwd，events 可填充） */
+function makeSession(id: string, events: SessionEvent[]): Session {
+  return {
+    id,
+    header: { version: 0, id, createdAt: 1, cwd: 'D:/workspace' },
+    events,
+  } as unknown as Session
+}
+
+/** 构造 user/message 事件 */
+function userEvent(seq: number, text: string): SessionEvent {
+  return {
+    type: 'user/message',
+    seq,
+    time: seq,
+    data: { id: `u${seq}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } },
+  } as SessionEvent
+}
+
+/** 构造 assistant/message 事件 */
+function assistantEvent(seq: number, text: string): SessionEvent {
+  return {
+    type: 'assistant/message',
+    seq,
+    time: seq,
+    data: {
+      turn: 1,
+      step: 1,
+      message: { id: `a${seq}`, role: 'assistant', content: [{ type: 'text', text }], source: { kind: 'model', provider: 'p', model: 'm' } },
+    },
+  } as SessionEvent
+}
+
+/** 构造 request/header 事件（提取路由来源） */
+function headerEvent(seq: number): SessionEvent {
+  return {
+    type: 'request/header',
+    seq,
+    time: seq,
+    data: { header: { config: { provider: 'deepseek', model: 'm' } }, reason: 'initial' },
+  } as SessionEvent
+}
+
+/** 构造 turn/end 事件 */
+function turnEndEvent(seq: number, turn: number): SessionEvent {
+  return { type: 'turn/end', seq, time: seq, data: { turn, reason: { kind: 'complete' } } } as SessionEvent
+}
+
+/** 构造 compaction/summary 事件 */
+function compactionSummaryEvent(seq: number, shadowedSeqs: number[]): SessionEvent {
+  return {
+    type: 'compaction/summary',
+    seq,
+    time: seq,
+    data: {
+      compactionId: `c${seq}`,
+      summary: [{ type: 'text', text: '摘要' }],
+      shadowedRange: { start: shadowedSeqs[0] ?? 0, end: shadowedSeqs.at(-1) ?? 0 },
+      shadowedSeqs,
+      shadowedTokenCount: 0,
+      provider: 'deepseek',
+      model: 'm',
+      rawOutput: [],
+      llmStreamCall: true,
+    },
+  } as SessionEvent
+}
+
+/** 配置工厂 */
+function config(overrides: Partial<ExtractorConfig> = {}): ExtractorConfig {
+  return { enableExtractor: true, minExtractChars: 100, extractMaxTokens: 100, ...overrides }
+}
+
+/** 组装被测对象 */
+function setup(options: { output?: string | Error; config?: ExtractorConfig } = {}) {
+  const ctx = new FakeCtx()
+  const table = new FakeTable()
+  const store = new MemoryStore(table)
+  const llm = new FakeLlm(options.output ?? '{"memories":[{"kind":"fact","content":"项目使用 pnpm","importance":7}]}')
+  const logger = { warn: () => {}, info: () => {} }
+  const extractor = new MemoryExtractor({ store, llm, logger, config: config(options.config) })
+  extractor.install(ctx as unknown as Context)
+  const listener = ctx.listeners.get('session/event')
+  if (listener === undefined) throw new Error('session/event 监听未注册')
+  return { ctx, store, llm, listener }
+}
+
+describe('MemoryExtractor 通道 B（增量）', () => {
+  it('低于阈值时累计不调用 LLM，达到阈值才提取', async () => {
+    const { store, llm, listener } = setup()
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '短消息'), turnEndEvent(3, 1)])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(0) // 文本不足阈值
+
+    session.events.push(userEvent(4, '这是一条足够长的消息内容用来凑足最小提取字符阈值'.repeat(6)), turnEndEvent(5, 2))
+    listener(session, session.events[3] as SessionEvent)
+    listener(session, session.events[4] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(1)
+    expect(store.stats().total).toBe(1)
+    const entry = store.listBySession('s1')[0]
+    expect(entry?.content).toBe('项目使用 pnpm')
+    expect(entry?.source.sessionId).toBe('s1')
+  })
+
+  it('提取调用文本包含累计的全部消息', async () => {
+    const { llm, listener } = setup()
+    const session = makeSession('s1', [
+      headerEvent(1),
+      userEvent(2, '第一轮：用户提出需求甲'.repeat(15)),
+      turnEndEvent(3, 1),
+    ])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(llm.lastTranscript).toContain('第一轮')
+  })
+})
+
+describe('MemoryExtractor 通道 A（压缩遮蔽）', () => {
+  it('立即提取被遮蔽跨度（不受阈值限制）', async () => {
+    const { store, llm, listener } = setup()
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '被遮蔽的事实：使用 vite'), assistantEvent(3, '确认')])
+    // 模拟：压缩遮蔽 [2,3] 区间
+    session.events.push(compactionSummaryEvent(4, [2, 3]))
+    listener(session, session.events[3] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(1)
+    expect(store.stats().total).toBe(1)
+    const entry = store.listBySession('s1')[0]
+    expect(entry?.source.eventSeqs).toEqual([2, 3])
+  })
+
+  it('已处理过的序号不会重复提取（水位防护）', async () => {
+    const { store, llm, listener } = setup()
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '甲'.repeat(200)), turnEndEvent(3, 1)])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(1)
+    // 再次触发压缩遮蔽同一跨度：不重复提取
+    session.events.push(compactionSummaryEvent(4, [1, 2, 3]))
+    listener(session, session.events[3] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(1)
+  })
+})
+
+describe('MemoryExtractor 失败与开关', () => {
+  it('LLM 失败不推进水位：下次触发重试成功', async () => {
+    const failing = new FakeLlm(new Error('模型不可用'))
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    const logger = { warn: () => {}, info: () => {} }
+    const extractor = new MemoryExtractor({ store, llm: failing, logger, config: config() })
+    extractor.install(ctx as unknown as Context)
+    const listener = ctx.listeners.get('session/event')
+    if (listener === undefined) throw new Error('监听未注册')
+
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '乙'.repeat(200)), turnEndEvent(3, 1)])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(failing.calls).toBe(1)
+    expect(store.stats().total).toBe(0)
+
+    // 换健康 llm 后重试：同一批次应被重新提取
+    const healthy = new FakeLlm('{"memories":[{"kind":"fact","content":"重试成功"}]}')
+    const extractor2 = new MemoryExtractor({ store, llm: healthy, logger, config: config() })
+    const ctx2 = new FakeCtx()
+    extractor2.install(ctx2 as unknown as Context)
+    const listener2 = ctx2.listeners.get('session/event')
+    if (listener2 === undefined) throw new Error('监听未注册')
+    listener2(session, turnEndEvent(5, 2))
+    await settle()
+    expect(healthy.calls).toBe(1)
+    expect(store.stats().total).toBe(1)
+  })
+
+  it('enableExtractor=false 时完全静默', async () => {
+    const { llm, listener } = setup({ config: { enableExtractor: false, minExtractChars: 100, extractMaxTokens: 100 } })
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '丙'.repeat(300)), turnEndEvent(3, 1)])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(0)
+  })
+
+  it('无路由时跳过提取并告警', async () => {
+    const { llm, listener } = setup()
+    const session = makeSession('s1', [userEvent(1, '丁'.repeat(300)), turnEndEvent(2, 1)])
+    listener(session, session.events[0] as SessionEvent)
+    listener(session, session.events[1] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(0)
+  })
+})

@@ -4,47 +4,10 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 
-import { MemoryStore, type SearchOptions } from '../src/store.ts'
-import type { MemoryEntry, NewMemoryInput } from '../src/types.ts'
-
-/** 内存假表：实现 KvTable 结构契约（update 对缺失键抛 missing-key，与领域层一致） */
-class FakeTable implements KvTable<string, MemoryEntry> {
-  private readonly map = new Map<string, MemoryEntry>()
-
-  get(key: string): MemoryEntry | undefined {
-    return this.map.get(key)
-  }
-
-  entries(): IterableIterator<[string, MemoryEntry]> {
-    return this.map.entries()
-  }
-
-  keys(): IterableIterator<string> {
-    return this.map.keys()
-  }
-
-  get size(): number {
-    return this.map.size
-  }
-
-  async put(key: string, value: MemoryEntry): Promise<void> {
-    this.map.set(key, value)
-  }
-
-  async delete(key: string): Promise<boolean> {
-    return this.map.delete(key)
-  }
-
-  async update(key: string, fn: (current: MemoryEntry) => MemoryEntry): Promise<MemoryEntry> {
-    const current = this.map.get(key)
-    if (current === undefined) throw new Error('missing-key')
-    const next = fn(current)
-    this.map.set(key, next)
-    return next
-  }
-}
+import { MemoryStore, type SearchOptions } from '../src/store.js'
+import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
+import { FakeTable, settle } from './helpers.js'
 
 /** 固定时钟：store 内部全部时间戳由此产生，断言确定 */
 const FIXED_NOW = Date.parse('2026-01-15T00:00:00.000Z')
@@ -66,8 +29,8 @@ function input(overrides: Partial<NewMemoryInput> = {}): NewMemoryInput {
 }
 
 /** 等待 fire-and-forget 的访问追踪写回落地 */
-async function settle(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0))
+async function settleAccessWrites(): Promise<void> {
+  await settle()
 }
 
 describe('MemoryStore.create', () => {
@@ -170,7 +133,7 @@ describe('MemoryStore.search', () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
     const { entry } = await store.create(input())
     store.search({ query: 'pnpm' })
-    await settle()
+    await settleAccessWrites()
     const after = store.getById(entry.id)
     expect(after?.accessCount).toBe(1)
     expect(after?.lastAccessAt).toBe(new Date(FIXED_NOW).toISOString())
