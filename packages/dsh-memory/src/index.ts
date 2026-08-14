@@ -14,6 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 
 import { Config, type Config as ConfigType } from './config.js'
 import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
+import { registerMemoryRpc } from './host-rpc.js'
 import { MemoryInjector, type InjectorConfig } from './injector.js'
 import { MEMORY_TABLE, memoryDomainSpec } from './memory-domain.js'
 import { registerSnapshot } from './snapshot.js'
@@ -60,6 +61,9 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
 
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
   registerSnapshot(ctx, { store, logger })
+
+  // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面
+  registerMemoryRpc(ctx, store, logger)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }

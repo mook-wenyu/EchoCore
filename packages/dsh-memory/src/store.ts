@@ -268,6 +268,17 @@ export class MemoryStore {
     return result
   }
 
+  /** 最近条目浏览（面板场景）：按创建时间倒序，可选状态过滤 */
+  listRecent(limit: number, status?: MemoryStatus): MemoryEntry[] {
+    const result: MemoryEntry[] = []
+    for (const [, entry] of this.table.entries()) {
+      if (status !== undefined && entry.status !== status) continue
+      result.push(entry)
+    }
+    result.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    return result.slice(0, limit)
+  }
+
   /** 统计快照 */
   stats(): MemoryStats {
     const byKind: Record<MemoryKind, number> = { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 }
