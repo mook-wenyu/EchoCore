@@ -139,6 +139,15 @@ describe('MemoryStore.search', () => {
     expect(after?.lastAccessAt).toBe(new Date(FIXED_NOW).toISOString())
   })
 
+  it('workspace 过滤：跨项目记忆不串入', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    await store.create(input({ content: '本项目的 pnpm 配置' }))
+    await store.create(input({ workspace: 'D:/other', content: '他项目的 pnpm 配置' }))
+    const results = store.search({ query: 'pnpm', workspace: 'D:/workspace' })
+    expect(results).toHaveLength(1)
+    expect(results[0]?.workspace).toBe('D:/workspace')
+  })
+
   it('低于最低分的弱命中被过滤', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
     await store.create(input({ content: 'pnpm workspace', importance: 0 }))

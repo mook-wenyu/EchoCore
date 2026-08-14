@@ -14,6 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 
 import { Config, type Config as ConfigType } from './config.js'
 import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
+import { MemoryInjector, type InjectorConfig } from './injector.js'
 import { MEMORY_TABLE, memoryDomainSpec } from './memory-domain.js'
 import { MemoryStore } from './store.js'
 
@@ -42,6 +43,15 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
     extractMaxTokens: config.extractMaxTokens ?? 2048,
   }
   new MemoryExtractor({ store, llm: ctx.llm, logger, config: extractorConfig }).install(ctx)
+
+  // 注入器：pre-step 自动注入相关记忆（带预算、去重与溯源标记）
+  const injectorConfig: InjectorConfig = {
+    enableAutoInject: config.enableAutoInject ?? true,
+    topK: config.topK ?? 8,
+    minScore: config.minScore ?? 0.15,
+    injectBudgetChars: config.injectBudgetChars ?? 4096,
+  }
+  new MemoryInjector({ store, logger, config: injectorConfig }).install(ctx)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }

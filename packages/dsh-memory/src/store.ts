@@ -30,6 +30,8 @@ import {
 export interface SearchOptions {
   /** 查询文本（空串返回空结果，避免无差别注入） */
   query: string
+  /** workspace 过滤（跨会话聚合时限定当前会话所属 workspace） */
+  workspace?: string
   /** 分类过滤（可选） */
   kind?: MemoryKind
   /** 返回条数上限 */
@@ -208,6 +210,7 @@ export class MemoryStore {
     for (const [, entry] of this.table.entries()) {
       if (entry.status !== 'active' && !(options.includeArchived && entry.status === 'archived')) continue
       if (options.kind !== undefined && entry.kind !== options.kind) continue
+      if (options.workspace !== undefined && entry.workspace !== options.workspace) continue
       const score = scoreEntry(entry, query, now)
       if (score >= minScore) scored.push({ entry, score })
     }
