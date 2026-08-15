@@ -169,6 +169,94 @@ describe('MemoryMaintenance 重复合并（任务 a）', () => {
     expect(store.getById('b')?.status).toBe('active')
     expect(store.stats().active).toBe(2)
   })
+
+  it('与 extractor 提取并发写入：无交错损坏，合并与新写入都正确（P1-2 交叠补盲）', async () => {
+    const { table, store, sessionEvent, maintenance } = setup()
+    // 预置一对近似重复（maintenance 合并目标；时间差明确合并方向）
+    const older = makeEntry({ id: 'old', content: 'keep all logs for compliance and audit', createdAt: new Date(NOW - 2 * MS_PER_DAY).toISOString() })
+    const newer = makeEntry({ id: 'new', content: 'keep all logs for compliance and audit forever' })
+    await table.put(older.id, older)
+    await table.put(newer.id, newer)
+    activate(sessionEvent, makeSession('s1'))
+
+    // 模拟 extractor 批次并发写入（同一 store；内容互不近似，不与维护窗口配对）
+    const concurrentWrites = Promise.all([
+      store.create({
+        workspace: 'D:/ws',
+        sessionId: 's1',
+        kind: 'fact',
+        content: 'pnpm workspace 管理多包依赖',
+        source: { sessionId: 's1', eventSeqs: [9], excerpt: '摘录' },
+        by: 'extractor',
+      }),
+      store.create({
+        workspace: 'D:/ws',
+        sessionId: 's1',
+        kind: 'fact',
+        content: 'vitest 配置测试环境',
+        source: { sessionId: 's1', eventSeqs: [10], excerpt: '摘录' },
+        by: 'extractor',
+      }),
+    ])
+
+    // maintenance 与 extractor 写入并发执行（Promise.all 交错调度）
+    const [results, ,] = await Promise.all([concurrentWrites, maintenance.runOnce()])
+    const created = results.map((r) => r.entry.id)
+    expect(created).toHaveLength(2)
+    // 合并正常完成：旧者归档、新者保留
+    expect(store.getById('old')?.status).toBe('archived')
+    expect(store.getById('new')?.status).toBe('active')
+    // 并发写入无丢失、无串写（两条独立事实都在且未被合并误伤）
+    for (const id of created) {
+      expect(store.getById(id)?.status).toBe('active')
+    }
+    expect(store.stats().total).toBe(4)
+  })
+
+  it('create supersede 优先于维护合并：被覆盖条目不参与配对（P1-2 交错语义）', async () => {
+    const { table, store, sessionEvent, maintenance } = setup()
+    // 预置一条旧表述；随后顺序创建两条互为近似重复（Jaccant 0.889 ≥ 0.85）
+    const old = makeEntry({ id: 'old', content: 'keep all logs for compliance and audit', createdAt: new Date(NOW - 2 * MS_PER_DAY).toISOString() })
+    await table.put(old.id, old)
+    activate(sessionEvent, makeSession('s1'))
+
+    // 顺序创建（真实提取批次语义：串行 await）——create2 完成 supersede create1
+    const r1 = await store.create({
+      workspace: 'D:/ws', sessionId: 's1', kind: 'fact',
+      content: '并发写入的独立事实',
+      source: { sessionId: 's1', eventSeqs: [9], excerpt: '摘录' }, by: 'extractor',
+    })
+    const r2 = await store.create({
+      workspace: 'D:/ws', sessionId: 's1', kind: 'fact',
+      content: '并发写入的独立事实二',
+      source: { sessionId: 's1', eventSeqs: [10], excerpt: '摘录' }, by: 'extractor',
+    })
+    // create2 已 supersede create1（检索排除 create1）；维护不得再合并/归档
+    // "现行表述"（create2）——否则两个都从检索消失。注意 create 返回值是
+    // 本地构造快照，supersede 回写在 table 上——须重读断言。
+    expect(store.getById(r1.entry.id)?.supersededBy).toBeDefined()
+    expect(store.getById(r2.entry.id)?.supersededBy).toBeUndefined()
+    await maintenance.runOnce()
+    expect(store.getById(r2.entry.id)?.status).toBe('active')
+    // 检索仍能命中现行表述（未被维护误归档）
+    const hits = store.search({ query: '独立事实', kind: 'fact' })
+    expect(hits.map((e) => e.id)).toContain(r2.entry.id)
+    expect(hits.map((e) => e.id)).not.toContain(r1.entry.id)
+  })
+
+  it('同刻 createdAt 的合并方向确定：归档 id 小者（tie-breaker，不依赖扫描序，P1-2 回归）', async () => {
+    const { table, store, sessionEvent, maintenance } = setup()
+    // 同刻创建（并发写入/同批导入）：合并方向必须确定——保留 id 大者、归档 id 小者
+    const small = makeEntry({ id: 'aaa', content: 'keep all logs for compliance and audit' })
+    const large = makeEntry({ id: 'zzz', content: 'keep all logs for compliance and audit forever' })
+    await table.put(small.id, small)
+    await table.put(large.id, large)
+    activate(sessionEvent, makeSession('s1'))
+    await maintenance.runOnce()
+    // 'zzz' > 'aaa' → zzz 保留、aaa 归档（不依赖窗口扫描顺序）
+    expect(store.getById('aaa')?.status).toBe('archived')
+    expect(store.getById('zzz')?.status).toBe('active')
+  })
 })
 
 describe('MemoryMaintenance 过期降级（任务 c）', () => {

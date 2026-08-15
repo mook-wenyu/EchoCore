@@ -441,4 +441,51 @@ describe('提取器串行链并发（O7 竞态防回归）', () => {
     expect(transcripts[1]).not.toContain('第一条记忆文本')
     expect(store.stats().total).toBe(0) // 摘录返回空 memories，无写入
   })
+
+  it('dispose 时链上另有批次：flush 排队其后执行，串行不交错（P1-2 补盲）', async () => {
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    // 闸门式假 llm：第一批阻塞到 release，制造"dispose 时批次仍在链上"的窗口
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const transcripts: string[] = []
+    const llm = {
+      async *stream(options: Record<string, unknown>): AsyncIterable<StreamChunk> {
+        const transcript = (options.messages as Array<{ content: Array<{ text: string }> }>)[0]?.content[0]?.text ?? ''
+        transcripts.push(transcript)
+        await gate
+        yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+        yield { type: 'text-delta', index: 0, text: '{"memories":[{"kind":"fact","content":"提取的事实"}]}' } as StreamChunk
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: '{"memories":[{"kind":"fact","content":"提取的事实"}]}' } } as StreamChunk
+        yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+      },
+    }
+    const extractor = new MemoryExtractor({
+      store,
+      llm,
+      logger: { warn: () => {}, info: () => {} },
+      config: config({ minExtractChars: 5 }),
+    })
+    extractor.install(ctx as unknown as Context)
+    const listener = ctx.listener('session/event')
+    const dispose = ctx.listener('agent/disposed')
+    if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
+
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '待提取文本'), turnEndEvent(10, 1)])
+    listener(session, session.events[2] as SessionEvent) // turnEnd 触发批次入链（阻塞中）
+    await settle()
+    // dispose 在批次未完成时到达：flush 应排队在链后，不打断在途批次
+    dispose(disposePayload('s1', session))
+    await settle()
+    expect(store.stats().total).toBe(0) // 批次仍阻塞，未写入
+    release()
+    await settle()
+    // 批次完成后 flush 排队执行：无异常、提取已落库、清理幂等
+    expect(store.stats().total).toBe(1)
+    dispose(disposePayload('s1', session))
+    await settle()
+    expect(transcripts.length).toBe(1) // flush 不重复提取
+  })
 })

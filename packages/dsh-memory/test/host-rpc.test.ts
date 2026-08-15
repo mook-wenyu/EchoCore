@@ -154,4 +154,16 @@ describe('memory RPC 载荷校验', () => {
       expect(result.ok, `${endpoint} ${JSON.stringify(payload)}`).toBe(false)
     }
   })
+
+  it('存储真实异常经 wrapper 转 internal 并透传消息（P1-2 错误传播语义）', async () => {
+    const { store, handler, table } = setup()
+    const id = await seed(store)
+    // 注入一次底层写入失败（模拟磁盘 IO 错误），archive 应返回 internal 而非上抛
+    table.failNextWrite(new Error('磁盘写入失败'))
+    const result = await handler('archive', { id })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.code).toBe('internal')
+    expect(result.error.message).toContain('磁盘写入失败')
+  })
 })

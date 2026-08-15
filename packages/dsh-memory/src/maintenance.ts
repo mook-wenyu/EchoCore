@@ -209,11 +209,26 @@ export class MemoryMaintenance {
         const b = this.deps.store.getById(wb.id)
         if (a === undefined || b === undefined) continue
         if (a.status !== 'active' || b.status !== 'active') continue
+        // 已被 supersede 标记的条目不再参与合并配对（P1-2 交错补盲）：窗口快照
+        // 可能在 create 的 supersede 回写前取得，重读时感知——被覆盖条目已从
+        // 检索隐藏，再合并会与 supersede 语义打架（可能归档"现行表述"）。
+        if (a.supersededBy !== undefined || b.supersededBy !== undefined) continue
         if (a.workspace !== b.workspace || a.kind !== b.kind) continue
         if (Math.abs(a.importance - b.importance) > MAX_IMPORTANCE_DIFF) continue
         if (jaccardOf(a.content, b.content) < JACCARD_THRESHOLD) continue
         try {
-          const newer = a.createdAt >= b.createdAt ? a : b
+          // 新者判定：createdAt 更大者为新；同刻（并发写入/同批导入）时按 id
+          // 字典序大者（与 listRecent 同刻展示序一致）——`>=` 会把先扫描者
+          // 误判为新者（窗口序由 id 决定，扫描序与时间序无关，曾致归档新者，
+          // P1-2 交叠补盲发现）。tie-breaker 保证合并方向确定性，不依赖扫描序。
+          const newer =
+            a.createdAt === b.createdAt
+              ? a.id >= b.id
+                ? a
+                : b
+              : a.createdAt > b.createdAt
+                ? a
+                : b
           const older = newer.id === a.id ? b : a
           await this.mergePair(newer, older)
           this.deps.logger.info(`[dsh-memory] 重复合并：${older.id} → ${newer.id}`)
