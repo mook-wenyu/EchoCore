@@ -6,24 +6,24 @@
  * 保证可独立单测、可被存储/提取/注入各模块共享。
  */
 
-/** 记忆条目分类（实现计划 D9：五类） */
-export type MemoryKind = 'fact' | 'preference' | 'decision' | 'todo' | 'insight'
+/** 记忆条目分类（实现计划 D9：五类；枚举单源——schema 与工具从本常量派生） */
+export const MEMORY_KINDS = ['fact', 'preference', 'decision', 'todo', 'insight'] as const
+export type MemoryKind = (typeof MEMORY_KINDS)[number]
 
-/** 记忆条目生命周期状态 */
-export type MemoryStatus = 'active' | 'archived' | 'deleted'
+/** 记忆条目生命周期状态（枚举单源；deleted 已随 D-D 裁决移除——物理删除不留状态） */
+export const MEMORY_STATUSES = ['active', 'archived'] as const
+export type MemoryStatus = (typeof MEMORY_STATUSES)[number]
 
-/** 审计动作：记录记忆条目的每一次变更（访问仅计数值 lastAccessAt/accessCount，不入审计） */
-export type AuditAction =
-  | 'create' // 新建
-  | 'update' // 内容/属性更新
-  | 'merge' // 与既有条目合并（去重）
-  | 'archive' // 归档（软删除）
-  | 'restore' // 恢复
-  | 'delete' // 物理删除
-  | 'inject' // 注入进模型上下文
+/**
+ * 审计动作（枚举单源）：记录记忆条目的每一次变更（访问仅计数值 lastAccessAt/accessCount，不入审计）。
+ * supersede：被新记忆覆盖（D-A 后向引用标记，见 store.create）。
+ */
+export const AUDIT_ACTIONS = ['create', 'update', 'merge', 'archive', 'supersede'] as const
+export type AuditAction = (typeof AUDIT_ACTIONS)[number]
 
 /** 审计主体：谁发起了这次变更 */
-export type AuditActor = 'extractor' | 'tool' | 'user' | 'system'
+export const AUDIT_ACTORS = ['extractor', 'tool', 'user', 'system'] as const
+export type AuditActor = (typeof AUDIT_ACTORS)[number]
 
 /** 单条审计记录（追加式，不可变） */
 export interface AuditRecord {
@@ -81,6 +81,13 @@ export interface MemoryEntry {
   accessCount: number
   /** 生命周期状态 */
   status: MemoryStatus
+  /**
+   * 被哪条记忆覆盖（D-A 后向引用）：新事实写入时标记旧事实，
+   * 检索/注入默认排除被覆盖条目（可经 includeSuperseded 审计）。
+   */
+  supersededBy?: string
+  /** 覆盖了谁（与 supersededBy 双向可查，仅记录直接覆盖者） */
+  supersedes?: string
   /** 审计日志（追加） */
   audit: AuditRecord[]
 }
@@ -110,7 +117,6 @@ export interface MemoryStats {
   total: number
   active: number
   archived: number
-  deleted: number
   byKind: Record<MemoryKind, number>
 }
 

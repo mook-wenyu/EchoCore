@@ -91,7 +91,9 @@ export class MemoryStore {
     const existingId = this.byDedupKey.get(dedupKey)
     if (existingId !== undefined) {
       const existing = this.table.get(existingId)
-      if (existing !== undefined && existing.workspace === input.workspace) {
+      // 归档守卫（O3/H6）：不与被归档条目合并——否则新信息被吞进不可见条目；
+      // 归档条目不占索引（此处相当于放行新建）。
+      if (existing !== undefined && existing.workspace === input.workspace && existing.status === 'active') {
         const merged = await this.table.update(existingId, (current) => ({
           ...current,
           importance: Math.max(current.importance, input.importance ?? 5),
@@ -156,7 +158,7 @@ export class MemoryStore {
     }
   }
 
-  /** 归档（软删除）：从检索结果中消失，审计与来源保留 */
+  /** 归档（软删除）：从检索结果中消失，审计与来源保留（D-D 裁决：无 restore——恢复=重建，审计可溯源） */
   async archive(id: string, by: AuditActor): Promise<boolean> {
     try {
       await this.table.update(id, (current) => ({
@@ -169,35 +171,6 @@ export class MemoryStore {
     } catch {
       return false
     }
-  }
-
-  /** 恢复归档 */
-  async restore(id: string, by: AuditActor): Promise<boolean> {
-    try {
-      await this.table.update(id, (current) => ({
-        ...current,
-        status: 'active' as const,
-        updatedAt: this.iso(),
-        audit: [...current.audit, { action: 'restore' as const, at: this.iso(), by }],
-      }))
-      return true
-    } catch {
-      return false
-    }
-  }
-
-  /** 物理删除（保留审计语义由调用方保证：先 archive 再 delete 的流程在工具层约束） */
-  async hardDelete(id: string, by: AuditActor): Promise<boolean> {
-    const entry = this.table.get(id)
-    if (entry === undefined) return false
-    // 删除前写入最终审计（领域写链保证顺序：update 完成后 delete）
-    await this.table.update(id, (current) => ({
-      ...current,
-      audit: [...current.audit, { action: 'delete' as const, at: this.iso(), by }],
-    }))
-    const removed = await this.table.delete(id)
-    if (removed) this.byDedupKey.delete(entry.dedupKey)
-    return removed
   }
 
   /**
@@ -279,21 +252,19 @@ export class MemoryStore {
     return result.slice(0, limit)
   }
 
-  /** 统计快照 */
+  /** 统计快照（deleted 已随 D-D 裁决移除——物理删除不留状态，无 deleted 计数） */
   stats(): MemoryStats {
     const byKind: Record<MemoryKind, number> = { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 }
     let active = 0
     let archived = 0
-    let deleted = 0
     let total = 0
     for (const [, entry] of this.table.entries()) {
       total++
       byKind[entry.kind]++
       if (entry.status === 'active') active++
-      else if (entry.status === 'archived') archived++
-      else deleted++
+      else archived++
     }
-    return { total, active, archived, deleted, byKind }
+    return { total, active, archived, byKind }
   }
 }
 

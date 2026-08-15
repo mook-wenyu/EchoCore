@@ -10,13 +10,13 @@
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 
-import type { MemoryEntry } from './types.js'
+import { AUDIT_ACTIONS, AUDIT_ACTORS, MEMORY_KINDS, MEMORY_STATUSES, type MemoryEntry } from './types.js'
 
-/** 审计记录 schema */
+/** 审计记录 schema（动作/主体枚举从 types.ts 单源派生，防止双写漂移） */
 export const auditRecordSchema = z.object({
-  action: z.enum(['create', 'update', 'merge', 'archive', 'restore', 'delete', 'inject']),
+  action: z.enum(AUDIT_ACTIONS),
   at: z.string(),
-  by: z.enum(['extractor', 'tool', 'user', 'system']),
+  by: z.enum(AUDIT_ACTORS),
   detail: z.string().optional(),
 })
 
@@ -27,12 +27,12 @@ export const memorySourceSchema = z.object({
   excerpt: z.string(),
 })
 
-/** 记忆条目 schema（持久记录的全部字段） */
+/** 记忆条目 schema（持久记录的全部字段；supersededBy/supersedes 为可选，向后兼容既有记录） */
 export const memoryEntrySchema = z.object({
   id: z.string(),
   workspace: z.string(),
   sessionId: z.string(),
-  kind: z.enum(['fact', 'preference', 'decision', 'todo', 'insight']),
+  kind: z.enum(MEMORY_KINDS),
   content: z.string(),
   importance: z.number(),
   tags: z.array(z.string()),
@@ -42,7 +42,9 @@ export const memoryEntrySchema = z.object({
   updatedAt: z.string(),
   lastAccessAt: z.string(),
   accessCount: z.number(),
-  status: z.enum(['active', 'archived', 'deleted']),
+  status: z.enum(MEMORY_STATUSES),
+  supersededBy: z.string().optional(),
+  supersedes: z.string().optional(),
   audit: z.array(auditRecordSchema),
 })
 

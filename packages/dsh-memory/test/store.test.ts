@@ -81,25 +81,18 @@ describe('MemoryStore 状态流转', () => {
     expect(await store.update('missing', {}, 'tool')).toBeUndefined()
   })
 
-  it('archive 后从检索消失、可 restore 恢复', async () => {
+  it('archive 后从检索消失（D-D 裁决：无 restore，恢复=重建）', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
     const { entry } = await store.create(input({ content: '用户偏好使用简体中文交流' }))
 
     expect(store.search({ query: '中文' })).toHaveLength(1)
     expect(await store.archive(entry.id, 'tool')).toBe(true)
     expect(store.search({ query: '中文' })).toHaveLength(0)
-    expect(await store.restore(entry.id, 'user')).toBe(true)
-    expect(store.search({ query: '中文' })).toHaveLength(1)
-  })
-
-  it('hardDelete 物理移除并清理去重索引', async () => {
-    const store = new MemoryStore(new FakeTable(), nowFn)
-    const { entry } = await store.create(input())
-    expect(await store.hardDelete(entry.id, 'user')).toBe(true)
-    expect(store.getById(entry.id)).toBeUndefined()
-    // 同内容可再次新建（去重索引已清理）
-    const again = await store.create(input())
+    // 归档后同内容新建：不被归档条目吞并（O3 守卫），得到新条目
+    const again = await store.create(input({ content: '用户偏好使用简体中文交流' }))
     expect(again.outcome.merged).toBe(false)
+    expect(store.search({ query: '中文' })).toHaveLength(1)
+    expect(store.getById(again.entry.id)?.status).toBe('active')
   })
 })
 
