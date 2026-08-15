@@ -12,6 +12,8 @@ import * as React from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 
+import { shortSessionId } from './constants.js'
+
 export const name = 'memory-panel'
 // 客户端运行时服务按 inject 声明绑定（未声明则 ctx.get 返回 undefined）：
 // - slots：settings.section 注册（MemoryPanel）
@@ -35,6 +37,16 @@ interface MemoryDetailView extends MemorySummaryView {
   source: { sessionId: string; eventSeqs: number[]; excerpt: string }
   accessCount: number
   audit: Array<{ action: string; at: string; by: string; detail?: string }>
+  supersededBy?: string
+  supersedes?: string
+}
+
+/** 统计展示形态（与宿主 MemoryStats 对齐，无 deleted 字段） */
+export interface MemoryStatsView {
+  total: number
+  active: number
+  archived: number
+  byKind: Record<string, number>
 }
 
 /** 面板数据 API（apply 期从 ctx 装配，随组件 props 传递） */
@@ -43,6 +55,7 @@ export interface MemoryPanelApi {
   search(query: string, kind?: string, status?: string): Promise<MemorySummaryView[]>
   get(id: string): Promise<MemoryDetailView | undefined>
   archive(id: string): Promise<boolean>
+  status(): Promise<MemoryStatsView>
 }
 
 /** 从 ctx 装配面板 API（connection 缺失时所有调用返回空结果） */
@@ -76,6 +89,10 @@ export function createMemoryApi(ctx: Context): MemoryPanelApi {
       const result = await call('archive', { id })
       const value = unwrap(result) as { archived: boolean }
       return value.archived
+    },
+    async status() {
+      const result = await call('status', {})
+      return unwrap(result) as MemoryStatsView
     },
   }
 }
@@ -119,7 +136,10 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
   const [query, setQuery] = React.useState('')
   const [kind, setKind] = React.useState('')
   const [selected, setSelected] = React.useState<MemoryDetailView | undefined>(undefined)
+  const [stats, setStats] = React.useState<MemoryStatsView | undefined>(undefined)
   const [error, setError] = React.useState('')
+  // 详情请求序号：openDetail 竞态守卫——只采纳最新一次请求的响应
+  const requestSeq = React.useRef(0)
 
   const refresh = React.useCallback(
     async (q: string, k: string): Promise<void> => {
@@ -136,12 +156,21 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
 
   React.useEffect(() => {
     void refresh('', '')
-  }, [refresh])
+    void props.api.status().then(setStats).catch((err) => setError(err instanceof Error ? err.message : String(err)))
+    return () => {
+      requestSeq.current++ // 卸载清理：作废未决请求
+    }
+  }, [refresh, props.api])
 
   const openDetail = async (id: string): Promise<void> => {
+    const seq = ++requestSeq.current
     try {
-      setSelected(await props.api.get(id))
+      const detail = await props.api.get(id)
+      // 竞态守卫：响应返回期间若又发起新一轮请求，丢弃过期响应
+      if (seq !== requestSeq.current) return
+      setSelected(detail)
     } catch (err) {
+      if (seq !== requestSeq.current) return
       setError(err instanceof Error ? err.message : String(err))
     }
   }
@@ -172,7 +201,7 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
       React.createElement(
         'div',
         { style: metaStyle },
-        `重要度 ${entry.importance} · 记忆 #${entry.id.slice(0, 8)} · 来自会话 ${entry.sessionId.slice(0, 8)} · ${entry.createdAt.slice(0, 10)}`,
+        `重要度 ${entry.importance} · 记忆 #${entry.id.slice(0, 8)} · 来自会话 ${shortSessionId(entry.sessionId)} · ${entry.createdAt.slice(0, 10)}`,
       ),
     ),
   )
@@ -180,6 +209,13 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
   return React.createElement(
     'div',
     { style: panelStyle },
+    stats !== undefined
+      ? React.createElement(
+          'div',
+          { style: statsStyle },
+          `共 ${stats.total} 条记忆（${stats.active} 条活跃）`,
+        )
+      : null,
     React.createElement(
       'div',
       null,
@@ -226,6 +262,7 @@ function DetailPane(props: { entry: MemoryDetailView; onArchive: () => void }): 
 // ── 样式（最小内联，跟随主题变量） ─────────────────────────────────────
 
 const panelStyle: React.CSSProperties = { padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }
+const statsStyle: React.CSSProperties = { fontSize: 13, fontWeight: 600, opacity: 0.85 }
 const listStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 360, overflowY: 'auto' }
 const detailStyle: React.CSSProperties = { border: '1px solid var(--dsh-border, #ccc)', borderRadius: 6, padding: 8 }
 const metaStyle: React.CSSProperties = { fontSize: 12, opacity: 0.75, margin: '2px 0' }

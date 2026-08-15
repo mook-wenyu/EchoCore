@@ -1,0 +1,112 @@
+/**
+ * 客户端面板 API（createMemoryApi）单元测试——纯逻辑，不测组件渲染。
+ * - 用假 connection 校验各端点的载荷形状（channel '/memory'、端点名、payload）
+ * - 校验 RpcResult 解包：ok:false 时 reject（抛错），ok:true 时返回规范化值
+ */
+
+import { describe, expect, it, vi } from 'vitest'
+import type { Context } from '@deepseek-ai/cordis'
+import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
+
+import { createMemoryApi, type MemoryPanelApi } from '../src/client.js'
+
+// client.ts 模块顶层 import * as React（仅供组件渲染用）；测试环境 node 无 react 依赖。
+// 用例只测 createMemoryApi（纯逻辑，不触 React），故用工厂桩替代，满足模块解析即可。
+vi.mock('react', () => ({ createElement: () => null }))
+
+/** 假 connection：记录每次 rpc.call 的参数，并回放预设结果序列 */
+interface FakeConnection {
+  rpc: { call: ReturnType<typeof vi.fn> }
+}
+
+function fakeCtx(results: Array<RpcResult<unknown>>, calls?: FakeConnection): { ctx: Context; api: MemoryPanelApi; recorded: Array<{ channel: string; endpoint: string; payload: unknown }> } {
+  const recorded: Array<{ channel: string; endpoint: string; payload: unknown }> = []
+  const call = vi.fn(async (channel: string, endpoint: string, payload: unknown) => {
+    recorded.push({ channel, endpoint, payload })
+    const result = results.shift()
+    if (result === undefined) throw new Error('假 connection 结果序列已耗尽')
+    return result
+  })
+  const connection = { rpc: { call } } as unknown as FakeConnection
+  const ctx = {
+    get: (name: string) => (name === 'connection' ? connection : undefined),
+  } as unknown as Context
+  const api = createMemoryApi(ctx)
+  return { ctx, api, recorded }
+}
+
+/** 快捷构造 ok 结果 */
+function ok(value: unknown): RpcResult<unknown> {
+  return { ok: true, value }
+}
+
+/** 快捷构造 internal 错误结果 */
+function err(message: string): RpcResult<unknown> {
+  return { ok: false, error: { code: 'internal', message, details: {} } }
+}
+
+describe('createMemoryApi 端点载荷', () => {
+  it('list：channel /memory、端点 list、payload 透传 status 与 limit', async () => {
+    const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
+    await api.list('archived', 5)
+    expect(recorded).toEqual([{ channel: '/memory', endpoint: 'list', payload: { status: 'archived', limit: 5 } }])
+  })
+
+  it('search：payload 含 query/kind/status 固定 limit=50', async () => {
+    const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
+    await api.search('重构', 'todo', 'active')
+    expect(recorded).toEqual([
+      { channel: '/memory', endpoint: 'search', payload: { query: '重构', kind: 'todo', status: 'active', limit: 50 } },
+    ])
+  })
+
+  it('get：payload 为 { id }', async () => {
+    const { api, recorded } = fakeCtx([ok({ found: true, entry: {} })])
+    const result = await api.get('id-1')
+    expect(recorded).toEqual([{ channel: '/memory', endpoint: 'get', payload: { id: 'id-1' } }])
+    expect(result).toEqual({})
+  })
+
+  it('get 未命中（found=false）返回 undefined', async () => {
+    const { api } = fakeCtx([ok({ found: false })])
+    await expect(api.get('missing')).resolves.toBeUndefined()
+  })
+
+  it('archive：payload 为 { id }，返回 archived 布尔', async () => {
+    const { api, recorded } = fakeCtx([ok({ id: 'id-1', archived: true })])
+    const archived = await api.archive('id-1')
+    expect(recorded).toEqual([{ channel: '/memory', endpoint: 'archive', payload: { id: 'id-1' } }])
+    expect(archived).toBe(true)
+  })
+
+  it('status：channel /memory、端点 status、空 payload', async () => {
+    const { api, recorded } = fakeCtx([ok({ total: 3, active: 2, archived: 1, byKind: { fact: 1 } })])
+    const status = await api.status()
+    expect(recorded).toEqual([{ channel: '/memory', endpoint: 'status', payload: {} }])
+    expect(status.total).toBe(3)
+    expect(status.active).toBe(2)
+  })
+})
+
+describe('createMemoryApi unwrap 错误路径', () => {
+  it('ok:false 时 list 抛错（reject，携带错误消息）', async () => {
+    const { api } = fakeCtx([err('连接被拒')])
+    await expect(api.list()).rejects.toThrow('连接被拒')
+  })
+
+  it('ok:false 时 status 抛错', async () => {
+    const { api } = fakeCtx([err('存储不可用')])
+    await expect(api.status()).rejects.toThrow('存储不可用')
+  })
+
+  it('ok:false 时 get 抛错', async () => {
+    const { api } = fakeCtx([err('id 非法')])
+    await expect(api.get('bad-id')).rejects.toThrow('id 非法')
+  })
+
+  it('connection 服务缺失时所有调用以 internal 错误结束', async () => {
+    const ctx = { get: () => undefined } as unknown as Context
+    const api = createMemoryApi(ctx)
+    await expect(api.status()).rejects.toThrow()
+  })
+})

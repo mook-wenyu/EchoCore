@@ -7,9 +7,9 @@ import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
-import { registerMemoryTools } from '../src/tools.js'
+import { registerMemoryTools, toDetail } from '../src/tools.js'
 import { MemoryStore } from '../src/store.js'
-import type { NewMemoryInput } from '../src/types.js'
+import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeTable } from './helpers.js'
 
 /** 假 ctx：tools 服务形状（register 捕获定义） */
@@ -36,7 +36,7 @@ function setup() {
   const table = new FakeTable()
   const store = new MemoryStore(table)
   registerMemoryTools(ctx as unknown as Context, { store })
-  return { tools: ctx.definitions, store }
+  return { tools: ctx.definitions, store, table }
 }
 
 /** 取一个工具定义 */
@@ -176,6 +176,35 @@ describe('memory_forget', () => {
   })
 })
 
+describe('toDetail supersede 投影', () => {
+  it('带 supersededBy/supersedes 时投射可选字段供审计展示覆盖链', async () => {
+    const { store, table } = setup()
+    const oldId = await seed(store, { content: '旧事实：A 方案' })
+    // 直接对被覆盖条目打上 supersede 后向引用（模拟 store.create 的 supersede 标记）
+    const record = store.getById(oldId)
+    if (record === undefined) throw new Error('条目缺失')
+    const superseded: MemoryEntry = {
+      ...record,
+      supersededBy: 'new-1234',
+      supersedes: 'sup-5678',
+    }
+
+    const detail = toDetail(superseded)
+    expect(detail.supersededBy).toBe('new-1234')
+    expect(detail.supersedes).toBe('sup-5678')
+  })
+
+  it('无 supersede 标记时字段不出现', async () => {
+    const { store } = setup()
+    const id = await seed(store)
+    const entry = store.getById(id)
+    if (entry === undefined) throw new Error('条目缺失')
+    const detail = toDetail(entry)
+    expect(detail.supersededBy).toBeUndefined()
+    expect(detail.supersedes).toBeUndefined()
+  })
+})
+
 describe('memory_audit', () => {
   it('返回完整溯源（来源/摘录/审计日志）', async () => {
     const { tools, store } = setup()
@@ -216,5 +245,13 @@ describe('memory_status', () => {
     expect(result.active).toBe(2)
     expect(result.byKind.fact).toBe(1)
     expect(result.byKind.todo).toBe(1)
+  })
+
+  it('统计输出不含已删除的 deleted 字段（MemoryStats 契约）', async () => {
+    const { tools, store } = setup()
+    await seed(store)
+    const def = toolOf(tools, 'memory_status')
+    const result = (await def.execute({}, fakeExec() as never)) as Record<string, unknown>
+    expect(result).not.toHaveProperty('deleted')
   })
 })

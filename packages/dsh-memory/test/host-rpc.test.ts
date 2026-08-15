@@ -11,12 +11,11 @@ import { FakeTable } from './helpers.js'
 
 /** 组装被测对象 */
 function setup() {
-  const store = new MemoryStore(new FakeTable())
+  const table = new FakeTable()
+  const store = new MemoryStore(table)
   const handler = createMemoryRpcHandler(store)
-  return { store, handler }
-}
-
-/** 播种一条记忆 */
+  return { store, handler, table }
+}/** 播种一条记忆 */
 async function seed(store: MemoryStore, input: Partial<NewMemoryInput> = {}): Promise<string> {
   const result = await store.create({
     workspace: 'D:/workspace',
@@ -77,6 +76,33 @@ describe('memory RPC 端点', () => {
 
     const miss = await handler('get', { id: 'missing' })
     if (miss.ok) expect((miss.value as { found: boolean }).found).toBe(false)
+  })
+
+  it('get：详情透传 supersede 链（supersededBy/supersedes）', async () => {
+    const { store, handler, table } = setup()
+    const id = await seed(store)
+    const record = store.getById(id)
+    if (record === undefined) throw new Error('条目缺失')
+    // 写回带 supersede 标记的条目，模拟 store.create 的后向引用
+    await table.put(id, { ...record, supersededBy: 'new-1234', supersedes: 'sup-5678' })
+
+    const hit = await handler('get', { id })
+    expect(hit.ok).toBe(true)
+    if (!hit.ok) return
+    const value = hit.value as { found: boolean; entry?: { supersededBy?: string; supersedes?: string } }
+    expect(value.found).toBe(true)
+    expect(value.entry?.supersededBy).toBe('new-1234')
+    expect(value.entry?.supersedes).toBe('sup-5678')
+  })
+
+  it('get：无 supersede 标记时详情不含这两字段', async () => {
+    const { handler } = setup()
+    // seed 后未打标记，直接访问 store 构造
+    const hit = await handler('get', { id: 'missing' })
+    expect(hit.ok).toBe(true)
+    if (!hit.ok) return
+    const value = hit.value as { found: boolean }
+    expect(value.found).toBe(false)
   })
 
   it('archive：归档成功返回 archived=true', async () => {

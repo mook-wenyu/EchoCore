@@ -12,8 +12,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
-import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS } from './constants.js'
-import { formatMemoryLine } from './injector.js'
+import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS, shortSessionId } from './constants.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry, MemoryKind } from './types.js'
 
@@ -41,6 +40,10 @@ export interface MemoryDetail extends MemorySummary {
   source: { sessionId: string; eventSeqs: number[]; excerpt: string }
   accessCount: number
   audit: Array<{ action: string; at: string; by: string; detail?: string }>
+  /** 被哪条记忆覆盖（supersede 链后向引用；无则缺席） */
+  supersededBy?: string
+  /** 覆盖了哪条旧记忆（supersede 链前向引用；无则缺席） */
+  supersedes?: string
 }
 
 /** 把条目投影为最小规范形态（不泄漏内部结构） */
@@ -58,7 +61,7 @@ export function toSummary(entry: MemoryEntry): MemorySummary {
   }
 }
 
-/** 把条目投影为详情规范形态（audit 用） */
+/** 把条目投影为详情规范形态（audit 用）；supersede 链字段仅在存在时投射 */
 export function toDetail(entry: MemoryEntry): MemoryDetail {
   return {
     ...toSummary(entry),
@@ -66,6 +69,8 @@ export function toDetail(entry: MemoryEntry): MemoryDetail {
     source: { ...entry.source },
     accessCount: entry.accessCount,
     audit: entry.audit.map((record) => ({ ...record })),
+    ...(entry.supersededBy !== undefined ? { supersededBy: entry.supersededBy } : {}),
+    ...(entry.supersedes !== undefined ? { supersedes: entry.supersedes } : {}),
   }
 }
 
@@ -121,15 +126,11 @@ function registerRecall(ctx: Context, deps: MemoryToolsDeps): void {
           additionalProperties: false,
         },
         render: (_args, value) => {
+          // 直接按行文本渲染，不再构造假 MemoryEntry 走 injector.formatMemoryLine
           const lines = value.memories.map((memory) => {
-            const entry = {
-              id: memory.id,
-              kind: memory.kind,
-              content: memory.content,
-              importance: memory.importance,
-              source: { sessionId: memory.sessionId, eventSeqs: memory.eventSeqs, excerpt: '' },
-            } as unknown as MemoryEntry
-            return formatMemoryLine(entry)
+            const memoryId = memory.id.slice(0, 8)
+            const sessionId = shortSessionId(memory.sessionId)
+            return `- [${memory.kind}] ${memory.content}（重要度 ${memory.importance}，记忆 #${memoryId}，来自会话 ${sessionId}）`
           })
           const header =
             value.total === 0
@@ -208,7 +209,7 @@ function registerSearch(ctx: Context, deps: MemoryToolsDeps): void {
         render: (_args, value) => {
           const lines = value.memories.map(
             (memory) =>
-              `- [${memory.kind}] ${memory.content}（重要度 ${memory.importance}，记忆 #${memory.id.slice(0, 8)}，来自会话 ${memory.sessionId.slice(0, 8)}）`,
+              `- [${memory.kind}] ${memory.content}（重要度 ${memory.importance}，记忆 #${memory.id.slice(0, 8)}，来自会话 ${shortSessionId(memory.sessionId)}）`,
           )
           return [{ type: 'text', text: `共 ${value.total} 条：\n${lines.join('\n')}` }]
         },
@@ -364,6 +365,8 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
                 },
                 accessCount: { type: 'integer', required: true },
                 status: { type: 'string', required: true },
+                supersededBy: { type: 'string', description: '被哪条记忆覆盖（supersede 链后向引用）' },
+                supersedes: { type: 'string', description: '覆盖了哪条旧记忆（supersede 链前向引用）' },
                 audit: {
                   type: 'array',
                   required: true,
@@ -389,6 +392,10 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
             return [{ type: 'text', text: `未找到记忆 ${value.entry?.id ?? ''}。` }]
           }
           const entry = value.entry
+          const supersedeLine =
+            entry.supersededBy != null || entry.supersedes != null
+              ? `supersede 链：${entry.supersedes != null ? `覆盖了 #${entry.supersedes.slice(0, 8)}` : ''}${entry.supersededBy != null && entry.supersedes != null ? '；' : ''}${entry.supersededBy != null ? `被 #${entry.supersededBy.slice(0, 8)} 覆盖` : ''}`
+              : ''
           const lines = [
             `记忆 #${entry.id.slice(0, 8)}（${entry.kind}，重要度 ${entry.importance}，状态 ${entry.status}）`,
             `内容：${entry.content}`,
@@ -396,6 +403,7 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
             `来源事件序号：${entry.source.eventSeqs.join(', ') || '（手动记录，无事件锚点）'}`,
             `原文摘录：${entry.source.excerpt.slice(0, 200)}${entry.source.excerpt.length > 200 ? '…' : ''}`,
             `访问次数：${entry.accessCount}`,
+            ...(supersedeLine !== '' ? [supersedeLine] : []),
             `审计日志：`,
             ...entry.audit.map((record) => `  - ${record.at} [${record.by}] ${record.action}${record.detail ? `：${record.detail}` : ''}`),
           ]
