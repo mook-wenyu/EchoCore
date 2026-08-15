@@ -38,9 +38,9 @@
 
 ## 四、下次最该做的事
 
-1. **重启 3080 实例**：当前进程（18:00 启动）运行旧代码——重启后新代码（面板配置/RRF/嵌入默认启用/配置面 4 项）才生效。
-2. **settings.yaml 降 `deepseek-v4-flash maxTokens` 384000→65536**：消除唯一已实测触发过的溢出卡死事故路径（token-meter 低估 + 压缩收益保护死锁链）。
+1. **重启 3080 实例**：当前进程（18:00 启动）运行旧代码——重启后新代码（面板配置/RRF/嵌入默认启用/配置面 4 项/F1-G5 治理）才生效。重启前先跑 `scripts/backup-memory.mjs` 刷新备份。
+2. **⚠️ 已撤销（2026-08-15）：降 settings.yaml maxTokens 384000→65536 是错误方案**——maxTokens 是模型最大输出上限，降它截断生成能力（用户否决）。溢出事故真实根因在宿主域：dsh-token-meter CHARS_PER_TOKEN=4 低估 2-3 倍 + 压缩触发/停止口径分裂 + 收益保护死锁（记忆 #f98ca946，harness 域缺陷，不属于 dsh-memory 修复范围）。正确路径：向宿主报 token-meter 缺陷；dsh-memory 侧已做注入预算上限 + 摘要截断治理。
 3. **备份脚本配计划任务**：`scripts/backup-memory.mjs` 已就绪（默认保留 10 份），建议每日定时运行。
 4. 缓存命中率基线实测（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益。
-5. 观察 memory.json：maintenance 首周期（6h 后）执行效果；A4 修复真机表现。
+5. 观察 memory.json：maintenance 首周期执行效果（降权放宽 imp≤5/批量 200/间隔 1h + 会话摘要归档收敛）。
 6. MemoryPanel 组件渲染测试：若引入 jsdom/testing-library 则补组件测试。
