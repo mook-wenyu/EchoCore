@@ -9,6 +9,7 @@ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
 import { registerMemoryTools, sessionIdOf, toDetail, toSummary, workspaceOf } from '../src/tools.js'
 import { MemoryStore } from '../src/store.js'
+import { MemoryStableSnapshot } from '../src/stable-snapshot.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
 
@@ -20,12 +21,25 @@ function fakeExec(agentId = 's1', cwd = 'D:/workspace') {
   }
 }
 
-/** 组装被测对象：注册全部工具，返回定义表与 store（R3-1：统一 FakeCtx） */
-function setup() {
+/**
+ * 快照依赖假对象（G3 去重回路专用）：tools.deps.snapshot 要求 MemoryStableSnapshot
+ * 结构（仅消费 snapshotIds(workspace) 同步方法）。测试用最小假对象注入可控的
+ * 「快照已含 id 集」——默认空集 = 快照不干涉，既有 recall/search 用例保持
+ * "未去重检索"语义；去重用例显式传入目标 id 集（详见快照去重 describe）。
+ * 与 injector.ts 共用同一型号：工具只读快照 ids 做显式召回层的去重。
+ */
+function fakeSnapshot(snapshotIdsOf: (workspace: string) => ReadonlySet<string> = () => new Set()): MemoryStableSnapshot {
+  return { snapshotIds: snapshotIdsOf } as unknown as MemoryStableSnapshot
+}
+
+/** 组装被测对象：注册全部工具，返回定义表、store 与 table（R3-1：统一 FakeCtx）
+ * - store：可注入既有 MemoryStore（去重用例需让工具与播种共享同一存储）；
+ * - snapshotOf：通过即可注入快照 id 视图（缺省假快照空集 = 不触发去重）。 */
+function setup(opts?: { snapshotOf?: (workspace: string) => ReadonlySet<string>; store?: MemoryStore }) {
   const ctx = new FakeCtx()
-  const table = new FakeTable()
-  const store = new MemoryStore(table)
-  registerMemoryTools(ctx as unknown as Context, { store })
+  const table = opts?.store !== undefined ? undefined : new FakeTable()
+  const store = opts?.store ?? new MemoryStore(table!)
+  registerMemoryTools(ctx as unknown as Context, { store, snapshot: fakeSnapshot(opts?.snapshotOf) })
   return { tools: ctx.toolDefs, store, table }
 }
 
@@ -70,9 +84,9 @@ describe('memory_recall', () => {
     const def = toolOf(tools, 'memory_recall')
     const result = (await def.execute({ query: 'pnpm workspace', limit: 5 }, fakeExec() as never)) as {
       memories: Array<{ id: string; sessionId: string; eventSeqs: number[] }>
-      total: number
+      returned: number
     }
-    expect(result.total).toBe(1)
+    expect(result.returned).toBe(1)
     expect(result.memories[0]?.id).toBe(id)
     expect(result.memories[0]?.sessionId).toBe('s-old')
     expect(result.memories[0]?.eventSeqs).toEqual([1, 2])
@@ -82,8 +96,48 @@ describe('memory_recall', () => {
     const { tools, store } = setup()
     await seed(store)
     const def = toolOf(tools, 'memory_recall')
-    const result = (await def.execute({ query: '完全无关词汇xyz' }, fakeExec() as never)) as { total: number }
-    expect(result.total).toBe(0)
+    const result = (await def.execute({ query: '完全无关词汇xyz' }, fakeExec() as never)) as { returned: number }
+    expect(result.returned).toBe(0)
+  })
+
+  // G3/R2-6：召回输出投影须含 createdAt（与注入包渲染一致，模型可判记忆新旧——
+  // 此前 recall 投影缺 createdAt 而注入渲染带创建日期，F3 一致性断裂）。
+  it('召回结果含 createdAt（供模型判断新旧）', async () => {
+    const harness = setup()
+    const id = await seed(harness.store)
+    // 显式钉住创建时间（NewMemoryInput 无 createdAt，经 table 回改以断言投影字段）
+    await harness.table.update(id, (entry) => ({ ...entry, createdAt: '2026-08-01T00:00:00.000Z' }))
+    const def = toolOf(harness.tools, 'memory_recall')
+    const result = await def.execute({ query: 'pnpm', limit: 5 }, fakeExec() as never)
+    expect(result.memories[0]?.createdAt).toBe('2026-08-01T00:00:00.000Z')
+  })
+
+  // G3：显式查询与快照/注入重复时快照优先——recall 只补快照未含的，防三处重复消化。
+  it('快照已含的记忆不出现在 recall 结果（快照优先，工具只补缺失）', async () => {
+    const harness = setup()
+    const id = await seed(harness.store) // 重要度 8，属"高重要度快照候选"
+    await seed(harness.store, {
+      content: '项目使用 pnpm 也用于测试运行',
+      importance: 5,
+      createdAt: '2026-08-01T00:00:00.000Z',
+    })
+    // 复用同一 store，假快照把首条标记为"已含"→ recall 应去重它，仅剩未入快照的第二条
+    const def = toolOf(setup({ store: harness.store, snapshotOf: () => new Set([id]) }).tools, 'memory_recall')
+    const r = (await def.execute({ query: '项目', limit: 10 }, fakeExec() as never)) as {
+      memories: Array<{ id: string }>
+      returned: number
+    }
+    expect(r.returned).toBe(1)
+    expect(r.memories.some((m) => m.id === id)).toBe(false)
+  })
+
+  // G3：去重后 returned 反映"返回条数"；快照全去重时 returned=0（快照不重复消化）。
+  it('recall 全部命中被快照去重时 returned=0', async () => {
+    const harness = setup()
+    const id = await seed(harness.store)
+    const def = toolOf(setup({ store: harness.store, snapshotOf: () => new Set([id]) }).tools, 'memory_recall')
+    const r = (await def.execute({ query: 'pnpm', limit: 5 }, fakeExec() as never)) as { returned: number }
+    expect(r.returned).toBe(0)
   })
 })
 
@@ -94,14 +148,14 @@ describe('memory_search', () => {
     await seed(store, { kind: 'decision', content: '决定：采用评分检索', tags: ['架构'] })
 
     const def = toolOf(tools, 'memory_search')
-    const byKind = (await def.execute({ kind: 'todo' }, fakeExec() as never)) as { total: number }
-    expect(byKind.total).toBe(1)
+    const byKind = (await def.execute({ kind: 'todo' }, fakeExec() as never)) as { returned: number }
+    expect(byKind.returned).toBe(1)
 
-    const byTag = (await def.execute({ tag: '架构' }, fakeExec() as never)) as { total: number }
-    expect(byTag.total).toBe(1)
+    const byTag = (await def.execute({ tag: '架构' }, fakeExec() as never)) as { returned: number }
+    expect(byTag.returned).toBe(1)
 
-    const byQuery = (await def.execute({ query: '重构', limit: 10 }, fakeExec() as never)) as { total: number }
-    expect(byQuery.total).toBe(1)
+    const byQuery = (await def.execute({ query: '重构', limit: 10 }, fakeExec() as never)) as { returned: number }
+    expect(byQuery.returned).toBe(1)
 
     void todoId
   })
@@ -112,10 +166,25 @@ describe('memory_search', () => {
     await store.archive(id, 'tool')
 
     const def = toolOf(tools, 'memory_search')
-    const active = (await def.execute({ query: 'pnpm' }, fakeExec() as never)) as { total: number }
-    expect(active.total).toBe(0)
-    const archived = (await def.execute({ query: 'pnpm', status: 'archived' }, fakeExec() as never)) as { total: number }
-    expect(archived.total).toBe(1)
+    const active = (await def.execute({ query: 'pnpm' }, fakeExec() as never)) as { returned: number }
+    expect(active.returned).toBe(0)
+    const archived = (await def.execute({ query: 'pnpm', status: 'archived' }, fakeExec() as never)) as { returned: number }
+    expect(archived.returned).toBe(1)
+  })
+
+  // G3：与 recall 同规则——search 结构化浏览同样过滤快照已含条目（快照优先）
+  it('快照已含的记忆不出现在 search 结果', async () => {
+    const harness = setup()
+    const id = await seed(harness.store)
+    // 第二条同为 pnpm 主题但不在快照（快照仅含首条）→ 去重后应只返回它
+    const keepId = await seed(harness.store, { content: 'pnpm 也用于运行测试与发布', importance: 4 })
+    const def = toolOf(setup({ store: harness.store, snapshotOf: () => new Set([id]) }).tools, 'memory_search')
+    const r = (await def.execute({ query: 'pnpm', limit: 10 }, fakeExec() as never)) as {
+      memories: Array<{ id: string }>
+      returned: number
+    }
+    expect(r.returned).toBe(1)
+    expect(r.memories.map((m) => m.id)).toEqual([keepId])
   })
 })
 

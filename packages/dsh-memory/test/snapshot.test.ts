@@ -64,6 +64,39 @@ describe('registerSnapshot', () => {
     expect(store.stats().total).toBe(0)
   })
 
+  it('G5 超长摘要截断并标记（原文长度可见，防摘要链损失无损放大）', async () => {
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    registerSnapshot(ctx as unknown as Context, { store, logger: { warn: () => {}, info: () => {} } })
+    const longText = '架构设计说明：'.repeat(300) // 约 2400 字符 > 2000 上限
+    ;(ctx.listener('session/event') as (s: Session, e: SessionEvent) => void)(makeSession('s1'), summaryEvent(5, [2], longText))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const entries = store.listBySession('s1')
+    expect(entries).toHaveLength(1)
+    const content = entries[0]?.content ?? ''
+    expect(content).toContain('…[摘要已截断，原文')
+    expect(content).toContain(`${longText.length} 字符]`)
+  })
+
+  it('G5 同会话旧摘要与新摘要主题重合（Jaccard≥0.5）→ 旧者归档，检索只出新者', async () => {
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    registerSnapshot(ctx as unknown as Context, { store, logger: { warn: () => {}, info: () => {} } })
+    const listener = ctx.listener('session/event') as (s: Session, e: SessionEvent) => void
+    // 第一次压缩：登记摘要 A
+    listener(makeSession('s1'), summaryEvent(5, [2, 3], '本轮完成了记忆系统架构设计，确定轻量评分检索方案'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    // 第二次压缩：登记高度重合的摘要 B（同主题演进）
+    listener(makeSession('s1'), summaryEvent(10, [6, 7, 8], '本轮完成了记忆系统架构设计，确定轻量评分检索方案，并补充了维护机制'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const entries = store.listBySession('s1')
+    const summaries = entries.filter((entry) => entry.tags.includes('session-summary'))
+    // 旧摘要被归档（active 只剩 1 份新摘要）
+    expect(summaries.filter((entry) => entry.status === 'active')).toHaveLength(1)
+    expect(summaries.filter((entry) => entry.status === 'archived')).toHaveLength(1)
+    expect(summaries.find((entry) => entry.status === 'active')?.content).toContain('维护机制')
+  })
+
   it('会话结束时写快照记录（含记忆规模统计）', async () => {
     const ctx = new FakeCtx()
     const store = new MemoryStore(new FakeTable())

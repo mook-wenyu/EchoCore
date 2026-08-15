@@ -147,7 +147,8 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
   new MemoryInjector({ store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger }).install(ctx)
 
   // 模型工具：recall / search / note / forget / audit / status
-  registerMemoryTools(ctx, { store, embedding: embeddingService, embedIndex, logger })
+  // （G3：snapshot 传入供工具回路去重——快照已注入的记忆不再由工具重复输出）
+  registerMemoryTools(ctx, { store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger })
 
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
   registerSnapshot(ctx, { store, logger })

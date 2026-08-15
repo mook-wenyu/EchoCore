@@ -17,6 +17,7 @@ import {
   SALIENCE_FLOOR_IMPORTANCE,
   SALIENCE_FLOOR_RECENCY,
   scoreEntry,
+  timeImportanceFactor,
   tokenize,
 } from '../src/scoring.ts'
 import { type MemoryEntry } from '../src/types.ts'
@@ -228,6 +229,38 @@ describe('memoryScore 衰减增强（P3）', () => {
   it('floor 常量语义：recency 下限 0.5 → 时间调制因子下限 0.8', () => {
     expect(SALIENCE_FLOOR_RECENCY).toBe(0.5)
     expect(0.6 + 0.4 * SALIENCE_FLOOR_RECENCY).toBe(0.8)
+  })
+
+  it('G4 salience floor 活跃窗口：90 天未创建/访问的高重要度不再保活（允许软降权）', () => {
+    // 创建与最后访问均在 90 天前 → floor 失效，recency 可降至 0.5 以下
+    const dormant = entry({
+      id: 'a',
+      importance: SALIENCE_FLOOR_IMPORTANCE,
+      lastAccessAt: '2025-01-01T00:00:00.000Z',
+      createdAt: '2025-01-01T00:00:00.000Z',
+    })
+    const active = entry({
+      id: 'b',
+      importance: SALIENCE_FLOOR_IMPORTANCE,
+      lastAccessAt: '2026-01-10T00:00:00.000Z', // 5 天前（窗口内）
+    })
+    // active 保活（因子 ≥0.8），dormant 无 floor（因子可低于 active）
+    expect(memoryScore(active, ['pnpm'], now)).toBeGreaterThan(memoryScore(dormant, ['pnpm'], now))
+    // dormant 的时间因子无 floor：recency=exp(-ln2/28d×380d)≈极低 → 因子≈0.6+0.4×0≈0.6×importanceFactor
+    const dormantFactor = timeImportanceFactor(dormant, now)
+    expect(dormantFactor).toBeLessThan(0.8)
+  })
+
+  it('G4 创建在窗口内（无访问）仍保活：创建活跃性替代访问活跃性', () => {
+    const newlyCreated = entry({
+      id: 'a',
+      importance: SALIENCE_FLOOR_IMPORTANCE,
+      lastAccessAt: '2025-06-01T00:00:00.000Z', // 半年无访问
+      createdAt: '2025-12-20T00:00:00.000Z', // 创建 26 天前（窗口内）
+    })
+    // floor 生效：recency=0.5 → 时间因子 0.8 × importanceFactor(8)=0.9 = 0.72；
+    // 无 floor（recency≈0）则 0.6×0.9=0.54——断言落在两者之间证明保活
+    expect(timeImportanceFactor(newlyCreated, now)).toBeGreaterThan(0.65)
   })
 
   it('新近访问仍占优（自适应半衰期不逆转"新"优势）', () => {

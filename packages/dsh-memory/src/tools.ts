@@ -16,12 +16,19 @@ import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS } from './constants.js'
 import { searchWithSemantic, type EmbeddingService } from './embedding.js'
 import type { EmbeddingIndex } from './embed-index.js'
 import { formatMemoryLine } from './render.js'
+import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry, MemoryKind } from './types.js'
 
 /** 工具集依赖 */
 export interface MemoryToolsDeps {
   store: MemoryStore
+  /**
+   * 稳定快照（G3 去重回路）：工具显式召回/检索时，排除当前 workspace 快照
+   * 已含的记忆 id——快照已由 systemPrompt 段前缀注入，工具只补快照未含的，
+   * 防同一记忆被「快照段 + 实时注入包 + 工具输出」三处重复消化（上下文腐化）。
+   */
+  snapshot: MemoryStableSnapshot
   /** P4 语义嵌入（可选；未启用时工具检索为纯关键词路径） */
   embedding?: EmbeddingService
   /** P4 嵌入索引（与 embedding 成对出现） */
@@ -139,11 +146,17 @@ function registerRecall(ctx: Context, deps: MemoryToolsDeps): void {
                   importance: { type: 'number', required: true },
                   sessionId: { type: 'string', required: true },
                   eventSeqs: { type: 'array', required: true, items: { type: 'integer' } },
+                  // G3/R2-6：投影补充创建时间（与注入包渲染一致，模型可判新旧）
+                  createdAt: { type: 'string', required: true },
                 },
                 additionalProperties: false,
               },
             },
-            total: { type: 'integer', required: true },
+            // G3：语义修正——`total` 实为返回条数（≤limit 且经快照去重），
+            // 改为诚实命名 `returned`（"返回条数"）。真实匹配总数正确统计
+            // 需 store 层新增计数方法（越出本次文件边界，store.ts 不受触碰），
+            // 故选改名——改动最小且模型不再把子集误当全量命中数。
+            returned: { type: 'integer', required: true },
           },
           additionalProperties: false,
         },
@@ -151,9 +164,9 @@ function registerRecall(ctx: Context, deps: MemoryToolsDeps): void {
           // R2-7（B7）：渲染单源——直接走 render.formatMemoryLine（memory 形状即 MemoryLineView）
           const lines = value.memories.map((memory) => formatMemoryLine(memory))
           const header =
-            value.total === 0
+            value.returned === 0
               ? '记忆库中未找到相关记忆。'
-              : `找到 ${value.total} 条相关记忆（可追问依据：memory_audit <id>）：`
+              : `找到 ${value.returned} 条相关记忆（可追问依据：memory_audit <id>）：`
           return [{ type: 'text', text: [header, ...lines].join('\n') }]
         },
       },
@@ -167,16 +180,22 @@ function registerRecall(ctx: Context, deps: MemoryToolsDeps): void {
           { workspace: workspaceOf(exec), limit: args.limit ?? 8 },
           (message) => deps.logger?.warn(message),
         )) as MemoryEntry[]
+        // G3 去重：快照已含同一记忆（system 前缀段已注入）→ 工具不再重复输出。
+        // 快照优先语义：显式查询与快照/注入重复时，快照负责呈现，工具只补缺失。
+        const workspace = workspaceOf(exec)
+        const snapshotIds = deps.snapshot.snapshotIds(workspace)
+        const deduped = results.filter((entry) => !snapshotIds.has(entry.id))
         return {
-          memories: results.map((entry) => ({
+          memories: deduped.map((entry) => ({
             id: entry.id,
             kind: entry.kind,
             content: entry.content,
             importance: entry.importance,
             sessionId: entry.source.sessionId,
             eventSeqs: entry.source.eventSeqs,
+            createdAt: entry.createdAt,
           })),
-          total: results.length,
+          returned: deduped.length,
         }
       },
     }),
@@ -225,23 +244,28 @@ function registerSearch(ctx: Context, deps: MemoryToolsDeps): void {
                 additionalProperties: false,
               },
             },
-            total: { type: 'integer', required: true },
+            // G3：同 recall——`total` 语义修正为诚实命名 `returned`（返回条数），
+            // 模型不再把 limit/去重后的子集误当全量命中数。
+            returned: { type: 'integer', required: true },
           },
           additionalProperties: false,
         },
         render: (_args, value) => {
           // R2-7（B7）：渲染单源——toSummary 形状即 MemoryLineView（含 sessionId）
           const lines = value.memories.map((memory) => formatMemoryLine(memory))
-          return [{ type: 'text', text: `共 ${value.total} 条：\n${lines.join('\n')}` }]
+          return [{ type: 'text', text: `共 ${value.returned} 条：\n${lines.join('\n')}` }]
         },
       },
       async execute(args, exec) {
+        const workspace = workspaceOf(exec)
+        // G3 去重：快照优先——排除快照已含记忆，工具只补快照未含的（防三处重复消化）
+        const snapshotIds = deps.snapshot.snapshotIds(workspace)
         // P4：语义增强检索（未启用时纯关键词；查询为空走浏览路径不嵌入）
         let results: MemoryEntry[]
         if (args.query === undefined || args.query.trim() === '') {
           results = deps.store.search({
             query: '',
-            workspace: workspaceOf(exec),
+            workspace,
             kind: args.kind,
             tag: args.tag,
             status: args.status,
@@ -254,7 +278,7 @@ function registerSearch(ctx: Context, deps: MemoryToolsDeps): void {
             deps.embedIndex,
             args.query,
             {
-              workspace: workspaceOf(exec),
+              workspace,
               kind: args.kind,
               tag: args.tag,
               status: args.status,
@@ -263,9 +287,10 @@ function registerSearch(ctx: Context, deps: MemoryToolsDeps): void {
             (message) => deps.logger?.warn(message),
           )) as MemoryEntry[]
         }
+        const deduped = results.filter((entry) => !snapshotIds.has(entry.id))
         return {
-          memories: results.map(toSummary),
-          total: results.length,
+          memories: deduped.map(toSummary),
+          returned: deduped.length,
         }
       },
     }),

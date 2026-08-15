@@ -39,6 +39,14 @@ export const SALIENCE_FLOOR_IMPORTANCE = 8
 export const SALIENCE_FLOOR_RECENCY = 0.5
 
 /**
+ * salience floor 的活跃窗口（ms；G4 防霸榜）：
+ * imp≥8 的记忆仅当"最近创建或访问在此窗口内"才保活——90 天未触碰的高重要度
+ * 记忆允许衰减软降权。审计实测：991 条 imp≥8 全部无差别保活 → 检索/快照长期
+ * 霸榜、压制新知识；活跃性门槛让"旧高重要度"按时间自然退出前排。
+ */
+export const SALIENCE_FLOOR_ACTIVE_WINDOW_MS = 90 * 86_400_000
+
+/**
  * 相关性硬门槛（F2，防上下文污染）：relevance 低于此值的记忆视为与查询无关，
  * 宁可不注入（弱相关注入 > 无注入）。
  *
@@ -161,13 +169,21 @@ export function importanceFactor(importance: number): number {
  * 时间 × 重要性调制因子（0.5..1.0）：memoryScore 与语义融合路径共用。
  * P3：半衰期随 importance 自适应 + 重要度 ≥ 8 的 salience floor（保活）。
  * B2：半衰期再乘访问频率调制（高频访问衰减更慢，召回抬回）。
+ * G4：floor 仅对活跃记忆生效（90 天内创建/访问）——旧高重要度允许软降权。
  */
 export function timeImportanceFactor(entry: MemoryEntry, now: number): number {
   let recency = recencyFactor(entry.lastAccessAt, now, modulatedHalfLifeDays(entry.importance, entry.accessCount))
-  if (entry.importance >= SALIENCE_FLOOR_IMPORTANCE) {
+  if (entry.importance >= SALIENCE_FLOOR_IMPORTANCE && isRecentlyActive(entry, now)) {
     recency = Math.max(recency, SALIENCE_FLOOR_RECENCY)
   }
   return (0.6 + 0.4 * recency) * importanceFactor(entry.importance)
+}
+
+/** G4：记忆是否"活跃"——最近创建或访问在 SALIENCE_FLOOR_ACTIVE_WINDOW_MS 内 */
+function isRecentlyActive(entry: MemoryEntry, now: number): boolean {
+  const lastAccess = Date.parse(entry.lastAccessAt)
+  const created = Date.parse(entry.createdAt)
+  return now - lastAccess <= SALIENCE_FLOOR_ACTIVE_WINDOW_MS || now - created <= SALIENCE_FLOOR_ACTIVE_WINDOW_MS
 }
 
 /**

@@ -296,6 +296,67 @@ describe('MemoryExtractor 长文本截断（O1-3 maxExtractChars）', () => {
   })
 })
 
+describe('MemoryExtractor 摘录截断标记（G1，防上下文腐化）', () => {
+  function makeExtractor() {
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    const llm = new FakeLlm('{"memories":[{"kind":"fact","content":"标记测试","importance":6}]}')
+    const extractor = new MemoryExtractor({
+      store,
+      llm,
+      logger: { warn: () => {}, info: () => {} },
+    })
+    extractor.install(ctx as unknown as Context)
+    const listener = ctx.listener('session/event')
+    if (listener === undefined) throw new Error('session/event 监听未注册')
+    return { store, llm, listener }
+  }
+
+  // 通道 A（压缩遮蔽）提取无阈值限制，便于用"短/长"跨度控制 transcript 是否超
+  // EXCERPT_MAX_CHARS=400，从而精确覆盖"截断 / 未截断"两个分支。
+
+  it('超 400 字符摘录：excerpt 追加截断标记并标注原文长度', async () => {
+    const { store, listener } = makeExtractor()
+    // 跨度文本 > 400 字符：摘录被切到前 400 字符，应带截断标记 + 原文总长度
+    const long = '很长的被压缩会话原文内容'.repeat(60) // 60 × 11 = 660 字符，远超 400
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, long), assistantEvent(3, '确认')])
+    session.events.push(compactionSummaryEvent(4, [2, 3]))
+    listener(session, session.events[3] as SessionEvent)
+    await settle()
+    expect(store.stats().total).toBe(1)
+    const entry = store.listBySession('s1')[0]
+    const excerpt = entry?.source.excerpt as string
+    // 摘录已截断：标记存在，且标注的原文长度 > EXCERPT_MAX_CHARS=400，
+    // 证明消费方可据此判断"此处被截断、原文有多长"
+    expect(excerpt).toContain('…[摘录已截断，原文')
+    const m = excerpt.match(/原文 (\d+) 字符]$/)
+    expect(m).not.toBeNull()
+    expect(Number(m![1])).toBeGreaterThan(400)
+    expect(excerpt.length).toBeGreaterThan(400) // 摘录本身 = 400 + 标记后缀
+    // 头部原文仍在、被截断的后段不可见（consumption 可据此判断完整性）
+    expect(excerpt).toContain(long.slice(0, 20))
+  })
+
+  it('未超 400 字符摘录：excerpt 无截断标记（防回归）', async () => {
+    const { store, listener } = makeExtractor()
+    const session = makeSession('s1', [
+      headerEvent(1),
+      userEvent(2, '这个片段很短，不会超过摘录长度上限'),
+      assistantEvent(3, '确认'),
+    ])
+    session.events.push(compactionSummaryEvent(4, [2, 3]))
+    listener(session, session.events[3] as SessionEvent)
+    await settle()
+    expect(store.stats().total).toBe(1)
+    const entry = store.listBySession('s1')[0]
+    const excerpt = entry?.source.excerpt as string
+    // 未超限 → 原样保留、无任何截断标记，保持既有格式
+    expect(excerpt).not.toContain('摘录已截断')
+    expect(excerpt).not.toContain('…[')
+    expect(excerpt).toContain('这个片段很短')
+  })
+})
+
 describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
   it('disposed 触发遗留批次立即提取（不等阈值）', async () => {
     const ctx = new FakeCtx()

@@ -38,9 +38,9 @@ import { tokenize } from './scoring.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
 
-/** 每批处理的候选条目数预算（只处理最新前 N 条，控制单次负载） */
-const BATCH_BUDGET = 20
-/** 候选拉取窗口（预算应用前的拉取量，放大检索范围） */
+/** 每批处理的候选条目数预算（只处理最新前 N 条，控制单次负载；G2 由 20→200，对 3441 条规模更游刃有余） */
+const BATCH_BUDGET = 200
+/** 候选拉取窗口（预算应用前的拉取量，放大检索范围；保持 200 与预算一致） */
 const CANDIDATE_WINDOW = 200
 
 /** 重复合并：tokenize Jaccard 相似度下限（≥0.85 视为近似重复） */
@@ -50,17 +50,24 @@ const MAX_IMPORTANCE_DIFF = 2
 
 /** 过期降级：updatedAt 距今超过该天数才可能降级 */
 const STALE_DAYS = 90
-/** 过期降级：重要度 ≤ 该值且从未被访问才降级（高重要/被访问的不动） */
-const MAX_STALE_IMPORTANCE = 3
+/**
+ * 过期降级：重要度 ≤ 该值 且从未被访问才降级。
+ * G2（防上下文腐化——维护力度升级）：由 3 放宽到 5。原 imp≤3 过窄，imp 4-7 且
+ * 从未访问的条目永不回收（实测 2108 条唯 imp≤3 的 36 条可降级），记忆库只进难收；
+ * imp 4-5 属中低重要度 + 长期未访问应收敛。imp≥6 保留保活语义（高重要度项目规则
+ * 即使闲置也不清出检索）。
+ */
+const MAX_STALE_IMPORTANCE = 5
 
 /** 一天毫秒数 */
 const MS_PER_DAY = 86_400_000
 
 /**
- * 后台整理间隔（ms；6 小时，与既有的 config 默认 maintenanceIntervalHours=6
- * 一致，现固定为模块内常量；导出供测试以真实常量驱动定时验证）。
+ * 后台整理间隔（ms；G2 由 6 小时缩短到 1 小时，配合单批预算放大，应对记忆库规模
+ * 增长后清理吞吐不足的问题。与 config 默认 maintenanceIntervalHours 的既有最小值
+ * 趋近，现固定为模块内常量；导出供测试以真实常量驱动定时验证）。
  */
-export const MAINTENANCE_INTERVAL_MS = 6 * 3_600_000
+export const MAINTENANCE_INTERVAL_MS = 1 * 3_600_000
 
 /** 整理任务依赖（store/logger/now 注入，便于单测；无 llm——任务纯规则） */
 export interface MemoryMaintenanceDeps {
@@ -123,7 +130,7 @@ export class MemoryMaintenance {
     }
   }
 
-  /** 调度下一周期（setTimeout 链；清除旧挂起句柄防重入）。R2-10/M2：间隔固定 6 小时，此处不夹逼 */
+  /** 调度下一周期（setTimeout 链；清除旧挂起句柄防重入）。R2-10/M2：间隔固定 1 小时（G2），此处不夹逼 */
   private schedule(): void {
     this.clearTimer()
     this.timer = setTimeout(() => this.onInterval(), MAINTENANCE_INTERVAL_MS)
@@ -184,8 +191,8 @@ export class MemoryMaintenance {
    * 保留新者（高重要度提升），旧者归档。
    * 注意（R2-10/M1）：每对经 getById 重读当前状态是有意为之——mergePair 会
    * 归档旧者/提升新者重要度，重读才能跳过已归档条目并感知重要度变化；
-   * getById 为同步内存读（table.get），窗口 20 条下约 380 次读，无性能问题，
-   * 勿"优化"为静态快照（会破坏已归档跳过语义）。
+   * getById 为同步内存读（table.get），窗口 200 条（G2 由 20 放大）下约 2 万次读，
+   * 仍为内存操作可接受，勿"优化"为静态快照（会破坏已归档跳过语义）。
    */
   private async mergeDuplicates(window: MemoryEntry[]): Promise<void> {
     for (let i = 0; i < window.length; i++) {
@@ -237,8 +244,9 @@ export class MemoryMaintenance {
 
   /**
    * 任务 c：过期降级。
-   * updatedAt 距今超 90 天 且 从未被访问（accessCount === 0）且 重要度 ≤ 3
-   * 的条目归档（审计 'archive' by 'system'；detail:'stale' 受 store.archive 无
+   * updatedAt 距今超 90 天 且 从未被访问（accessCount === 0）且 重要度 ≤ 5
+   * （G2 由 3 放宽，imp 4-5 中低重要度亦收敛，imp≥6 保活）的条目归档
+   * （审计 'archive' by 'system'；detail:'stale' 受 store.archive 无
    * detail 参数约束而省略——降级由审计动作与字段状态可还原）。
    */
   private async archiveStale(window: MemoryEntry[]): Promise<void> {

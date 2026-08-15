@@ -19,7 +19,7 @@ import { FakeCtx, FakeTable } from './helpers.js'
 const NOW = Date.UTC(2025, 0, 15, 0, 0, 0)
 /** 一天毫秒数 */
 const MS_PER_DAY = 86_400_000
-/** 定时器触发所需推进量（整理间隔已常量化：6 小时） */
+/** 定时器触发所需推进量（整理间隔已常量化：G2 起为 1 小时） */
 const INTERVAL_MS = MAINTENANCE_INTERVAL_MS
 
 /** 构造 request/header 事件（模型路由来源） */
@@ -58,7 +58,7 @@ function makeEntry(overrides: Partial<MemoryEntry> & { id: string }): MemoryEntr
   return { ...base, ...overrides }
 }
 
-/** 组装被测对象：返回 maintenance / ctx / store / 监听器（整理行为已常量化：恒启用、间隔 6 小时） */
+/** 组装被测对象：返回 maintenance / ctx / store / 监听器（整理行为已常量化：恒启用、间隔 1 小时） */
 function setup() {
   const ctx = new FakeCtx()
   const table = new FakeTable()
@@ -254,12 +254,12 @@ describe('MemoryMaintenance 重复合并（任务 a）', () => {
 })
 
 describe('MemoryMaintenance 过期降级（任务 c）', () => {
-  it('91 天前、从未访问、重要度≤3 的条目被归档', async () => {
+  it('91 天前、从未访问、重要度≤5 的条目被归档', async () => {
     const { table, store, sessionEvent, maintenance } = setup()
     const stale = makeEntry({
       id: 'stale',
       content: '过期事实',
-      importance: 3,
+      importance: 5,
       accessCount: 0,
       updatedAt: new Date(NOW - 91 * MS_PER_DAY).toISOString(),
     })
@@ -269,10 +269,46 @@ describe('MemoryMaintenance 过期降级（任务 c）', () => {
     expect(store.getById(stale.id)?.status).toBe('archived')
   })
 
-  it('被访问过 或 重要度高 或 距现在不足 90 天的条目不降级', async () => {
+  it('G2 新语义回归：imp=5 中低重要度 + 从未访问 + 超 90 天也被降权（旧条件 imp>3 不放行）', async () => {
+    const { table, store, sessionEvent, maintenance } = setup()
+    // G2 前 MAX_STALE_IMPORTANCE=3，imp=4/5 仅 36 条可降级，2108 条 imp 4-7 永不回收；
+    // 放宽至 5 后，imp=5 且长期未访问必须归档，防止记忆库只进难收。
+    const stale = makeEntry({
+      id: 'stale5',
+      content: '中低重要度长期未访问',
+      importance: 5,
+      accessCount: 0,
+      updatedAt: new Date(NOW - 91 * MS_PER_DAY).toISOString(),
+    })
+    await table.put(stale.id, stale)
+    activate(sessionEvent, makeSession('s1'))
+    await maintenance.runOnce()
+    expect(store.getById(stale.id)?.status).toBe('archived')
+  })
+
+  it('G2 防回归保活：imp=6 及以上的条目不因长期未访问而降权', async () => {
+    const { table, store, sessionEvent, maintenance } = setup()
+    // imp≥6 为高重要度保活语义（MAX_STALE_IMPORTANCE=5），即使从未访问且超 90 天也不回收，
+    // 避免把用户真正重视的项目规则/事实清出检索。
+    const high = makeEntry({
+      id: 'imp6',
+      content: '高重要度事实',
+      importance: 6,
+      accessCount: 0,
+      updatedAt: new Date(NOW - 91 * MS_PER_DAY).toISOString(),
+    })
+    await table.put(high.id, high)
+    activate(sessionEvent, makeSession('s1'))
+    await maintenance.runOnce()
+    expect(store.getById(high.id)?.status).toBe('active')
+  })
+
+  it('被访问过 或 重要度高(≥6) 或 距现在不足 90 天的条目不降级', async () => {
     const { table, store, sessionEvent, maintenance } = setup()
     const accessed = makeEntry({ id: 'acc', content: '被访问过', accessCount: 3, updatedAt: new Date(NOW - 91 * MS_PER_DAY).toISOString() })
-    const important = makeEntry({ id: 'imp', content: '重要', importance: 4, updatedAt: new Date(NOW - 91 * MS_PER_DAY).toISOString() })
+    // G2 变更记录：原用例 const imp 用 importance: 4（MAX_STALE_IMPORTANCE=3 时代 imp>3 不降级）
+    // 断言 active；放宽到 ≤5 后 imp=4 会被回收，故改高为 6 以保持"不降级"分支语义（保活）。
+    const important = makeEntry({ id: 'imp', content: '重要', importance: 6, updatedAt: new Date(NOW - 91 * MS_PER_DAY).toISOString() })
     const fresh = makeEntry({ id: 'fresh', content: '较新', importance: 1, updatedAt: new Date(NOW - 10 * MS_PER_DAY).toISOString() })
     await table.put(accessed.id, accessed)
     await table.put(important.id, important)
@@ -298,10 +334,11 @@ describe('MemoryMaintenance 标签整理（任务 d）', () => {
 })
 
 describe('MemoryMaintenance 批预算', () => {
-  it('候选超过预算只处理前 20 条', async () => {
+  it('候选超过预算只处理前 200 条（G2 由 20→200）', async () => {
     const { table, store, sessionEvent, maintenance } = setup()
-    // 25 条全部满足过期降级条件的条目；预算 20 → 仅前 20 归档
-    for (let i = 0; i < 25; i++) {
+    // G2 前 BATCH_BUDGET=20，单批仅处理最新 20 条；放宽到 200（含候选窗口上限 200）
+    // 后对 3441 条规模更游刃有余。此处 250 条全部满足过期降级 → 单批最多处理 200 条。
+    for (let i = 0; i < 250; i++) {
       const entry = makeEntry({
         id: `e${i}`,
         content: `过期条目 ${i}`,
@@ -314,8 +351,8 @@ describe('MemoryMaintenance 批预算', () => {
     }
     activate(sessionEvent, makeSession('s1'))
     await maintenance.runOnce()
-    expect(store.stats().archived).toBe(20)
-    expect(store.stats().active).toBe(5)
+    expect(store.stats().archived).toBe(200)
+    expect(store.stats().active).toBe(50)
   })
 })
 

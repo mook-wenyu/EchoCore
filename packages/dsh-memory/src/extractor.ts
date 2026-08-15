@@ -233,7 +233,19 @@ export class MemoryExtractor {
     )
     const workspace = session.header.cwd ?? DEFAULT_WORKSPACE
     const eventSeqs = events.map((event) => event.seq)
-    const excerpt = transcript.slice(0, EXCERPT_MAX_CHARS)
+    // G1 摘录截断标记（防上下文腐化）：
+    // - 摘录是写入记忆条目 source.excerpt 的回顾原文片段，供消费方（模型/审计）
+    //   判断该条记忆所依据的原始上下文；
+    // - 实测超长摘录曾被无提示地硬切到 EXCERPT_MAX_CHARS=400，被砍掉的后段对消费
+    //   方完全不可见——无法判断摘录是否完整，信息损失悄悄污染上下文（lost-in-compaction）；
+    // - 因此在 transcript 超限时，在摘录末尾追加人/审计可读的截断标记，并带上原文总
+    //   字符数，让消费方一眼可知"此处被截断、原文有多长"，从而可进一步溯源/补全；
+    // - 未超限则不追加，保持既有格式（防回归）。此处仅改造 extractor 自身落库的
+    //   摘录；tools.ts:449 的审计渲染超限省略标记属另一子代理域，不在此改动。
+    const excerpt =
+      transcript.length > EXCERPT_MAX_CHARS
+        ? `${transcript.slice(0, EXCERPT_MAX_CHARS)}…[摘录已截断，原文 ${transcript.length} 字符]`
+        : transcript.slice(0, EXCERPT_MAX_CHARS)
     for (const memory of memories) {
       await this.deps.store.create({
         workspace,
