@@ -42,6 +42,8 @@ export class EmbeddingIndex {
   private readonly vectors = new Map<string, number[]>()
   /** 全量构建串行锁（并发调用合并为一次） */
   private building: Promise<void> | undefined
+  /** 持久化串行队列（P0-1：并发 persist 互斥，见 persist()） */
+  private persistChain: Promise<void> | undefined
 
   constructor(private readonly deps: EmbeddingIndexDeps) {}
 
@@ -54,7 +56,16 @@ export class EmbeddingIndex {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
       throw error
     }
-    const parsed = JSON.parse(raw) as Record<string, unknown>
+    // P0-1：损坏 JSON（并发 rename 竞态/手工编辑产物）降级为空索引 + 告警——
+    // 嵌入层语义本为"可选附加层"（缺失向量仅影响语义召回），损坏文件不应让
+    // 插件整体加载失败；显式降级（logWarn）非静默吞错。
+    let parsed: Record<string, unknown>
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>
+    } catch (error) {
+      this.deps.logWarn('[dsh-memory] 嵌入索引文件损坏（解析失败，已按空索引加载；可删除该文件后重启重建）：', error)
+      return
+    }
     for (const [id, vector] of Object.entries(parsed)) {
       if (
         Array.isArray(vector) &&
@@ -117,7 +128,19 @@ export class EmbeddingIndex {
   }
 
   /** 原子持久化：写临时文件后 rename（防半截文件） */
-  private async persist(): Promise<void> {
+  private persist(): Promise<void> {
+    // P0-1：promise 队列串行化——fire-and-forget 的 indexEntry/remove 可并发进入
+    // persist，并发写同一 `${file}.tmp` 会让 rename 落在写入中的局部（半截文件）。
+    // 队列保证任意时刻至多一个写事务；每次写的是调用时点的 vectors 快照，后写
+    // 覆盖先写，末次写即最终态。写失败沿 promise 上抛（indexEntry/remove 调用方
+    // 各自记录），链上失败不阻断后续写（双处理器接续队列）。
+    const next = this.persistChain === undefined ? this.persistNow() : this.persistChain.then(() => this.persistNow(), () => this.persistNow())
+    this.persistChain = next
+    return next
+  }
+
+  /** 实际写事务（仅由 persist 队列调用，保证串行） */
+  private async persistNow(): Promise<void> {
     await mkdir(dirname(this.deps.file), { recursive: true })
     const tmp = `${this.deps.file}.tmp`
     await writeFile(tmp, JSON.stringify(Object.fromEntries(this.vectors)), 'utf8')

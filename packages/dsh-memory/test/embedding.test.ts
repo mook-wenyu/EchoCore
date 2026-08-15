@@ -216,4 +216,56 @@ describe('EmbeddingIndex', () => {
     expect(index.get('bad')).toBeUndefined()
     expect(warns.some((message) => message.includes('畸形'))).toBe(true)
   })
+
+  it('损坏 JSON 文件 load 降级为空索引并告警（P0-1：不抛致命错误）', async () => {
+    const { file, index, warns } = await setup()
+    const { writeFile } = await import('node:fs/promises')
+    // 半截写入（并发 rename 竞态的产物）——JSON 无法 parse
+    await writeFile(file, '{"m-1":[0.1,0.2,', 'utf8')
+    await expect(index.load()).resolves.toBeUndefined()
+    expect(index.get('m-1')).toBeUndefined()
+    expect(warns.some((message) => message.includes('损坏') || message.includes('解析'))).toBe(true)
+  })
+
+  it('并发 indexEntry 持久化串行互斥：最终文件完整可解析（P0-1 竞态回归）', async () => {
+    const { file, index } = await setup()
+    // 慢嵌入（50ms）制造并发窗口：多条 fire-and-forget 同时进入 embedOne → persist
+    const slow = new EmbeddingIndex({
+      file,
+      service: {
+        state: 'ready',
+        embed: async (text: string) => {
+          await new Promise((resolve) => setTimeout(resolve, 50))
+          const v = new Float32Array(384)
+          v[0] = text.length
+          return v
+        },
+      },
+      listAll: () => [] as MemoryEntry[],
+      logWarn: () => {},
+    })
+    const entries = Array.from({ length: 8 }, (_, i) => ({
+      id: `m-${i}`,
+      content: `内容${i}`,
+    })) as unknown as MemoryEntry[]
+    for (const entry of entries) slow.indexEntry(entry)
+    // 等全部落地（8 × 50ms 串行化后约 400ms；轮询文件内容达到 8 条或超时）
+    const { readFile } = await import('node:fs/promises')
+    let parsed: Record<string, number[]> | undefined
+    for (let i = 0; i < 100; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      try {
+        parsed = JSON.parse(await readFile(file, 'utf8')) as Record<string, number[]>
+        if (Object.keys(parsed).length === entries.length) break
+      } catch {
+        // 文件未就绪或写入中——继续等
+      }
+    }
+    expect(parsed).toBeDefined()
+    expect(Object.keys(parsed!)).toHaveLength(entries.length)
+    // 每条向量可完整读回且维度正确
+    for (const entry of entries) {
+      expect(parsed![entry.id]).toHaveLength(384)
+    }
+  })
 })
