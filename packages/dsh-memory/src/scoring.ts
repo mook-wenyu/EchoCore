@@ -111,6 +111,18 @@ export function adaptiveHalfLifeDays(importance: number): number {
 }
 
 /**
+ * 访问频率调制半衰期（天）（B2，Elastic agent memory / FadeMem 落地模式）：
+ * 访问次数越多衰减越慢——召回行为本身把记忆"抬回"前排（被频繁使用的记忆
+ * 更有价值）。调制因子 1 + log2(1 + accessCount)：0 次 → 1×；1 次 → 2×；
+ * 3 次 → 3×；7 次 → 4×（对数增长，防止高频访问无限放大）。
+ * 与 importance 感知叠加：高重要度 + 高频访问的记忆衰减最慢。
+ */
+export function modulatedHalfLifeDays(importance: number, accessCount: number): number {
+  const frequencyFactor = 1 + Math.log2(1 + Math.max(0, Math.floor(accessCount)))
+  return adaptiveHalfLifeDays(importance) * frequencyFactor
+}
+
+/**
  * 时间衰减因子：以 lastAccessAt 为基准的半衰期指数衰减（半衰期可注入）。
  * 返回 1（刚访问）到趋近 0（久未访问）之间的值。
  */
@@ -128,9 +140,10 @@ export function importanceFactor(importance: number): number {
 /**
  * 时间 × 重要性调制因子（0.5..1.0）：memoryScore 与语义融合路径共用。
  * P3：半衰期随 importance 自适应 + 重要度 ≥ 8 的 salience floor（保活）。
+ * B2：半衰期再乘访问频率调制（高频访问衰减更慢，召回抬回）。
  */
 export function timeImportanceFactor(entry: MemoryEntry, now: number): number {
-  let recency = recencyFactor(entry.lastAccessAt, now, adaptiveHalfLifeDays(entry.importance))
+  let recency = recencyFactor(entry.lastAccessAt, now, modulatedHalfLifeDays(entry.importance, entry.accessCount))
   if (entry.importance >= SALIENCE_FLOOR_IMPORTANCE) {
     recency = Math.max(recency, SALIENCE_FLOOR_RECENCY)
   }

@@ -9,6 +9,7 @@ import {
   adaptiveHalfLifeDays,
   importanceFactor,
   memoryScore,
+  modulatedHalfLifeDays,
   recencyFactor,
   relevanceScore,
   rrfScore,
@@ -193,8 +194,32 @@ describe('memoryScore 衰减增强（P3）', () => {
   })
 })
 
-describe('rrfScore（RRF 排名融合，B1）', () => {
-  it('双榜第一 = 1（归一化上界）', () => {
+describe('modulatedHalfLifeDays（访问频率调制衰减，B2）', () => {
+  it('访问次数延长半衰期：0→1×、1→2×、3→3×、7→4×（1+log2(1+n)）', () => {
+    const base = adaptiveHalfLifeDays(5) // 7 天
+    expect(modulatedHalfLifeDays(5, 0)).toBeCloseTo(base)
+    expect(modulatedHalfLifeDays(5, 1)).toBeCloseTo(base * 2)
+    expect(modulatedHalfLifeDays(5, 3)).toBeCloseTo(base * 3)
+    expect(modulatedHalfLifeDays(5, 7)).toBeCloseTo(base * 4)
+    expect(modulatedHalfLifeDays(5, 15)).toBeCloseTo(base * 5)
+  })
+
+  it('与 importance 感知叠加：高频访问的高重要度记忆衰减最慢', () => {
+    const lowFreqLowImp = modulatedHalfLifeDays(3, 0)
+    const highFreqHighImp = modulatedHalfLifeDays(9, 7)
+    expect(highFreqHighImp).toBeGreaterThan(lowFreqLowImp * 4)
+  })
+
+  it('高频访问的久远记忆得分高于低频访问（召回抬回）', () => {
+    const now = Date.parse('2026-01-15T00:00:00.000Z')
+    const VERY_OLD = '2025-01-01T00:00:00.000Z' // 一年前
+    const visited = entry({ id: 'a', importance: 5, lastAccessAt: VERY_OLD, accessCount: 15 })
+    const ignored = entry({ id: 'b', importance: 5, lastAccessAt: VERY_OLD, accessCount: 0 })
+    expect(memoryScore(visited, ['pnpm'], now)).toBeGreaterThan(memoryScore(ignored, ['pnpm'], now))
+  })
+})
+
+describe('rrfScore（RRF 排名融合，B1）', () => {  it('双榜第一 = 1（归一化上界）', () => {
     expect(rrfScore(1, 1)).toBe(1)
   })
 
