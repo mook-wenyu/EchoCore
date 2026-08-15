@@ -52,9 +52,33 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 | `maxExtractChars` | 12000 | 增量提取摘录长度上限（超限截尾保最新） |
 | `extractMaxTokens` | 2048 | 提取调用输出上限 |
 | `enableAutoInject` | true | 自动注入总开关 |
+| `enableSnapshot` | true | 稳定快照开关（system 前缀缓存感知注入；窗口内字节不变） |
+| `snapshotTtlMs` | 300000 | 快照缓存窗口（ms；过期或记忆变更后重建） |
+| `snapshotBudgetChars` | 8192 | 快照预算（字符；重要性优先取数，预算内截断） |
+| `snapshotTopK` | 30 | 快照 Top-K 候选上限 |
 | `enableExtractor` | true | 提取器总开关 |
 | `enableMaintenance` | true | 后台记忆整理任务开关（O8-M） |
 | `maintenanceIntervalHours` | 6 | 后台整理间隔（小时；有会话活动后计时） |
+| `embeddingEnabled` | false | 语义嵌入检索开关（默认关闭；模型文件与依赖体积是有意取舍，需显式启用） |
+| `embeddingModelDir` | `~/.dsh/storages/embedding-model` | 嵌入模型目录（含 ONNX 与 tokenizer 文件） |
+| `embeddingFusionWeight` | 0.5 | 语义融合权重：`final = w×relevance + (1-w)×cosine` |
+
+### 语义嵌入（P4，默认关闭）
+
+本地嵌入检索（`@huggingface/transformers` + `Xenova/all-MiniLM-L6-v2` q8，
+384 维，模型 21.9MB）：关键词零重合但语义相关的记忆可被召回。启用步骤：
+
+```bash
+# 1. 下载模型（hf-mirror，国内可达；或手动复制到模型目录）
+node packages/dsh-memory/scripts/download-embedding-model.mjs
+# 2. 组合行配置 embeddingEnabled: true 后重启实例
+```
+
+- 嵌入索引独立持久化（`~/.dsh/storages/memory-embeddings.json`），不污染
+  memory.json 条目 schema；启动全量补齐（~1.2s/1260 条）+ 新建增量 + 归档移除
+- 一等状态（`disabled/loading/ready/error`）：初始化失败显式记录并保持关键词
+  检索（非静默兜底）；运行期故障显式降级并告警
+- **依赖体积 +374.9MB**（onnxruntime-node 全平台预编译）；默认关闭即无运行时成本
 
 ## 集成（已执行，全局启用：所有 Agent 可用）
 
