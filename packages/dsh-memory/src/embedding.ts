@@ -131,7 +131,7 @@ export function cosine(a: ArrayLike<number>, b: ArrayLike<number>): number {
 /** 语义检索的可选附加选项（与 store.SearchOptions 子集一致；type-only 引用防循环） */
 export type SemanticSearchExtra = Omit<
   import('./store.js').SearchOptions,
-  'query' | 'queryEmbedding' | 'lookupEmbedding' | 'fusionWeight'
+  'query' | 'queryEmbedding' | 'lookupEmbedding'
 >
 
 /**

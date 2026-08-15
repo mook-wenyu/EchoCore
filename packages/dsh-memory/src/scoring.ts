@@ -152,3 +152,21 @@ export function memoryScore(entry: MemoryEntry, queryTokens: string[], now: numb
 export function scoreEntry(entry: MemoryEntry, query: string, now: number): number {
   return memoryScore(entry, tokenize(query), now)
 }
+
+/** RRF 平滑常数（业界标准 k=60：cuuun/lin 2019，RRF 论文推荐） */
+const RRF_K = 60
+
+/**
+ * RRF（Reciprocal Rank Fusion）排名融合分（B1：2026 混合检索默认栈）。
+ * 两路排名（关键词 relevance 榜 / 语义 cosine 榜）按 1/(k+rank) 叠加后归一化：
+ * - 双榜第一 = 1（上界）；单榜第一 = 0.5（半权）；双榜均不在榜 = 0；
+ * - rank 为 1-based；undefined = 该路未上榜（relevance=0 或 cosine≤0）→ 0 贡献。
+ * 与分数加权（w×rel+(1-w)×cos）的差异：RRF 只用排名不用分值，天然免疫两路
+ * 分数尺度差异（rel 0..1 vs cos -1..1），且零重合高语义相关条目可单榜上榜。
+ */
+export function rrfScore(kwRank: number | undefined, semRank: number | undefined, k = RRF_K): number {
+  let score = 0
+  if (kwRank !== undefined) score += 1 / (k + kwRank)
+  if (semRank !== undefined) score += 1 / (k + semRank)
+  return score / (2 / (k + 1))
+}

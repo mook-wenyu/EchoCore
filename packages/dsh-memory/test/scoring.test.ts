@@ -11,6 +11,7 @@ import {
   memoryScore,
   recencyFactor,
   relevanceScore,
+  rrfScore,
   SALIENCE_FLOOR_IMPORTANCE,
   SALIENCE_FLOOR_RECENCY,
   scoreEntry,
@@ -189,5 +190,31 @@ describe('memoryScore 衰减增强（P3）', () => {
     const fresh = entry({ id: 'a', importance: 9, lastAccessAt: '2026-01-14T00:00:00.000Z' })
     const old = entry({ id: 'b', importance: 9, lastAccessAt: '2025-12-01T00:00:00.000Z' })
     expect(memoryScore(fresh, ['pnpm'], now)).toBeGreaterThan(memoryScore(old, ['pnpm'], now))
+  })
+})
+
+describe('rrfScore（RRF 排名融合，B1）', () => {
+  it('双榜第一 = 1（归一化上界）', () => {
+    expect(rrfScore(1, 1)).toBe(1)
+  })
+
+  it('单榜第一 = 0.5（归一化半权）', () => {
+    expect(rrfScore(1, undefined)).toBe(0.5)
+    expect(rrfScore(undefined, 1)).toBe(0.5)
+  })
+
+  it('双榜均不在榜 = 0', () => {
+    expect(rrfScore(undefined, undefined)).toBe(0)
+  })
+
+  it('排名越靠前贡献越大且单调', () => {
+    expect(rrfScore(1, 1)).toBeGreaterThan(rrfScore(2, 1))
+    expect(rrfScore(3, 3)).toBeGreaterThan(rrfScore(4, 4))
+    // 单榜第二 < 单榜第一
+    expect(rrfScore(2, undefined)).toBeLessThan(rrfScore(1, undefined))
+  })
+
+  it('双榜靠前优于单榜靠前（两通道证据叠加）', () => {
+    expect(rrfScore(2, 2)).toBeGreaterThan(rrfScore(1, undefined))
   })
 })

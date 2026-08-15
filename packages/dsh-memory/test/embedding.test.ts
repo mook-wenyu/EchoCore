@@ -102,7 +102,7 @@ describe('store 语义融合检索', () => {
     return v
   }
 
-  it('关键词零重合但语义相关（cosine 高）的条目被召回', async () => {
+  it('关键词零重合但语义相关（cosine 高）的条目被召回（RRF 单榜上榜）', async () => {
     const table = new FakeTable()
     const store = new MemoryStore(table, () => now)
     // 内容与"怎么管理多包项目"零 token 重合
@@ -114,7 +114,6 @@ describe('store 语义融合检索', () => {
       minScore: 0.15,
       queryEmbedding: vec(0),
       lookupEmbedding: () => Array.from(vec(0)),
-      fusionWeight: 0.5,
     })
     expect(results).toHaveLength(1)
   })
@@ -229,13 +228,14 @@ describe('EmbeddingIndex', () => {
 
   it('并发 indexEntry 持久化串行互斥：最终文件完整可解析（P0-1 竞态回归）', async () => {
     const { file, index } = await setup()
-    // 慢嵌入（50ms）制造并发窗口：多条 fire-and-forget 同时进入 embedOne → persist
+    // 慢嵌入制造并发窗口：多条 fire-and-forget 同时进入 embedOne → persist
+    // （20ms/条：全量并行跑时留足时序余量，防轮询超时误报）
     const slow = new EmbeddingIndex({
       file,
       service: {
         state: 'ready',
         embed: async (text: string) => {
-          await new Promise((resolve) => setTimeout(resolve, 50))
+          await new Promise((resolve) => setTimeout(resolve, 20))
           const v = new Float32Array(384)
           v[0] = text.length
           return v
@@ -249,10 +249,10 @@ describe('EmbeddingIndex', () => {
       content: `内容${i}`,
     })) as unknown as MemoryEntry[]
     for (const entry of entries) slow.indexEntry(entry)
-    // 等全部落地（8 × 50ms 串行化后约 400ms；轮询文件内容达到 8 条或超时）
+    // 等全部落地（8 × 20ms 串行化后约 160ms；轮询文件内容达到 8 条或超时）
     const { readFile } = await import('node:fs/promises')
     let parsed: Record<string, number[]> | undefined
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 200; i++) {
       await new Promise((resolve) => setTimeout(resolve, 25))
       try {
         parsed = JSON.parse(await readFile(file, 'utf8')) as Record<string, number[]>

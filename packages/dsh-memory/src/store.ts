@@ -16,7 +16,7 @@
 import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 import { cosine } from './embedding.js'
-import { relevanceScore, scoreEntry, timeImportanceFactor, tokenize } from './scoring.js'
+import { relevanceScore, rrfScore, scoreEntry, timeImportanceFactor, tokenize } from './scoring.js'
 import {
   dedupKeyOf,
   newMemoryId,
@@ -50,14 +50,13 @@ export interface SearchOptions {
   includeSuperseded?: boolean
   /**
    * 语义融合检索（P4，可选）：提供查询向量与条目向量查找时，评分切换为
-   * `(w×relevance + (1-w)×max(0,cosine)) × 时间 × 重要性`——关键词零重合
-   * 但语义相关的条目可被召回。任一项缺失则退回纯关键词路径。
+   * `RRF(关键词榜, 语义榜) × 时间 × 重要性`（B1：排名融合，免疫两路分数尺度
+   * 差异）——关键词零重合但语义相关的条目可单榜上榜被召回。
+   * 任一项缺失则退回纯关键词路径。
    */
   queryEmbedding?: ArrayLike<number>
   /** 条目向量查找（id → 384 维向量；undefined = 尚无嵌入，该条目只用关键词分） */
   lookupEmbedding?: (id: string) => number[] | undefined
-  /** 语义融合权重（0..1；默认 0.5） */
-  fusionWeight?: number
 }
 
 /**
@@ -366,21 +365,41 @@ export class MemoryStore {
       top = matches.slice(0, limit)
     } else {
       const scored: Array<{ entry: MemoryEntry; score: number }> = []
-      // P4 语义融合：提供查询向量与条目向量查找时启用（关键词零重合但语义相关可召回）
+      // P4+B1 语义融合：提供查询向量与条目向量查找时，两路排名（关键词
+      // relevance / 语义 cosine）经 RRF 融合——排名融合免疫两路分数尺度差异，
+      // 零重合高语义相关条目可单榜上榜（P4 意图保持）。
       const semantic = options.queryEmbedding !== undefined && options.lookupEmbedding !== undefined
-      const weight = options.fusionWeight ?? 0.5
       const queryTokenList = tokenize(query)
-      for (const entry of matches) {
-        let score: number
-        if (semantic) {
-          const rel = relevanceScore(queryTokenList, entryTokensOf(entry))
-          const vector = options.lookupEmbedding?.(entry.id)
-          const cos = vector === undefined ? 0 : Math.max(0, cosine(options.queryEmbedding!, vector))
-          score = (weight * rel + (1 - weight) * cos) * timeImportanceFactor(entry, now)
-        } else {
-          score = scoreEntry(entry, query, now)
+      if (semantic) {
+        // 关键词榜：relevance > 0 的条目降序（同分按 id 稳定；relevance=0 不上榜）
+        const withRel = matches.map((entry) => ({ entry, rel: relevanceScore(queryTokenList, entryTokensOf(entry)) }))
+        const kwRanked = withRel
+          .filter((item) => item.rel > 0)
+          .sort((a, b) => b.rel - a.rel || a.entry.id.localeCompare(b.entry.id))
+        const kwRank = new Map<string, number>()
+        kwRanked.forEach((item, index) => kwRank.set(item.entry.id, index + 1))
+        // 语义榜：cosine > 0 的条目降序（同分按 id 稳定；无向量/负相似不上榜）
+        const semRanked = matches
+          .map((entry) => ({
+            entry,
+            cos: (() => {
+              const vector = options.lookupEmbedding?.(entry.id)
+              return vector === undefined ? 0 : cosine(options.queryEmbedding!, vector)
+            })(),
+          }))
+          .filter((item) => item.cos > 0)
+          .sort((a, b) => b.cos - a.cos || a.entry.id.localeCompare(b.entry.id))
+        const semRank = new Map<string, number>()
+        semRanked.forEach((item, index) => semRank.set(item.entry.id, index + 1))
+        for (const { entry } of withRel) {
+          const score = rrfScore(kwRank.get(entry.id), semRank.get(entry.id)) * timeImportanceFactor(entry, now)
+          if (score >= minScore) scored.push({ entry, score })
         }
-        if (score >= minScore) scored.push({ entry, score })
+      } else {
+        for (const entry of matches) {
+          const score = scoreEntry(entry, query, now)
+          if (score >= minScore) scored.push({ entry, score })
+        }
       }
       scored.sort((a, b) => b.score - a.score)
       top = scored.slice(0, limit).map((item) => item.entry)
