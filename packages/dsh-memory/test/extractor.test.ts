@@ -10,11 +10,10 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { MemoryExtractor, type ExtractorConfig } from '../src/extractor.js'
 import { MemoryStore } from '../src/store.js'
 import { FakeTable, settle } from './helpers.js'
-
 /** 假 ctx：捕获事件监听器，供测试直接驱动 */
 class FakeCtx {
-  readonly listeners = new Map<string, (session: Session, event: SessionEvent) => void>()
-  on(type: string, listener: (session: Session, event: SessionEvent) => void): void {
+  readonly listeners = new Map<string, (...args: unknown[]) => void>()
+  on(type: string, listener: (...args: unknown[]) => void): void {
     this.listeners.set(type, listener)
   }
   get(): undefined {
@@ -87,6 +86,11 @@ function turnEndEvent(seq: number, turn: number): SessionEvent {
   return { type: 'turn/end', seq, time: seq, data: { turn, reason: { kind: 'complete' } } } as SessionEvent
 }
 
+/** 构造 agent/disposed 事件载荷 */
+function disposePayload(id: string, session: Session): { agent: { id: string; session: Session } } {
+  return { agent: { id, session } }
+}
+
 /** 构造 compaction/summary 事件 */
 function compactionSummaryEvent(seq: number, shadowedSeqs: number[]): SessionEvent {
   return {
@@ -109,7 +113,13 @@ function compactionSummaryEvent(seq: number, shadowedSeqs: number[]): SessionEve
 
 /** 配置工厂 */
 function config(overrides: Partial<ExtractorConfig> = {}): ExtractorConfig {
-  return { enableExtractor: true, minExtractChars: 100, extractMaxTokens: 100, ...overrides }
+  return {
+    enableExtractor: true,
+    minExtractChars: 100,
+    maxExtractChars: 12000,
+    extractMaxTokens: 100,
+    ...overrides,
+  }
 }
 
 /** 组装被测对象 */
@@ -221,7 +231,7 @@ describe('MemoryExtractor 失败与开关', () => {
   })
 
   it('enableExtractor=false 时完全静默', async () => {
-    const { llm, listener } = setup({ config: { enableExtractor: false, minExtractChars: 100, extractMaxTokens: 100 } })
+    const { llm, listener } = setup({ config: { enableExtractor: false, minExtractChars: 100, maxExtractChars: 12000, extractMaxTokens: 100 } })
     const session = makeSession('s1', [headerEvent(1), userEvent(2, '丙'.repeat(300)), turnEndEvent(3, 1)])
     listener(session, session.events[1] as SessionEvent)
     listener(session, session.events[2] as SessionEvent)
@@ -236,5 +246,154 @@ describe('MemoryExtractor 失败与开关', () => {
     listener(session, session.events[1] as SessionEvent)
     await settle()
     expect(llm.calls).toBe(0)
+  })
+})
+
+describe('MemoryExtractor 长文本截断（O1-3 maxExtractChars）', () => {
+  function makeExtractor(overrides: Partial<ExtractorConfig>) {
+    const warns: string[] = []
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    const llm = new FakeLlm('{"memories":[{"kind":"fact","content":"最新片段","importance":6}]}')
+    const extractor = new MemoryExtractor({
+      store,
+      llm,
+      logger: { warn: (m: string) => warns.push(m), info: () => {} },
+      config: {
+        enableExtractor: true,
+        minExtractChars: 5,
+        maxExtractChars: 12000,
+        extractMaxTokens: 100,
+        ...overrides,
+      },
+    })
+    extractor.install(ctx as unknown as Context)
+    const listener = ctx.listeners.get('session/event')
+    if (listener === undefined) throw new Error('监听未注册')
+    return { warns, llm, listener, store }
+  }
+
+  it('超限时截尾保最新，且在 \\n 边界切', async () => {
+    const { warns, llm, listener } = makeExtractor({ maxExtractChars: 40 })
+    // 文本远超上限：头部"旧内容"应在截断中被丢弃，保留尾部
+    const text = `${'旧内容'.repeat(20)}\n${'新内容'.repeat(20)}`
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, text), turnEndEvent(3, 1)])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(1)
+    expect(llm.lastTranscript).not.toContain('旧内容')
+    expect(llm.lastTranscript).toContain('新内容')
+    expect(warns.length).toBeGreaterThan(0)
+  })
+
+  it('未超限时保留完整文本且不 warn', async () => {
+    const { warns, llm, listener } = makeExtractor({ maxExtractChars: 5000 })
+    const text = '完整内容会被完整保留下来'
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, text), turnEndEvent(3, 1)])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(warns).toHaveLength(0)
+    expect(llm.lastTranscript).toContain('完整内容会被完整保留下来')
+  })
+
+  it('compaction 通道同样截断', async () => {
+    const { warns, llm, listener } = makeExtractor({ maxExtractChars: 40 })
+    const long = '被压缩的长文本内容'.repeat(10)
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, long), assistantEvent(3, 'OK')])
+    session.events.push(compactionSummaryEvent(4, [2, 3]))
+    listener(session, session.events[3] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(1)
+    expect(warns.length).toBeGreaterThan(0)
+    expect(llm.lastTranscript.length).toBeLessThan(100)
+  })
+})
+
+describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
+  it('disposed 触发遗留批次立即提取（不等阈值）', async () => {
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    const llm = new FakeLlm('{"memories":[{"kind":"fact","content":"遗留批次","importance":6}]}')
+    const extractor = new MemoryExtractor({
+      store,
+      llm,
+      logger: { warn: () => {}, info: () => {} },
+      config: config({ minExtractChars: 1000 }), // 远高于文本量，正常路径不会触发
+    })
+    extractor.install(ctx as unknown as Context)
+    const listener = ctx.listeners.get('session/event')
+    const dispose = ctx.listeners.get('agent/disposed')
+    if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '短文本'), turnEndEvent(3, 1)])
+    // 文本量 < minExtractChars(1000)：增量通道只挂起不提取
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(0)
+    // 会话结束：flush 遗留批次
+    dispose(disposePayload('s1', session))
+    await settle()
+    expect(llm.calls).toBe(1)
+    expect(store.stats().total).toBe(1)
+  })
+
+  it('disposed 清理遗留批次，重复 dispose 不重复提取', async () => {
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    const llm = new FakeLlm('{"memories":[]}')
+    const extractor = new MemoryExtractor({
+      store,
+      llm,
+      logger: { warn: () => {}, info: () => {} },
+      config: config({ minExtractChars: 1000 }),
+    })
+    extractor.install(ctx as unknown as Context)
+    const listener = ctx.listeners.get('session/event')
+    const dispose = ctx.listeners.get('agent/disposed')
+    if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '短文本'), turnEndEvent(3, 1)])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    expect(llm.calls).toBe(0)
+    dispose(disposePayload('s1', session))
+    await settle()
+    expect(llm.calls).toBe(1)
+    // 再次 dispose：批次已清理，不应重复提取
+    dispose(disposePayload('s1', session))
+    await settle()
+    expect(llm.calls).toBe(1)
+  })
+
+  it('flush 失败时 warn 一次并仍清理', async () => {
+    const ctx = new FakeCtx()
+    const table = new FakeTable()
+    const store = new MemoryStore(table)
+    const llm = new FakeLlm(new Error('模型不可用'))
+    const warns: string[] = []
+    const extractor = new MemoryExtractor({
+      store,
+      llm,
+      logger: { warn: (m: string) => warns.push(m), info: () => {} },
+      config: config({ minExtractChars: 1000 }),
+    })
+    extractor.install(ctx as unknown as Context)
+    const listener = ctx.listeners.get('session/event')
+    const dispose = ctx.listeners.get('agent/disposed')
+    if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, '短文本'), turnEndEvent(3, 1)])
+    listener(session, session.events[1] as SessionEvent)
+    listener(session, session.events[2] as SessionEvent)
+    await settle()
+    dispose(disposePayload('s1', session))
+    await settle()
+    expect(warns.length).toBeGreaterThan(0)
+    expect(store.stats().total).toBe(0)
+    // 已清理：后续 dispose 不再尝试
+    dispose(disposePayload('s1', session))
+    await settle()
+    expect(llm.calls).toBe(1)
   })
 })

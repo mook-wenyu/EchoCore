@@ -20,7 +20,7 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { DEFAULT_WORKSPACE, MEMORY_PLUGIN_ID } from './constants.js'
+import { DEFAULT_WORKSPACE, MEMORY_PLUGIN_ID, shortSessionId } from './constants.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
 
@@ -45,14 +45,17 @@ export interface RenderedPack {
   ids: string[]
 }
 
-/** pre-step 事件载荷（与 Event 目录签名一致） */
+/** pre-step 事件载荷（与 Event 目录签名一致；messages 为 UserMessage 精确形态） */
 interface PreStepPayload {
   agent: { id: string; session: Session }
-  messages: Array<{ content: Array<{ type: string; text?: string }> }>
+  messages: Array<{ source: { kind: string }; content: Array<{ type: string; text?: string }> }>
 }
 
 /** session/event 监听器形态 */
 type SessionEventListener = (session: Session, event: SessionEvent) => void
+
+/** agent/disposed 监听器形态 */
+type DisposedListener = (payload: { agent: { id: string; session: Session } }) => void
 
 export class MemoryInjector {
   /** 会话 → 待回填的记忆 id 队列（与下一次自身注入消息一一对应） */
@@ -62,12 +65,27 @@ export class MemoryInjector {
 
   constructor(private readonly deps: InjectorDeps) {}
 
-  /** 注册 pre-step 与 session/event 监听 */
+  /** 注册 pre-step、session/event 与 agent/disposed 监听 */
   install(ctx: Context): void {
     ctx.on('agent/pre-step', (payload: PreStepPayload, next: () => Promise<PreStepDecision>) =>
       this.handlePreStep(payload, next),
     )
     ctx.on('session/event', this.onSessionEvent.bind(this) as SessionEventListener)
+    // O2-4：会话结束清理两张去重/回填表，防跨会话残留
+    ctx.on('agent/disposed', ((payload: { agent: { id: string; session: Session } }) => {
+      this.onDisposed(payload)
+    }) as DisposedListener)
+  }
+
+  /**
+   * 会话结束（O2-4）：清理该会话的 pendingIds 与 injectedSeqs。
+   * 会话已死，其注入去重状态与待回填队列不再有意义；不清理会造成跨会话
+   * 记忆 id 残留（下一个会话若复用该 id 会被误判"已注入而不注入"）。
+   */
+  private onDisposed(payload: { agent: { id: string; session: Session } }): void {
+    const agentId = payload.agent.id
+    this.pendingIds.delete(agentId)
+    this.injectedSeqs.delete(agentId)
   }
 
   /** pre-step waterfall：下游决定为 enter 且批次非空时才注入 */
@@ -138,9 +156,17 @@ export class MemoryInjector {
   }
 }
 
-/** 从 pre-step 批次提取查询文本（只取文本块） */
-function textOfBatch(messages: PreStepPayload['messages']): string {
+/**
+ * 从 pre-step 批次提取检索查询文本（M8 查询清洗）。
+ * 只取 `source.kind === 'user'` 的用户消息文本块——排除本插件注入
+ * （plugin / recall）、模型、工具等来源，防止：
+ * - 以本插件注入内容再次命中同一批记忆（自引循环）；
+ * - 工具结果噪声污染检索相关性。
+ * 全为排除来源时返回空串，调用方据此跳过注入。
+ */
+export function textOfBatch(messages: PreStepPayload['messages']): string {
   return messages
+    .filter((message) => message.source?.kind === 'user')
     .flatMap((message) => message.content)
     .filter((block) => block.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text as string)
@@ -177,6 +203,7 @@ export function renderPack(entries: MemoryEntry[], budgetChars: number): Rendere
 /** 单条记忆渲染：分类、内容、重要度、短 id（可追溯）、来源会话短 id（工具与注入共用） */
 export function formatMemoryLine(entry: MemoryEntry): string {
   const memoryId = entry.id.slice(0, 8)
-  const sourceSession = entry.source.sessionId.slice(0, 8)
+  // 短会话 id 去 'session-' 前缀（直接 slice 会截到前缀本身，见 shortSessionId 注释）
+  const sourceSession = shortSessionId(entry.source.sessionId)
   return `- [${entry.kind}] ${entry.content}（重要度 ${entry.importance}，记忆 #${memoryId}，来自会话 ${sourceSession}）`
 }

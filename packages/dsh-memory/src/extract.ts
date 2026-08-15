@@ -40,6 +40,9 @@ export const EXTRACTION_SYSTEM_PROMPT = `你是一个记忆提取器，为 AI �
 3. 不编造原文没有的信息；信息不完整时如实摘录并标注不确定
 4. 同一摘录中重复信息合并为一条
 5. 重要性 importance（1-10）：该信息对未来决策的影响程度
+6. 忽略元内容：会话摘要、'来自记忆 #xxx' 的引用、'[参考记忆]' 包裹的文本、压缩摘要——这些不是原始对话事实，不得提取
+7. 保持具体：保留时间、数值、标识符与限定条件；禁止把多条具体事实概括成一句抽象结论
+8. 状态变化：若摘录显示既有认知被更新或推翻（如"改用 X 替代 Y"、"不再使用 Z"），按新状态提取
 
 输出严格 JSON（不要输出任何其他文字）：
 {"memories":[{"kind":"fact","content":"...","importance":7,"tags":["标签"]}]}
@@ -61,9 +64,30 @@ function textOf(blocks: ReadonlyArray<{ type: string; text?: string }>): string 
 }
 
 /**
+ * 段落级回述防线：从单条摘录文本中剔除以 `[参考记忆]` 开头的段落。
+ *
+ * 用途（O1-2 双层防线）：
+ * - 第一层在事件级：`renderEventsText` 按 source.plugin 滤掉本插件注入消息；
+ * - 本层为段落级双保险：注入包文本即使被以 user 来源重放，或被 assistant
+ *   逐字回述（其单条文本内嵌整个 [参考记忆] 头），也因其首个段落以该标记开头
+ *   而被整段剔除——防止"从注入内容再提取记忆"的反馈循环污染训练语料。
+ *
+ * 实现：以 `\n\n` 切分段落，仅剔除 trimmed 首段以 `[参考记忆]` 开头的块；
+ * 同一文本内其他段落（真实对话）原样保留，避免误删后续真实内容；文本中部
+ * 出现的该标记不受影响（保留原文语义）。
+ */
+export function stripReferenceMemoryParagraphs(text: string): string {
+  const paragraphs = text.split('\n\n')
+  return paragraphs
+    .filter((paragraph) => !paragraph.trimStart().startsWith('[参考记忆]'))
+    .join('\n\n')
+}
+
+/**
  * 从事件列表渲染提取用的摘录文本。
  * 只取 user/message 与 assistant/message 的文本块；跳过工具结果（噪声）
  * 与记忆插件自身的注入消息（防"从注入内容再提取记忆"的反馈循环）。
+ * 每条事件文本再经 stripReferenceMemoryParagraphs 做段落级回述防线（双保险）。
  */
 export function renderEventsText(events: readonly SessionEvent[]): string {
   const parts: string[] = []
@@ -71,9 +95,9 @@ export function renderEventsText(events: readonly SessionEvent[]): string {
     if (event.type === 'user/message') {
       const source = event.data.source
       if (source.kind === 'plugin' && source.plugin === MEMORY_PLUGIN_ID) continue
-      parts.push(textOf(event.data.content))
+      parts.push(stripReferenceMemoryParagraphs(textOf(event.data.content)))
     } else if (event.type === 'assistant/message') {
-      parts.push(textOf(event.data.message.content))
+      parts.push(stripReferenceMemoryParagraphs(textOf(event.data.message.content)))
     }
   }
   return parts.filter((part) => part.length > 0).join('\n')

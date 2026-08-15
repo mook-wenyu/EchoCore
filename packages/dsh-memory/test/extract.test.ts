@@ -12,6 +12,7 @@ import {
   renderEventsText,
   resolveRoute,
   runExtraction,
+  stripReferenceMemoryParagraphs,
 } from '../src/extract.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
@@ -101,8 +102,62 @@ describe('renderEventsText', () => {
     expect(renderEventsText([injected, normal])).toBe('正常用户消息')
   })
 
+  it('跳过以 [参考记忆] 开头的段落（回述回路双保险）', () => {
+    const pack = '[参考记忆]（来自记忆库，仅作背景资料）\n- [fact] 项目使用 pnpm\n（另有 2 条相关记忆）'
+    const user = userEvent(1, '正常用户消息')
+    // user source 无 plugin 标记，仅靠段落标记过滤
+    const injectedAsUser = userEvent(2, pack)
+    expect(renderEventsText([injectedAsUser, user])).toBe('正常用户消息')
+  })
+
+  it('assistant 回述注入内容时按段落标记拦截', () => {
+    const pack = '[参考记忆]（来自记忆库）\n- [fact] 项目使用 pnpm\n我建议按此处理'
+    const assistant = assistantEvent(2, pack)
+    const user = userEvent(1, '用户消息')
+    expect(renderEventsText([user, assistant])).toBe('用户消息')
+  })
+
+  it('段首标记仅删该段，同一文本其余段落保留', () => {
+    // 事件内多段：中间一段以 [参考记忆] 开头，应仅删该段，保留前后真实段落
+    const text = '第一段真实内容\n\n[参考记忆] 注入块\n\n第二段真实内容'
+    const user = userEvent(1, text)
+    expect(renderEventsText([user])).toBe('第一段真实内容\n\n第二段真实内容')
+  })
+
   it('空输入返回空串', () => {
     expect(renderEventsText([])).toBe('')
+  })
+})
+
+describe('stripReferenceMemoryParagraphs', () => {
+  it('剔除以 [参考记忆] 开头的段落', () => {
+    expect(stripReferenceMemoryParagraphs('[参考记忆]（来自记忆库）\n- [fact] x')).toBe('')
+  })
+
+  it('保留不以该标记开头的段落', () => {
+    expect(stripReferenceMemoryParagraphs('第一段\n\n第二段')).toBe('第一段\n\n第二段')
+  })
+})
+
+describe('EXTRACTION_SYSTEM_PROMPT 提取规则（O1-1 腐化防线）', () => {
+  it('规则 1：忽略元内容包括会话摘要、记忆引用与 [参考记忆] 包裹文本', () => {
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('会话摘要')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('来自记忆')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('[参考记忆]')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('压缩摘要')
+  })
+
+  it('规则 2：保持具体，不把多条具体事实概括为抽象结论', () => {
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('数值')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('标识符')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('限定条件')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('概括成')
+  })
+
+  it('规则 3：状态变化按新状态提取（更新/推翻既有认知）', () => {
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('更新')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('推翻')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('新状态')
   })
 })
 

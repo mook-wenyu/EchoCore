@@ -8,19 +8,26 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { MemoryInjector, renderPack, type InjectorConfig } from '../src/injector.js'
+import { MemoryInjector, renderPack, textOfBatch, type InjectorConfig } from '../src/injector.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeTable } from './helpers.js'
 
-/** 假 ctx：捕获两类监听器 */
+/** 假 ctx：捕获三类监听器 */
 class FakeCtx {
   preStep: ((payload: unknown, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>) | undefined
   sessionEvents: ((session: Session, event: SessionEvent) => void) | undefined
+  disposed: ((payload: { agent: { id: string; session: Session } }) => void) | undefined
   on(type: string, listener: unknown): void {
     if (type === 'agent/pre-step') this.preStep = listener as FakeCtx['preStep']
     if (type === 'session/event') this.sessionEvents = listener as FakeCtx['sessionEvents']
+    if (type === 'agent/disposed') this.disposed = listener as FakeCtx['disposed']
   }
+}
+
+/** 会话结束载荷 */
+function disposePayload(id: string, session: Session): { agent: { id: string; session: Session } } {
+  return { agent: { id, session } }
 }
 
 /** 构造会话 */
@@ -84,7 +91,7 @@ function setup(config: Partial<InjectorConfig> = {}) {
   })
   injector.install(ctx as unknown as Context)
   if (ctx.preStep === undefined || ctx.sessionEvents === undefined) throw new Error('监听未注册')
-  return { ctx, store, injector, preStep: ctx.preStep, sessionEvents: ctx.sessionEvents }
+  return { ctx, store, injector, preStep: ctx.preStep, sessionEvents: ctx.sessionEvents, disposed: ctx.disposed }
 }
 
 describe('MemoryInjector pre-step 注入', () => {
@@ -225,6 +232,72 @@ describe('renderPack', () => {
 
   it('预算连一条都放不下时返回 undefined（不注入空包）', () => {
     expect(renderPack(entries, 10)).toBeUndefined()
+  })
+})
+
+describe('textOfBatch 查询清洗（M8）', () => {
+  const userMsg = { source: { kind: 'user' }, content: [{ type: 'text', text: '用户问题' }] }
+  const pluginMsg = { source: { kind: 'plugin', plugin: '@echocore/dsh-memory', form: 'recall' }, content: [{ type: 'text', text: '插件注入文本' }] }
+  const modelToolMsg = { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'tool-result', text: '工具结果' }] }
+
+  it('批含 plugin 注入与 tool 来源时仅取用户文本', () => {
+    expect(textOfBatch([userMsg, pluginMsg, modelToolMsg] as never)).toBe('用户问题')
+  })
+
+  it('全 plugin / 全 tool 时返回空串', () => {
+    expect(textOfBatch([pluginMsg] as never)).toBe('')
+    expect(textOfBatch([modelToolMsg] as never)).toBe('')
+  })
+
+  it('全 plugin 时 pre-step 不注入（空查询）', async () => {
+    const { preStep, store } = setup()
+    await seed(store)
+    const allPlugin = {
+      agent: { id: 's1', session: makeSession('s1') },
+      messages: [pluginMsg],
+    }
+    const decision = await preStep(allPlugin as never, async () => enterDecision())
+    if (decision.kind === 'enter') expect(decision.messages).toHaveLength(1)
+  })
+})
+
+describe('MemoryInjector 会话生命周期清理（O2-4）', () => {
+  it('disposed 清理 injectedSeqs：结束后记忆重新可注入', async () => {
+    const { preStep, sessionEvents, disposed, store } = setup()
+    const entry = await seed(store)
+    const session = makeSession('s1')
+    // 第一次注入并回填序号
+    const first = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
+    if (first.kind !== 'enter') throw new Error('应注入')
+    expect(first.messages).toHaveLength(2)
+    sessionEvents(session, { type: 'user/message', seq: 10, time: 10, data: first.messages[1] } as SessionEvent)
+    // 再次 pre-step：已在表层，不重复注入
+    const again = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
+    if (again.kind !== 'enter') throw new Error('应 enter')
+    expect(again.messages).toHaveLength(1)
+    // 会话结束：清理 injectedSeqs
+    disposed?.(disposePayload('s1', session))
+    // 结束后重新 pre-step：不再去重，应重新注入
+    const after = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
+    if (after.kind !== 'enter') throw new Error('应 enter')
+    expect(after.messages).toHaveLength(2)
+    void entry
+  })
+
+  it('disposed 清理 pendingIds：后续注入序号不再回填旧批次', async () => {
+    const { preStep, sessionEvents, disposed, store } = setup()
+    await seed(store)
+    const session = makeSession('s1')
+    const first = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
+    if (first.kind !== 'enter') throw new Error('应注入')
+    // 注入消息已发出但未回填前 dispose
+    disposed?.(disposePayload('s1', session))
+    // 模拟一次用户普通消息，不应触发对本插件消息的回填（pendingIds 已清），故注入标记不落
+    sessionEvents(session, { type: 'user/message', seq: 20, time: 20, data: { role: 'user', content: [{ type: 'text', text: '普通' }], source: { kind: 'user' } } } as SessionEvent)
+    // 不清除 injectedSeqs 的前提下……重新注入验证，见前一个用例；这里断言清理后不残留 pendingIds
+    const again = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
+    if (again.kind !== 'enter') throw new Error('应 enter')
+    expect(again.messages).toHaveLength(2)
   })
 })
 

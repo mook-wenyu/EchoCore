@@ -18,6 +18,7 @@ import {
   normalizeContent,
   type MemoryEntry,
 } from '../src/types.js'
+import { shortSessionId } from '../src/constants.js'
 
 describe('normalizeContent（去重规范化）', () => {
   it('折叠大小写与首尾空白', () => {
@@ -76,6 +77,20 @@ describe('枚举单源', () => {
     expect(AUDIT_ACTIONS).not.toContain('restore')
     expect(AUDIT_ACTIONS).not.toContain('delete')
     expect(AUDIT_ACTIONS).not.toContain('inject')
+  })
+})
+
+describe('shortSessionId（会话短 id，用户报告 bug 修复）', () => {
+  it('去 session- 前缀取 uuid 主体前 8 位', () => {
+    expect(shortSessionId('session-63bbf845-9e8d-4348-9a30-30b65427288f')).toBe('63bbf845')
+  })
+
+  it('无前缀的纯 uuid 同样兼容', () => {
+    expect(shortSessionId('63bbf845-9e8d-4348-9a30-30b65427288f')).toBe('63bbf845')
+  })
+
+  it('短于 8 位的输入原样返回（不回退为空）', () => {
+    expect(shortSessionId('session-ab')).toBe('ab')
   })
 })
 
