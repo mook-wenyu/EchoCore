@@ -5,6 +5,13 @@
  * 借鉴 Generative Agents（arXiv:2304.03442）三维评分思想，公式自研简化：
  *   score = relevance(query, entry) × (0.6 + 0.4 × recency) × (0.5 + importance / 20)
  *
+ * P3 衰减增强（OPTIMIZATION_PLAN_3，依据 Scrub Jay arXiv:2608.04746 /
+ * Learning What to Remember arXiv:2606.12945 / Adaptive Recall / Mem0）：
+ * - importance 感知半衰期：高重要度记忆衰减更慢（magic-context decay-curve
+ *   的 D 语义）——无差别时间衰减会伤害"旧但重要"的项目规则/决策；
+ * - salience floor：重要度 ≥ 8 的记忆时间因子下限 0.5（保活）——高价值
+ *   事实不允许单凭时间被压出注入/检索前排。
+ *
  * 设计约束：
  * - 全部纯函数：输入输出确定，便于单测与调试；
  * - 无向量库：会话级记忆量级（数百条）下关键词重合评分足够（决策 D4）；
@@ -18,6 +25,18 @@ const CJK_GRAM = 2
 
 /** 英文/数字分词：小写字母数字连续段 */
 const WORD_RE = /[a-z0-9]+/g
+
+/** 基础半衰期（天）：importance 5 时的半衰期（与 P3 前默认一致） */
+const BASE_HALF_LIFE_DAYS = 7
+
+/** 半衰期重要度敏感度：importance 每 +2，半衰期翻倍（2^((imp-5)/2)） */
+const HALF_LIFE_IMPORTANCE_STEP = 2
+
+/** salience floor 触发的重要度下限（≥ 此值保活） */
+export const SALIENCE_FLOOR_IMPORTANCE = 8
+
+/** salience floor 的时间因子下限（recency ≥ 0.5 → 时间调制因子 ≥ 0.8） */
+export const SALIENCE_FLOOR_RECENCY = 0.5
 
 /** CJK 统一表意文字区段（含扩展 A） */
 function isCjk(ch: string): boolean {
@@ -81,10 +100,21 @@ export function relevanceScore(queryTokens: string[], entryTokens: Set<string>):
 }
 
 /**
- * 时间衰减因子：以 lastAccessAt 为基准的半衰期指数衰减（默认半衰期 7 天）。
+ * importance 感知半衰期（天）：7 × 2^((imp-5)/2)。
+ * importance 5 → 7 天（与 P3 前一致）；7 → 14 天；9 → 28 天；10 → ~39.6 天。
+ * 语义对齐 magic-context decay-curve 的 D 参数（importance 越高衰减越慢），
+ * 避免高重要度项目规则/决策被时间衰减压出检索前排。imp 先钳制 0..10。
+ */
+export function adaptiveHalfLifeDays(importance: number): number {
+  const clamped = Math.min(Math.max(importance, 0), 10)
+  return BASE_HALF_LIFE_DAYS * 2 ** ((clamped - 5) / HALF_LIFE_IMPORTANCE_STEP)
+}
+
+/**
+ * 时间衰减因子：以 lastAccessAt 为基准的半衰期指数衰减（半衰期可注入）。
  * 返回 1（刚访问）到趋近 0（久未访问）之间的值。
  */
-export function recencyFactor(lastAccessAt: string, now: number, halfLifeDays = 7): number {
+export function recencyFactor(lastAccessAt: string, now: number, halfLifeDays = BASE_HALF_LIFE_DAYS): number {
   const days = (now - Date.parse(lastAccessAt)) / 86_400_000
   if (!Number.isFinite(days) || days <= 0) return 1
   return Math.exp((-Math.LN2 / halfLifeDays) * days)
@@ -97,13 +127,17 @@ export function importanceFactor(importance: number): number {
 
 /**
  * 综合评分（0..1）：相关性主导，时间衰减与重要性为调制因子。
- * 供检索排序与阈值过滤使用；结果确定可单测。
+ * P3：半衰期随 importance 自适应（adaptiveHalfLifeDays）；重要度 ≥ 8 的
+ * 记忆施加 salience floor（时间因子下限 0.5，保活）。结果确定可单测。
  */
 export function memoryScore(entry: MemoryEntry, queryTokens: string[], now: number): number {
   const entryTokens = new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
   const relevance = relevanceScore(queryTokens, entryTokens)
   if (relevance <= 0) return 0
-  const recency = recencyFactor(entry.lastAccessAt, now)
+  let recency = recencyFactor(entry.lastAccessAt, now, adaptiveHalfLifeDays(entry.importance))
+  if (entry.importance >= SALIENCE_FLOOR_IMPORTANCE) {
+    recency = Math.max(recency, SALIENCE_FLOOR_RECENCY)
+  }
   return relevance * (0.6 + 0.4 * recency) * importanceFactor(entry.importance)
 }
 

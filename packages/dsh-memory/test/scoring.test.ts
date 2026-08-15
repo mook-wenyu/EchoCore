@@ -6,10 +6,13 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  adaptiveHalfLifeDays,
   importanceFactor,
   memoryScore,
   recencyFactor,
   relevanceScore,
+  SALIENCE_FLOOR_IMPORTANCE,
+  SALIENCE_FLOOR_RECENCY,
   scoreEntry,
   tokenize,
 } from '../src/scoring.ts'
@@ -133,5 +136,58 @@ describe('memoryScore / scoreEntry', () => {
   it('标签参与相关性命中', () => {
     const tagged = entry({ tags: ['架构'] })
     expect(scoreEntry(tagged, '架构', now)).toBeGreaterThan(0)
+  })
+})
+
+// P3（OPTIMIZATION_PLAN_3）：importance 感知半衰期 + salience floor
+describe('adaptiveHalfLifeDays（P3）', () => {
+  it('importance 5 为基础半衰期 7 天（与 P3 前行为一致）', () => {
+    expect(adaptiveHalfLifeDays(5)).toBeCloseTo(7, 10)
+  })
+
+  it('importance 每 +2 半衰期翻倍（7→14→28）', () => {
+    expect(adaptiveHalfLifeDays(7)).toBeCloseTo(14, 10)
+    expect(adaptiveHalfLifeDays(9)).toBeCloseTo(28, 10)
+  })
+
+  it('importance 10 半衰期约 39.6 天', () => {
+    expect(adaptiveHalfLifeDays(10)).toBeCloseTo(7 * 2 ** 2.5, 6)
+  })
+
+  it('单调递增且越界钳制', () => {
+    expect(adaptiveHalfLifeDays(3)).toBeLessThan(adaptiveHalfLifeDays(6))
+    expect(adaptiveHalfLifeDays(6)).toBeLessThan(adaptiveHalfLifeDays(9))
+    expect(adaptiveHalfLifeDays(99)).toBe(adaptiveHalfLifeDays(10))
+    expect(adaptiveHalfLifeDays(-5)).toBe(adaptiveHalfLifeDays(0))
+  })
+})
+
+describe('memoryScore 衰减增强（P3）', () => {
+  const now = Date.parse('2026-01-15T00:00:00.000Z')
+  const VERY_OLD = '2025-01-01T00:00:00.000Z' // 一年前
+
+  it('高重要度久未访问的记忆得分高于低重要度久未访问（自适应半衰期）', () => {
+    const high = entry({ id: 'a', importance: 9, lastAccessAt: VERY_OLD })
+    const low = entry({ id: 'b', importance: 3, lastAccessAt: VERY_OLD })
+    // 同 relevance（内容相同）；imp 9 半衰期 28 天 + floor，imp 3 半衰期 ~3.5 天无 floor
+    expect(memoryScore(high, ['pnpm'], now)).toBeGreaterThan(memoryScore(low, ['pnpm'], now))
+  })
+
+  it('salience floor：importance ≥ 8 时时间因子被钳制（保活）', () => {
+    const floored = entry({ id: 'a', importance: SALIENCE_FLOOR_IMPORTANCE, lastAccessAt: VERY_OLD })
+    const below = entry({ id: 'b', importance: SALIENCE_FLOOR_IMPORTANCE - 1, lastAccessAt: VERY_OLD })
+    // 一年远大于两者的半衰期：无 floor 时 recency ≈ 0（因子 0.6）；有 floor 时 recency=0.5（因子 0.8）
+    expect(memoryScore(floored, ['pnpm'], now)).toBeGreaterThan(memoryScore(below, ['pnpm'], now))
+  })
+
+  it('floor 常量语义：recency 下限 0.5 → 时间调制因子下限 0.8', () => {
+    expect(SALIENCE_FLOOR_RECENCY).toBe(0.5)
+    expect(0.6 + 0.4 * SALIENCE_FLOOR_RECENCY).toBe(0.8)
+  })
+
+  it('新近访问仍占优（自适应半衰期不逆转"新"优势）', () => {
+    const fresh = entry({ id: 'a', importance: 9, lastAccessAt: '2026-01-14T00:00:00.000Z' })
+    const old = entry({ id: 'b', importance: 9, lastAccessAt: '2025-12-01T00:00:00.000Z' })
+    expect(memoryScore(fresh, ['pnpm'], now)).toBeGreaterThan(memoryScore(old, ['pnpm'], now))
   })
 })
