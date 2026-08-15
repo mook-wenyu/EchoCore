@@ -7,14 +7,27 @@ import { describe, expect, it } from 'vitest'
 import { createMemoryRpcHandler } from '../src/host-rpc.js'
 import { MemoryStore } from '../src/store.js'
 import type { NewMemoryInput } from '../src/types.js'
+import { DEFAULTS } from '../src/config.js'
 import { FakeTable } from './helpers.js'
 
 /** 组装被测对象 */
 function setup() {
   const table = new FakeTable()
   const store = new MemoryStore(table)
-  const handler = createMemoryRpcHandler(store)
-  return { store, handler, table }
+  // 假 fiber：记录 update 调用与载荷；config 引用可变（模拟 fiber 配置）
+  const rpcConfig: Record<string, unknown> = { ...DEFAULTS }
+  const updates: Array<Record<string, unknown>> = []
+  const rpc = {
+    config: rpcConfig,
+    fiber: {
+      async update(config: Record<string, unknown>, _noSave?: boolean): Promise<void> {
+        updates.push(config)
+        Object.assign(rpcConfig, config)
+      },
+    },
+  }
+  const handler = createMemoryRpcHandler(store, rpc)
+  return { store, handler, table, rpc, updates }
 }/** 播种一条记忆 */
 async function seed(store: MemoryStore, input: Partial<NewMemoryInput> = {}): Promise<string> {
   const result = await store.create({
@@ -165,5 +178,75 @@ describe('memory RPC 载荷校验', () => {
     if (result.ok) return
     expect(result.error.code).toBe('internal')
     expect(result.error.message).toContain('磁盘写入失败')
+  })
+})
+
+describe('memory RPC 配置端点（面板配置）', () => {
+  it('getConfig：返回当前生效配置全部字段与 apiKey 解析状态', async () => {
+    const { handler } = setup()
+    const result = await handler('getConfig', null)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const value = result.value as { config: Record<string, unknown> }
+    expect(value.config.injectBudgetChars).toBe(DEFAULTS.injectBudgetChars)
+    expect(value.config.topK).toBe(DEFAULTS.topK)
+    expect(value.config.enableMaintenance).toBe(DEFAULTS.enableMaintenance)
+    expect('embeddingEnabled' in value.config).toBe(false)
+  })
+
+  it('setConfig：合法载荷合并到当前配置并调用 fiber.update（noSave=false 写回）', async () => {
+    const { handler, updates } = setup()
+    const result = await handler('setConfig', { topK: 12, minScore: 0.3 })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(updates).toHaveLength(1)
+    // fiber.update 收到合并后完整配置（未传字段保留当前值）
+    expect(updates[0]?.topK).toBe(12)
+    expect(updates[0]?.minScore).toBe(0.3)
+    expect(updates[0]?.injectBudgetChars).toBe(DEFAULTS.injectBudgetChars)
+    // 响应返回更新后配置
+    const value = result.value as { config: Record<string, unknown> }
+    expect(value.config.topK).toBe(12)
+  })
+
+  it('setConfig：未知键拒绝（internal）', async () => {
+    const { handler, updates } = setup()
+    const result = await handler('setConfig', { 不存在的键: 1 })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.message).toContain('未知配置键')
+    expect(updates).toHaveLength(0)
+  })
+
+  it('setConfig：类型错误拒绝（internal）', async () => {
+    const { handler, updates } = setup()
+    const result = await handler('setConfig', { minScore: '不是数字' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(updates).toHaveLength(0)
+  })
+
+  it('setConfig：数值越界拒绝（minScore > 1）', async () => {
+    const { handler, updates } = setup()
+    const result = await handler('setConfig', { minScore: 1.5 })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(updates).toHaveLength(0)
+  })
+
+  it('setConfig：跨字段互斥拒绝（minExtractChars > maxExtractChars）', async () => {
+    const { handler, updates } = setup()
+    const result = await handler('setConfig', { minExtractChars: 13000, maxExtractChars: 12000 })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(updates).toHaveLength(0)
+  })
+
+  it('setConfig：空载荷拒绝', async () => {
+    const { handler, updates } = setup()
+    const result = await handler('setConfig', {})
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(updates).toHaveLength(0)
   })
 })

@@ -168,8 +168,9 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
   registerSnapshot(ctx, { store, logger })
 
-  // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面
-  registerMemoryRpc(ctx, store)
+  // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面；
+  // config 传入供 getConfig/setConfig 端点（setConfig 经 ctx.fiber.update 写回+重启）
+  registerMemoryRpc(ctx, store, config)
 
   // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理；开关与间隔经配置
   const maintenanceConfig: MaintenanceConfig = {
