@@ -36,8 +36,9 @@
 
 ## 四、下次最该做的事
 
-1. **部署同步 + 重启验证**：build + 手动拷贝 profile 副本（pnpm install 判定无变化跳过），重启实例验证嵌入自动启用与**面板配置区块**（改 topK → 保存 → 插件重启 → 新值生效 → cordis.patch.yml 已写回）。
-2. **远程嵌入真机验证**（若配置）：硅基流动 key（`env:NAME` 或字面）配置后验证远程优先、维度校验、远程失败回退本地。
-3. **缓存命中率基线实测**（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益；若 <40% 回落查字节级前缀抖动。
-4. 观察 memory.json：maintenance 首周期（6h 后）执行效果（重复合并/标签归一化）；A4 修复（同刻 tie-breaker + supersede 优先）真机表现。
-5. MemoryPanel 组件渲染测试：若引入 jsdom/testing-library 则补组件测试（当前 client.test 只覆盖 createMemoryApi 纯逻辑）。
+1. **重启 3080 实例**：当前进程（18:00 启动）运行旧代码——重启后新代码（面板配置/RRF/嵌入默认启用/配置面 4 项）才生效。
+2. **settings.yaml 降 `deepseek-v4-flash maxTokens` 384000→65536**：消除唯一已实测触发过的溢出卡死事故路径（token-meter 低估 + 压缩收益保护死锁链）。
+3. **备份脚本配计划任务**：`scripts/backup-memory.mjs` 已就绪（默认保留 10 份），建议每日定时运行。
+4. 缓存命中率基线实测（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益。
+5. 观察 memory.json：maintenance 首周期（6h 后）执行效果；A4 修复真机表现。
+6. MemoryPanel 组件渲染测试：若引入 jsdom/testing-library 则补组件测试。

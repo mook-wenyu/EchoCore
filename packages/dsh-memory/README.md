@@ -96,6 +96,16 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 - **远程 API 返回维度 ≠ 配置维度 → 显式报错**（防混维）；本地依赖体积 +374.9MB
   （onnxruntime-node 全平台预编译），无模型文件时零本地运行时成本
 
+## 运维：记忆库备份
+
+`memory.json` 是记忆库唯一副本（无备份机制是单点风险）。仓库提供备份脚本：
+
+```bash
+node packages/dsh-memory/scripts/backup-memory.mjs [备份目录] [保留份数]
+# 默认备份到 ~/.dsh/storages/backups/，保留最近 10 份（时间戳命名）
+# 建议配合系统计划任务每日运行；源文件缺失/保留 0 份会显式报错（不静默）
+```
+
 ## 集成（已执行，全局启用：所有 Agent 可用）
 
 - `~/.dsh/profiles/web/package.json`：`"@echocore/dsh-memory": "file:D:/TSProjects/EchoCore/packages/dsh-memory"`
