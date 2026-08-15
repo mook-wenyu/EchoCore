@@ -389,3 +389,52 @@ describe('MemoryStore 访问追踪节流（O6）', () => {
     expect(store.getById(entry.id)?.accessCount).toBe(2)
   })
 })
+
+/**
+ * B3：contradiction 评测基线（PersonaMem 风格——矛盾处理已列为 2026 记忆评测
+ * 标准维度）。钉住"偏好变化/事实被推翻"场景的矛盾消解行为：supersede 链保证
+ * 检索只出现行表述、旧表述可经审计追溯、链方向完整。
+ */
+describe('contradiction 评测基线（B3）', () => {
+  // 偏好变化：Jaccard≥0.7 的一对偏好（实测 0.778）
+  const OLD_PREF = '偏好使用 pnpm 作为包管理器'
+  const NEW_PREF = '偏好使用 pnpm 作为包管理器管理多包'
+
+  it('偏好变化：新偏好 supersede 旧偏好，检索只出现行偏好', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    const oldE = (await store.create(input({ kind: 'preference', content: OLD_PREF }))).entry
+    const newE = (await store.create(input({ kind: 'preference', content: NEW_PREF }))).entry
+    const hits = store.search({ query: '偏好 pnpm', kind: 'preference' })
+    expect(hits.map((e) => e.id)).toEqual([newE.id])
+    expect(hits[0]?.supersededBy).toBeUndefined()
+    // 旧表述不再出现在任何默认检索路径
+    expect(store.search({ query: '', kind: 'preference' }).map((e) => e.id)).not.toContain(oldE.id)
+  })
+
+  it('事实被推翻：新事实覆盖旧事实，审计链可完整追溯（含 supersede 动作与 detail）', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    const oldE = (await store.create(input({ content: '决定采用评分检索' }))).entry
+    const newE = (await store.create(input({ content: '决定采用评分检索方案' }))).entry
+    // 双向链：旧 → supersededBy 新；新 → supersedes 旧
+    expect(store.getById(oldE.id)?.supersededBy).toBe(newE.id)
+    expect(store.getById(newE.id)?.supersedes).toBe(oldE.id)
+    // 旧表述的审计链含 supersede 动作（矛盾消解可追溯）
+    const audit = store.getById(oldE.id)?.audit
+    const supersedeAction = audit?.find((a) => a.action === 'supersede')
+    expect(supersedeAction).toBeDefined()
+    expect(supersedeAction?.detail).toContain(newE.id)
+    expect(supersedeAction?.by).toBe('extractor')
+  })
+
+  it('矛盾消解不破坏其他事实：同 kind 无关条目不受影响', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    await store.create(input({ content: '决定采用评分检索' }))
+    await store.create(input({ content: '决定采用评分检索方案' }))
+    const unrelated = (await store.create(input({ content: '前端使用 React 渲染面板' }))).entry
+    expect(store.getById(unrelated.id)?.supersededBy).toBeUndefined()
+    expect(store.getById(unrelated.id)?.supersedes).toBeUndefined()
+    // 无关条目仍可被检索
+    const hits = store.search({ query: 'React 面板' })
+    expect(hits.map((e) => e.id)).toContain(unrelated.id)
+  })
+})
