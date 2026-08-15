@@ -86,6 +86,23 @@ describe('createMemoryApi 端点载荷', () => {
     expect(status.total).toBe(3)
     expect(status.active).toBe(2)
   })
+
+  it('getConfig：端点 getConfig、空 payload，返回配置视图', async () => {
+    const { api, recorded } = fakeCtx([ok({ config: { topK: 8, embeddingApiKeyResolved: false } })])
+    const config = await api.getConfig()
+    expect(recorded).toEqual([{ channel: '/memory', endpoint: 'getConfig', payload: {} }])
+    expect(config.topK).toBe(8)
+    expect(config.embeddingApiKeyResolved).toBe(false)
+  })
+
+  it('setConfig：端点 setConfig、payload 为变更项 partial，返回更新后配置', async () => {
+    const { api, recorded } = fakeCtx([ok({ config: { topK: 12, minScore: 0.3 } })])
+    const config = await api.setConfig({ topK: 12, minScore: 0.3 })
+    expect(recorded).toEqual([
+      { channel: '/memory', endpoint: 'setConfig', payload: { topK: 12, minScore: 0.3 } },
+    ])
+    expect(config.topK).toBe(12)
+  })
 })
 
 describe('createMemoryApi unwrap 错误路径', () => {
@@ -102,6 +119,11 @@ describe('createMemoryApi unwrap 错误路径', () => {
   it('ok:false 时 get 抛错', async () => {
     const { api } = fakeCtx([err('id 非法')])
     await expect(api.get('bad-id')).rejects.toThrow('id 非法')
+  })
+
+  it('ok:false 时 setConfig 抛错（载荷校验失败透传）', async () => {
+    const { api } = fakeCtx([err('未知配置键：topKk')])
+    await expect(api.setConfig({ topKk: 1 })).rejects.toThrow('未知配置键')
   })
 
   // R2-3/B3：connection 已声明为硬 inject（缺失则插件不加载），运行期必有。

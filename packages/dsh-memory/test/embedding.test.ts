@@ -374,16 +374,24 @@ describe('EmbeddingIndex', () => {
       content: `内容${i}`,
     })) as unknown as MemoryEntry[]
     for (const entry of entries) slow.indexEntry(entry)
-    // 等全部落地（8 × 10ms 串行化后约 80ms；轮询文件内容达到 8 条或超时）
+    // 等全部落地：轮询直到连续 3 次读到完整内容（连续稳定判定——防最后一次
+    // rename 未落盘时的残留竞态；全量并行时 CPU 竞争留足余量）
     const { readFile } = await import('node:fs/promises')
     let parsed: Record<string, number[]> | undefined
+    let stable = 0
     for (let i = 0; i < 300; i++) {
       await new Promise((resolve) => setTimeout(resolve, 25))
       try {
         parsed = JSON.parse(await readFile(file, 'utf8')) as Record<string, number[]>
-        if (Object.keys(parsed).length === entries.length) break
+        if (Object.keys(parsed).length === entries.length) {
+          stable++
+          if (stable >= 3) break
+        } else {
+          stable = 0
+        }
       } catch {
         // 文件未就绪或写入中——继续等
+        stable = 0
       }
     }
     expect(parsed).toBeDefined()

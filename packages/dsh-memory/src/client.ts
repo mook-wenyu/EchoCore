@@ -49,6 +49,34 @@ export interface MemoryStatsView {
   byKind: Record<string, number>
 }
 
+/**
+ * 配置视图（与宿主 configView 对齐）：当前生效配置全部字段 +
+ * embeddingApiKeyResolved（apiKey 解析状态——字面 key 或 env:NAME 环境变量
+ * 引用是否可用；面板展示用，不泄露解析后的 key 值）。
+ */
+export interface MemoryPanelConfigView {
+  injectBudgetChars: number
+  topK: number
+  minScore: number
+  minExtractChars: number
+  maxExtractChars: number
+  extractMaxTokens: number
+  enableAutoInject: boolean
+  enableSnapshot: boolean
+  snapshotTtlMs: number
+  snapshotBudgetChars: number
+  snapshotTopK: number
+  enableExtractor: boolean
+  enableMaintenance: boolean
+  maintenanceIntervalHours: number
+  embeddingModelDir: string
+  embeddingApiBaseUrl: string
+  embeddingApiKey: string
+  embeddingModel: string
+  embeddingDimension: number
+  embeddingApiKeyResolved: boolean
+}
+
 /** 面板数据 API（apply 期从 ctx 装配，随组件 props 传递） */
 export interface MemoryPanelApi {
   list(status?: string, limit?: number): Promise<MemorySummaryView[]>
@@ -56,6 +84,10 @@ export interface MemoryPanelApi {
   get(id: string): Promise<MemoryDetailView | undefined>
   archive(id: string): Promise<boolean>
   status(): Promise<MemoryStatsView>
+  /** 读取当前生效配置（含 apiKey 解析状态） */
+  getConfig(): Promise<MemoryPanelConfigView>
+  /** 更新配置（仅变更项；宿主校验并写回 cordis.patch.yml，插件重启生效） */
+  setConfig(partial: Record<string, unknown>): Promise<MemoryPanelConfigView>
 }
 
 /** 从 ctx 装配面板 API（R2-3/B3：connection 为硬 inject，缺失则插件不加载，运行期必有） */
@@ -95,6 +127,16 @@ export function createMemoryApi(ctx: Context): MemoryPanelApi {
     async status() {
       const result = await call('status', {})
       return unwrap(result) as MemoryStatsView
+    },
+    async getConfig() {
+      const result = await call('getConfig', {})
+      const value = unwrap(result) as { config: MemoryPanelConfigView }
+      return value.config
+    },
+    async setConfig(partial) {
+      const result = await call('setConfig', partial)
+      const value = unwrap(result) as { config: MemoryPanelConfigView }
+      return value.config
     },
   }
 }
@@ -237,6 +279,141 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
     error !== '' ? React.createElement('div', { style: errorStyle }, error) : null,
     React.createElement('div', { style: listStyle }, rows.length > 0 ? rows : React.createElement('div', null, '（暂无记忆）')),
     selected !== undefined ? React.createElement(DetailPane, { entry: selected, onArchive: () => void doArchive(selected.id) }) : null,
+    // 配置区块（面板底部）：当前生效配置表单 + 保存（写回配置源并重启插件生效）
+    React.createElement(ConfigPane, { api: props.api }),
+  )
+}
+
+// ── 配置区块 ────────────────────────────────────────────────────────────
+
+/** 配置表单字段定义（驱动渲染，DRY：新增可改配置只需在此加一行） */
+interface ConfigFieldDef {
+  /** 配置键（必须与 MemoryPanelConfigView 字段一致） */
+  key: keyof MemoryPanelConfigView
+  label: string
+  type: 'number' | 'boolean' | 'string'
+  /** 输入框提示（可选） */
+  hint?: string
+}
+
+/** 面板可编辑字段清单（全部配置项——用户拍板；apiKey 支持字面 key 或 env:NAME） */
+const CONFIG_FIELDS: ConfigFieldDef[] = [
+  { key: 'injectBudgetChars', label: '注入预算（字符）', type: 'number' },
+  { key: 'topK', label: '自动注入 Top-K', type: 'number' },
+  { key: 'minScore', label: '注入最低综合分（0..1）', type: 'number' },
+  { key: 'enableAutoInject', label: '自动注入开关', type: 'boolean' },
+  { key: 'enableSnapshot', label: '稳定快照开关', type: 'boolean' },
+  { key: 'snapshotTtlMs', label: '快照缓存窗口（ms）', type: 'number' },
+  { key: 'snapshotBudgetChars', label: '快照预算（字符）', type: 'number' },
+  { key: 'snapshotTopK', label: '快照 Top-K 候选', type: 'number' },
+  { key: 'enableExtractor', label: '提取器开关', type: 'boolean' },
+  { key: 'minExtractChars', label: '提取触发阈值（字符）', type: 'number' },
+  { key: 'maxExtractChars', label: '提取摘录上限（字符）', type: 'number' },
+  { key: 'extractMaxTokens', label: '提取输出上限（token）', type: 'number' },
+  { key: 'enableMaintenance', label: '后台整理开关', type: 'boolean' },
+  { key: 'maintenanceIntervalHours', label: '整理间隔（小时）', type: 'number' },
+  { key: 'embeddingModelDir', label: '本地模型目录', type: 'string' },
+  { key: 'embeddingApiBaseUrl', label: '远程 API Base URL', type: 'string' },
+  {
+    key: 'embeddingApiKey',
+    label: '远程 API Key',
+    type: 'string',
+    hint: '可直接写字面 key，或写 env:NAME 引用环境变量（如 env:SILICONFLOW_KEY）',
+  },
+  { key: 'embeddingModel', label: '远程模型名', type: 'string' },
+  { key: 'embeddingDimension', label: '远程维度', type: 'number' },
+]
+
+/** 配置区块：草稿表单 + 保存（仅提交变更项） + 生效提示 */
+function ConfigPane(props: { api: MemoryPanelApi }): React.ReactElement {
+  // 草稿：字段 → 字符串（输入框统一字符串态，保存时按字段类型转换）
+  const [draft, setDraft] = React.useState<Record<string, string>>({})
+  const [resolved, setResolved] = React.useState(false)
+  const [notice, setNotice] = React.useState('')
+
+  React.useEffect(() => {
+    void props.api
+      .getConfig()
+      .then((config) => {
+        const initial: Record<string, string> = {}
+        for (const field of CONFIG_FIELDS) {
+          const value = config[field.key]
+          initial[field.key] = String(value)
+        }
+        setDraft(initial)
+        setResolved(config.embeddingApiKeyResolved)
+      })
+      .catch((err) => setNotice(err instanceof Error ? err.message : String(err)))
+  }, [props.api])
+
+  const setField = (key: string, value: string): void => {
+    setDraft((prev) => ({ ...prev, [key]: value }))
+  }
+
+  const save = async (): Promise<void> => {
+    try {
+      // 仅提交变更项（减少 payload 与校验面）；类型按字段定义转换
+      const partial: Record<string, unknown> = {}
+      for (const field of CONFIG_FIELDS) {
+        const current = draft[field.key]
+        if (current === undefined) continue
+        const raw = (await props.api.getConfig())[field.key]
+        const parsed = field.type === 'number' ? Number(current) : field.type === 'boolean' ? current === 'true' : current
+        if (parsed !== raw) partial[field.key] = parsed
+      }
+      if (Object.keys(partial).length === 0) {
+        setNotice('无变更项')
+        return
+      }
+      const config = await props.api.setConfig(partial)
+      // 保存成功 = 宿主已校验并写回配置源、插件重启生效
+      setNotice('已保存并生效（插件已重启；注入/提取/嵌入按新配置运行）')
+      setResolved(config.embeddingApiKeyResolved)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const rows = CONFIG_FIELDS.map((field) => {
+    const control =
+      field.type === 'boolean'
+        ? React.createElement('input', {
+            type: 'checkbox',
+            checked: draft[field.key] === 'true',
+            onChange: (event: React.ChangeEvent<HTMLInputElement>) => setField(field.key, String(event.target.checked)),
+            style: { marginRight: 8 },
+          })
+        : React.createElement('input', {
+            type: 'text',
+            value: draft[field.key] ?? '',
+            onChange: (event: React.ChangeEvent<HTMLInputElement>) => setField(field.key, event.target.value),
+            style: { ...inputStyle, width: 220 },
+          })
+    return React.createElement(
+      'div',
+      { key: field.key, style: { display: 'flex', alignItems: 'center', gap: 8, margin: '4px 0' } },
+      React.createElement('label', { style: { width: 200, flexShrink: 0 } }, field.label),
+      control,
+      field.hint !== undefined ? React.createElement('span', { style: metaStyle }, field.hint) : null,
+    )
+  })
+
+  return React.createElement(
+    'div',
+    { style: { ...detailStyle, marginTop: 12 } },
+    React.createElement('h4', null, '配置'),
+    React.createElement(
+      'div',
+      { style: metaStyle },
+      `远程 API Key 状态：${resolved ? '已解析可用' : '未配置或环境变量未设置（支持字面 key 或 env:NAME）'}`,
+    ),
+    rows,
+    React.createElement(
+      'div',
+      { style: { marginTop: 8 } },
+      React.createElement('button', { onClick: () => void save(), style: buttonStyle }, '保存'),
+      notice !== '' ? React.createElement('span', { style: { ...metaStyle, marginLeft: 8 } }, notice) : null,
+    ),
   )
 }
 
