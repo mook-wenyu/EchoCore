@@ -28,7 +28,9 @@ const WORD_RE = /[a-z0-9]+/g
 
 /** 基础半衰期（天）：importance 5 时的半衰期（与 P3 前默认一致） */
 import { Jieba } from '@node-rs/jieba'
-import { dict } from '@node-rs/jieba/dict'
+// 显式 .js 子路径：包无 exports 字段，ESM 的 NodeNext 严格解析要求扩展名
+// （裸子路径 '@node-rs/jieba/dict' 在 ESM 下 ERR_MODULE_NOT_FOUND——副本运行时实测）
+import { dict } from '@node-rs/jieba/dict.js'
 
 const BASE_HALF_LIFE_DAYS = 7
 
