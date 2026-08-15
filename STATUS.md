@@ -6,8 +6,8 @@
 
 - 模块总数：19（types / constants / config / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / stable-snapshot / embedding / embed-index / host-rpc / maintenance / render / client.ts 浏览器半 + scripts/build-client.mjs）
 - 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants/render/embedding 被复用，无环
-- 单元测试 **255 个全绿**（19 文件，三次连跑稳定）；类型检查与构建通过
-- 测试基建统一：FakeCtx 五合一（helpers.ts）、FakeTable 失败注入 + 快照迭代、可控 id 序列（vi.mock newMemoryId）
+- 单元测试 **258 个全绿**（19 文件，三次连跑稳定）；类型检查与构建通过
+- 测试基建统一：FakeCtx 五合一（helpers.ts）、FakeTable 失败注入 + 快照迭代、可控 id 序列（vi.mock newMemoryId）、index.test 嵌入 mock（不真实加载 22MB 模型，533ms→15ms）
 
 ## 二、本次变更影响范围（P1-P4 + OPTIMIZATION_PLAN_4）
 
@@ -19,7 +19,8 @@
 - **B1 RRF**（8d4a36f）：语义融合改 RRF 排名融合（k=60 归一化），退役 `embeddingFusionWeight` 配置（无存量用户不向后兼容）
 - **B2 频率调制**（cca7d8d）：半衰期 ×(1+log2(1+accessCount))，高频访问召回抬回（Elastic/FadeMem 模式）
 - **B3 评测基线**（2bcd2a5）：contradiction 显式测试（PersonaMem 风格：偏好变化/事实推翻/无关性）
-- **接口契约变更**（累计）：`embeddingFusionWeight` 移除；`hooks.onSupersede` 新增；store SearchOptions 去 fusionWeight；Config schema 边界收紧
+- **E1 嵌入默认启用**（24543bf）：删除 `embeddingEnabled` 开关——**远程优先 → 自动回退本地 → 都无则关闭**；新增远程 4 项配置（embeddingApiBaseUrl/ApiKey/Model/Dimension，OpenAI 兼容 /embeddings）；EmbeddingService 多后端（远程验证失败回退本地、运行期故障切本地重试）；EmbeddingIndex 动态维度 + 索引文件按维度隔离（memory-embeddings-<dim>.json，本地 384/远程配置值）；远程返回维度 ≠ 配置 → 显式报错防混维；index.test 嵌入 mock 化（533ms→15ms 确定性）
+- **接口契约变更**（累计）：`embeddingEnabled` 移除；`embeddingApiBaseUrl/ApiKey/Model/Dimension` 新增；EmbeddingIndexDeps.service 加 `dimension`；EmbeddingServiceDeps 改 `{modelDir, remote?, hasLocalModel?, loadLocalBackend?, fetchRemoteEmbeddings?}`
 - **提交**：92a2725（PLAN4）→ d5a9eda（A1）→ 16a6677（A2）→ 2e20f1f（A3）→ 35911f6（A4）→ 8d4a36f（B1）→ cca7d8d（B2）→ 2bcd2a5（B3）→ 本轮文档
 
 ## 三、已知风险点（诚实自曝）
@@ -32,8 +33,8 @@
 
 ## 四、下次最该做的事
 
-1. **部署同步**：`pnpm install` 刷新 profile 副本（file: 依赖需拷贝+重启），真机验证 A1-B3 全链路。
-2. **缓存命中率基线实测**（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益；若 <40% 回落查字节级前缀抖动。
-3. 观察 memory.json：maintenance 首周期（6h 后）执行效果（重复合并/标签归一化）；A4 修复（同刻 tie-breaker + supersede 优先）真机表现。
-4. 嵌入启用真机验证：embeddingEnabled: true + 模型文件部署后验证 RRF 融合检索与索引联动（supersede/归档移除）。
+1. **部署同步 + 重启验证**：build + 手动拷贝 profile 副本（pnpm install 判定无变化跳过），重启实例验证嵌入自动启用（有本地模型 → ready(local) 384 索引；无模型 → disabled 正常态）。
+2. **远程嵌入真机验证**（若配置）：硅基流动 key 配置后验证远程优先、维度校验、远程失败回退本地。
+3. **缓存命中率基线实测**（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益；若 <40% 回落查字节级前缀抖动。
+4. 观察 memory.json：maintenance 首周期（6h 后）执行效果（重复合并/标签归一化）；A4 修复（同刻 tie-breaker + supersede 优先）真机表现。
 5. MemoryPanel 组件测试：若引入 jsdom/testing-library 则补组件渲染测试。

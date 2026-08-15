@@ -7,7 +7,8 @@
  * ~/.dsh/storages/embedding-model，与插件默认 embeddingModelDir 一致）。
  *
  * 用法：node scripts/download-embedding-model.mjs [目标目录]
- * 运行后重启实例并设置 embeddingEnabled: true 生效。
+ * 运行后重启实例生效——嵌入默认启用：启动时检测模型文件存在性，
+ * 有模型即用本地嵌入（无需任何开关配置）。
  */
 
 import { mkdir, writeFile } from 'node:fs/promises'
@@ -45,4 +46,4 @@ for (const file of FILES) {
 }
 
 console.log(`模型就绪：${targetDir}`)
-console.log('插件配置：cordis.patch.yml 中 memory 组合行设置 embeddingEnabled: true 后重启。')
+console.log('重启实例后生效（嵌入默认启用，无需开关配置；无模型时自动使用远程 API（若配置）或保持关键词检索）。')
