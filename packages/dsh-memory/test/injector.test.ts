@@ -100,7 +100,26 @@ describe('MemoryInjector pre-step 注入', () => {
     const text = (injected.content[0] as { type: string; text: string }).text
     expect(text).toContain('参考记忆')
     expect(text).toContain('仅作背景资料')
+    expect(text).toContain('可能过时或被覆盖') // R4-2：注入声明强化（对抗经验跟随）
     expect(text).toContain('pnpm workspace')
+  })
+
+  // R4-3：注入隔离钉住——注入块始终是独立 user/message（source plugin + form recall），
+  // 与用户指令消息分离，绝不与指令同块（Injection-Execution Dissociation 防线）
+  it('注入消息与用户指令分离（独立 recall 消息，不混入指令块）', async () => {
+    const { preStep, store } = setup()
+    await seed(store)
+    const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么管理'), async () => enterDecision())
+    expect(decision.kind).toBe('enter')
+    if (decision.kind !== 'enter') return
+    // 下游消息保留原样（无注入污染）
+    expect(decision.messages[0]).toMatchObject({ id: 'down0', source: { kind: 'user' } })
+    // 注入消息独立成条：plugin 来源 + recall 形态
+    const injected = decision.messages[1]
+    expect(injected.source).toMatchObject({ kind: 'plugin', plugin: '@echocore/dsh-memory', form: 'recall' })
+    // 注入消息的 content 不含用户指令文本（内容隔离）
+    const injectedText = (injected.content[0] as { type: string; text: string }).text
+    expect(injectedText).not.toContain('怎么管理')
   })
 
   it('下游为 reject 时不注入', async () => {

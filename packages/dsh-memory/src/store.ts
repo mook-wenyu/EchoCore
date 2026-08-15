@@ -73,6 +73,24 @@ export interface MergeOutcome {
 export type NowFn = () => number
 
 /**
+ * source 锚点完整性校验（R4-1：记忆投毒轻量防线——读路径防篡改）。
+ * memory.json 是人类可读文件：手工编辑可能产生畸形 source（或注入无来源伪记忆）。
+ * 检索/浏览路径跳过畸形条目并告警，getById 仍放行（审计必须能看到原始内容）。
+ * 校验只要求字段存在与类型（宽容），不校验内容格式——避免误伤合法旧数据。
+ */
+export function isSourceWellFormed(source: unknown): source is { sessionId: string; eventSeqs: number[]; excerpt: string } {
+  if (typeof source !== 'object' || source === null) return false
+  const record = source as Record<string, unknown>
+  return (
+    typeof record.sessionId === 'string' &&
+    record.sessionId !== '' &&
+    Array.isArray(record.eventSeqs) &&
+    record.eventSeqs.every((n) => typeof n === 'number') &&
+    typeof record.excerpt === 'string'
+  )
+}
+
+/**
  * MemoryStore：依赖一个 entries 表句柄。
  * 表句柄来自 `Domain.table('entries')`（装配处）或测试假表。
  */
@@ -91,7 +109,12 @@ export class MemoryStore {
    */
   private readonly lastTrackedAt = new Map<string, number>()
 
-  constructor(table: KvTable<string, MemoryEntry>, now: NowFn = () => Date.now()) {
+  constructor(
+    table: KvTable<string, MemoryEntry>,
+    now: NowFn = () => Date.now(),
+    /** R4-1：畸形 source 条目被检索过滤时的告警回调（装配层注入 logger；无回调则静默过滤） */
+    private readonly onCorruptSource?: (id: string) => void,
+  ) {
     this.table = table
     this.now = now
     for (const [, entry] of table.entries()) {
@@ -266,6 +289,11 @@ export class MemoryStore {
 
     const matches: MemoryEntry[] = []
     for (const [, entry] of this.table.entries()) {
+      // R4-1：畸形 source（手工篡改 memory.json 的伪记忆）不进检索结果——注入面最后防线
+      if (!isSourceWellFormed(entry.source)) {
+        this.onCorruptSource?.(entry.id)
+        continue
+      }
       if (options.status !== undefined) {
         if (entry.status !== options.status) continue
       } else if (entry.status !== 'active' && !(options.includeArchived && entry.status === 'archived')) {
@@ -334,6 +362,11 @@ export class MemoryStore {
   listRecent(limit: number, status?: MemoryStatus, includeSuperseded = false): MemoryEntry[] {
     const result: MemoryEntry[] = []
     for (const [, entry] of this.table.entries()) {
+      // R4-1：畸形 source 不进浏览列表（与 search 同防线）
+      if (!isSourceWellFormed(entry.source)) {
+        this.onCorruptSource?.(entry.id)
+        continue
+      }
       if (status !== undefined && entry.status !== status) continue
       if (entry.supersededBy !== undefined && !includeSuperseded) continue
       result.push(entry)

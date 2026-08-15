@@ -49,7 +49,10 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
     void domain.close()
   })
 
-  const store = new MemoryStore(domain.table(MEMORY_TABLE))
+  // R4-1：畸形 source（手工篡改 memory.json）被检索过滤时告警一次，可观测性由装配层提供
+  const store = new MemoryStore(domain.table(MEMORY_TABLE), undefined, (id) => {
+    logger.warn(`[dsh-memory] 发现 source 结构畸形的记忆条目（已从检索/浏览过滤，可用 memory_audit ${id} 查看）：${id}`)
+  })
 
   // 提取器：双通道（压缩遮蔽 + 轮次增量），纯观察不阻塞主循环
   // R2-4（B4）：schemastery 加载即填充默认值，?? 是死分支——直接读 config 字段
