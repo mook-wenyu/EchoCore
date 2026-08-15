@@ -270,9 +270,31 @@ const statsStyle: React.CSSProperties = { font: 'var(--dsw-font-xs-13)', fontWei
 const listStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 360, overflowY: 'auto' }
 const detailStyle: React.CSSProperties = { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: 8 }
 const metaStyle: React.CSSProperties = { font: 'var(--dsw-font-xxs-12)', color: 'var(--dsw-alias-label-tertiary)', margin: '2px 0' }
-const inputStyle: React.CSSProperties = { marginRight: 8, padding: '4px 8px' }
-const selectStyle: React.CSSProperties = { marginRight: 8, padding: '4px 8px' }
-const buttonStyle: React.CSSProperties = { padding: '4px 10px', cursor: 'pointer' }
+/** 控件统一外观：官方输入/按钮形态（border-l2 边框 + layer-1 底 + primary 文字） */
+const inputStyle: React.CSSProperties = {
+  marginRight: 8,
+  padding: '4px 8px',
+  border: '1px solid var(--dsw-alias-border-l2)',
+  borderRadius: 4,
+  background: 'var(--dsw-alias-bg-layer-1)',
+  color: 'var(--dsw-alias-label-primary)',
+}
+const selectStyle: React.CSSProperties = {
+  marginRight: 8,
+  padding: '4px 8px',
+  border: '1px solid var(--dsw-alias-border-l2)',
+  borderRadius: 4,
+  background: 'var(--dsw-alias-bg-layer-1)',
+  color: 'var(--dsw-alias-label-primary)',
+}
+const buttonStyle: React.CSSProperties = {
+  padding: '4px 10px',
+  cursor: 'pointer',
+  border: '1px solid var(--dsw-alias-border-l2)',
+  borderRadius: 4,
+  background: 'var(--dsw-alias-bg-layer-1)',
+  color: 'var(--dsw-alias-label-primary)',
+}
 const errorStyle: React.CSSProperties = { color: 'var(--dsw-alias-state-error-primary)', fontSize: 13 }
 
 function rowStyle(active: boolean): React.CSSProperties {
