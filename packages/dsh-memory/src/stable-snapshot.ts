@@ -63,6 +63,8 @@ export const SNAPSHOT_CONTEXT_ORDER = 130
 export class MemoryStableSnapshot {
   /** workspace → 快照缓存（进程内；重启清空，与 store.revision 同生命周期） */
   private readonly cache = new Map<string, CachedSnapshot>()
+  /** 禁用态共享空集（snapshotIds 的显式返回，避免每次新建 Set） */
+  private static readonly EMPTY_IDS: ReadonlySet<string> = new Set()
 
   constructor(private readonly deps: SnapshotDeps) {}
 
@@ -87,8 +89,13 @@ export class MemoryStableSnapshot {
     return this.snapshotOf(workspace).text
   }
 
-  /** 该 workspace 当前快照含有的记忆 id 集合（供 injector 实时注入去重） */
+  /**
+   * 该 workspace 当前快照含有的记忆 id 集合（供 injector 实时注入去重）。
+   * 禁用时返回空集——实时注入路径不受快照影响（与"不注册段"一致：禁用
+   * 是显式配置，不是空快照）。
+   */
   snapshotIds(workspace: string): ReadonlySet<string> {
+    if (!this.deps.config.enableSnapshot) return MemoryStableSnapshot.EMPTY_IDS
     return this.snapshotOf(workspace).ids
   }
 

@@ -19,7 +19,7 @@ import { MemoryInjector, type InjectorConfig } from './injector.js'
 import { MemoryMaintenance, type MaintenanceConfig } from './maintenance.js'
 import { MEMORY_TABLE, memoryDomainSpec } from './memory-domain.js'
 import { registerSnapshot } from './snapshot.js'
-import { MemoryStableSnapshot, type SnapshotConfig } from './stable-snapshot.js'
+import { MemoryStableSnapshot } from './stable-snapshot.js'
 import { MemoryStore } from './store.js'
 import { registerMemoryTools } from './tools.js'
 
@@ -73,16 +73,18 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
     minScore: config.minScore,
     injectBudgetChars: config.injectBudgetChars,
   }
-  new MemoryInjector({ store, logger, config: injectorConfig }).install(ctx)
-
-  // 稳定快照（P1：system 前缀缓存感知注入）：窗口内字节不变的全局重要记忆段
-  const snapshotConfig: SnapshotConfig = {
-    enableSnapshot: config.enableSnapshot,
-    snapshotTtlMs: config.snapshotTtlMs,
-    snapshotBudgetChars: config.snapshotBudgetChars,
-    snapshotTopK: config.snapshotTopK,
-  }
-  new MemoryStableSnapshot({ store, config: snapshotConfig, now: () => Date.now() }).install(ctx)
+  const snapshotService = new MemoryStableSnapshot({
+    store,
+    config: {
+      enableSnapshot: config.enableSnapshot,
+      snapshotTtlMs: config.snapshotTtlMs,
+      snapshotBudgetChars: config.snapshotBudgetChars,
+      snapshotTopK: config.snapshotTopK,
+    },
+    now: () => Date.now(),
+  })
+  snapshotService.install(ctx)
+  new MemoryInjector({ store, snapshot: snapshotService, logger, config: injectorConfig }).install(ctx)
 
   // 模型工具：recall / search / note / forget / audit / status
   registerMemoryTools(ctx, { store })

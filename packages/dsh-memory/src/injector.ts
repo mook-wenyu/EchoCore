@@ -22,6 +22,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { DEFAULT_WORKSPACE, MEMORY_INJECTION_HEADER, MEMORY_PLUGIN_ID } from './constants.js'
 import { renderBudgetedPack } from './render.js'
+import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
 
@@ -36,6 +37,8 @@ export interface InjectorConfig {
 /** 注入器依赖（store 可注入，便于单测） */
 export interface InjectorDeps {
   store: MemoryStore
+  /** 稳定快照服务（P2：实时注入排除快照已含记忆，避免重复注入） */
+  snapshot: MemoryStableSnapshot
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
   config: InjectorConfig
 }
@@ -109,7 +112,14 @@ export class MemoryInjector {
       limit: this.deps.config.topK,
       minScore: this.deps.config.minScore,
     })
-    const fresh = candidates.filter((entry) => !this.isCurrentlyInjected(payload.agent.id, entry.id))
+    const fresh = candidates.filter(
+      (entry) =>
+        // 表层去重：已注入且未被压缩遮蔽的不再注入
+        !this.isCurrentlyInjected(payload.agent.id, entry.id) &&
+        // P2 快照去重：稳定快照已含的记忆不再进实时包（避免同一记忆
+        // 同时出现在 system 快照段与实时包，重复占预算）
+        !this.deps.snapshot.snapshotIds(workspace).has(entry.id),
+    )
     if (fresh.length === 0) return decision
 
     const pack = renderPack(fresh, this.deps.config.injectBudgetChars)

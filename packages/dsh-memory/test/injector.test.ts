@@ -9,6 +9,7 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { MemoryInjector, renderPack, textOfBatch, type InjectorConfig } from '../src/injector.js'
+import { MemoryStableSnapshot } from '../src/stable-snapshot.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
@@ -60,14 +61,24 @@ async function seed(store: MemoryStore, input: Partial<NewMemoryInput> = {}): Pr
   return result.entry
 }
 
-/** 组装被测对象（R3-1：统一 FakeCtx，监听器经 listener() 取用） */
-function setup(config: Partial<InjectorConfig> = {}) {
+/** 组装被测对象（R3-1：统一 FakeCtx，监听器经 listener() 取用）。
+ * 快照默认禁用：既有用例验证的是实时注入本身（高重要度 seed 会进快照
+ * 而被 P2 排除）；快照去重用例（P2 describe）显式启用并可按需收紧 topK
+ * 以精确控制快照成员（候选少时低重要度也会进快照，topK 是唯一杠杆）。 */
+function setup(config: Partial<InjectorConfig> = {}, snapshotEnabled = false, snapshotTopK = 30) {
   const ctx = new FakeCtx()
   const table = new FakeTable()
   const store = new MemoryStore(table)
   const logger = { warn: () => {}, info: () => {} }
+  // P2：快照服务（默认启用；测试可关以验证"禁用不影响实时注入"）
+  const snapshot = new MemoryStableSnapshot({
+    store,
+    config: { enableSnapshot: snapshotEnabled, snapshotTtlMs: 300_000, snapshotBudgetChars: 8192, snapshotTopK },
+    now: () => 1_000_000,
+  })
   const injector = new MemoryInjector({
     store,
+    snapshot,
     logger,
     config: {
       enableAutoInject: true,
@@ -84,7 +95,7 @@ function setup(config: Partial<InjectorConfig> = {}) {
   const sessionEvents = ctx.listener('session/event') as ((session: Session, event: SessionEvent) => void) | undefined
   const disposed = ctx.listener('agent/disposed') as ((payload: { agent: { id: string; session: Session } }) => void) | undefined
   if (preStep === undefined || sessionEvents === undefined) throw new Error('监听未注册')
-  return { ctx, store, injector, preStep, sessionEvents, disposed }
+  return { ctx, store, injector, snapshot, preStep, sessionEvents, disposed }
 }
 
 describe('MemoryInjector pre-step 注入', () => {
@@ -324,6 +335,49 @@ describe('MemoryInjector 会话生命周期清理（O2-4）', () => {
     const again = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
     if (again.kind !== 'enter') throw new Error('应 enter')
     expect(again.messages).toHaveLength(2)
+  })
+})
+
+// P2（OPTIMIZATION_PLAN_3）：实时注入排除稳定快照已含的记忆（混合形态去重）
+describe('MemoryInjector 快照去重（P2）', () => {
+  /** 从注入消息提取文本 */
+  function injectedText(decision: PreStepDecision): string {
+    if (decision.kind !== 'enter') throw new Error('应注入')
+    const injected = decision.messages[decision.messages.length - 1]
+    const text = (injected?.content ?? []).find((block) => block.type === 'text')?.text ?? ''
+    return text
+  }
+
+  it('快照已含的高重要度记忆不进实时包，未含的低重要度记忆正常注入', async () => {
+    const { preStep, store } = setup({}, true, 1)
+    // 快照 topK=1 → 只含高重要度（9）；低重要度（3）不在快照 → 实时注入只注入后者
+    await seed(store, { content: 'pnpm workspace 高重要规则', importance: 9 })
+    await seed(store, { content: 'pnpm workspace 一次性备注', importance: 3 })
+    const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
+    const text = injectedText(decision)
+    expect(text).toContain('一次性备注')
+    expect(text).not.toContain('高重要规则')
+  })
+
+  it('快照禁用时实时注入不受影响（显式配置语义）', async () => {
+    const { preStep, store } = setup({}, false)
+    await seed(store, { content: 'pnpm workspace 规则', importance: 9 })
+    const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
+    const text = injectedText(decision)
+    expect(text).toContain('pnpm workspace 规则')
+  })
+
+  it('快照重建（revision 变更）后排除集合更新：离开快照的记忆恢复可注入', async () => {
+    const { preStep, store } = setup({}, true, 1)
+    await seed(store, { content: 'pnpm workspace 旧备注', importance: 5 })
+    // 快照 topK=1：旧备注是唯一候选 → 在快照 → 实时注入排除它
+    const first = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
+    expect(injectedText(first)).not.toContain('旧备注')
+    // 写入更高重要度 → revision 变更 → 快照重建：topK=1 换成权威规则，旧备注离开快照
+    await seed(store, { content: 'pnpm workspace 权威规则', importance: 9 })
+    const second = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
+    expect(injectedText(second)).toContain('旧备注')
+    expect(injectedText(second)).not.toContain('权威规则')
   })
 })
 
