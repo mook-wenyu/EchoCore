@@ -1,6 +1,10 @@
 packages:
   - packages/*
 
-# pnpm 11：仅允许 esbuild 执行构建脚本（vitest 依赖其平台二进制）
+# pnpm 11：仅允许必要的构建脚本（vitest 依赖 esbuild 平台二进制；
+# onnxruntime-node 原生绑定与 protobufjs/sharp 为 @huggingface/transformers 依赖）
 allowBuilds:
   esbuild: true
+  onnxruntime-node: true
+  protobufjs: true
+  sharp: true

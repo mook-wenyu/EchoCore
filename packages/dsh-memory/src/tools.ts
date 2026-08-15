@@ -13,6 +13,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
 import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS } from './constants.js'
+import { searchWithSemantic, type EmbeddingService } from './embedding.js'
+import type { EmbeddingIndex } from './embed-index.js'
 import { formatMemoryLine } from './render.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry, MemoryKind } from './types.js'
@@ -20,6 +22,12 @@ import type { MemoryEntry, MemoryKind } from './types.js'
 /** 工具集依赖 */
 export interface MemoryToolsDeps {
   store: MemoryStore
+  /** P4 语义嵌入（可选；未启用时工具检索为纯关键词路径） */
+  embedding?: EmbeddingService
+  /** P4 嵌入索引（与 embedding 成对出现） */
+  embedIndex?: EmbeddingIndex
+  /** 语义降级/嵌入故障记录（可选；装配层注入 logger） */
+  logger?: Pick<ReturnType<Context['logger']>, 'warn'>
 }
 
 /** 记忆条目的最小规范形态（工具输出与 RPC 共用） */
@@ -150,11 +158,15 @@ function registerRecall(ctx: Context, deps: MemoryToolsDeps): void {
         },
       },
       async execute(args, exec) {
-        const results = deps.store.search({
-          query: args.query,
-          workspace: workspaceOf(exec),
-          limit: args.limit ?? 8,
-        })
+        // P4：语义增强检索（未启用时纯关键词，行为与之前一致）
+        const results = (await searchWithSemantic(
+          deps.store,
+          deps.embedding,
+          deps.embedIndex,
+          args.query,
+          { workspace: workspaceOf(exec), limit: args.limit ?? 8 },
+          (message) => deps.logger?.warn(message),
+        )) as MemoryEntry[]
         return {
           memories: results.map((entry) => ({
             id: entry.id,
@@ -224,14 +236,33 @@ function registerSearch(ctx: Context, deps: MemoryToolsDeps): void {
         },
       },
       async execute(args, exec) {
-        const results = deps.store.search({
-          query: args.query ?? '',
-          workspace: workspaceOf(exec),
-          kind: args.kind,
-          tag: args.tag,
-          status: args.status,
-          limit: args.limit ?? 20,
-        })
+        // P4：语义增强检索（未启用时纯关键词；查询为空走浏览路径不嵌入）
+        let results: MemoryEntry[]
+        if (args.query === undefined || args.query.trim() === '') {
+          results = deps.store.search({
+            query: '',
+            workspace: workspaceOf(exec),
+            kind: args.kind,
+            tag: args.tag,
+            status: args.status,
+            limit: args.limit ?? 20,
+          })
+        } else {
+          results = (await searchWithSemantic(
+            deps.store,
+            deps.embedding,
+            deps.embedIndex,
+            args.query,
+            {
+              workspace: workspaceOf(exec),
+              kind: args.kind,
+              tag: args.tag,
+              status: args.status,
+              limit: args.limit ?? 20,
+            },
+            (message) => deps.logger?.warn(message),
+          )) as MemoryEntry[]
+        }
         return {
           memories: results.map(toSummary),
           total: results.length,

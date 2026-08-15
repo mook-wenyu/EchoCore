@@ -39,6 +39,12 @@ export const DEFAULTS = {
   snapshotBudgetChars: 8192,
   /** 稳定快照 Top-K 候选上限（预算之外的保险，防止单 workspace 记忆过多时全表扫描） */
   snapshotTopK: 30,
+  /** 语义嵌入检索总开关（P4；默认关闭——模型文件与依赖体积是有意取舍，显式启用） */
+  embeddingEnabled: false,
+  /** 嵌入模型目录（含 ONNX 模型与 tokenizer 文件；空串 → 默认 ~/.dsh/storages/embedding-model） */
+  embeddingModelDir: '',
+  /** 语义融合权重：final = w×relevance + (1-w)×cosine（0..1） */
+  embeddingFusionWeight: 0.5,
   /** 提取器总开关 */
   enableExtractor: true,
   /** 后台记忆整理任务开关（O8-M） */
@@ -71,6 +77,12 @@ export interface Config {
   snapshotBudgetChars?: number
   /** 稳定快照 Top-K 候选上限 */
   snapshotTopK?: number
+  /** 语义嵌入检索总开关（默认 false，显式启用） */
+  embeddingEnabled?: boolean
+  /** 嵌入模型目录（空串 → 默认 ~/.dsh/storages/embedding-model） */
+  embeddingModelDir?: string
+  /** 语义融合权重（0..1） */
+  embeddingFusionWeight?: number
   /** 提取器总开关 */
   enableExtractor?: boolean
   /** 后台记忆整理任务开关 */
@@ -104,6 +116,10 @@ export const Config: z<Config> = z.object({
   snapshotTtlMs: z.number().min(1000).default(DEFAULTS.snapshotTtlMs),
   snapshotBudgetChars: z.number().min(1).default(DEFAULTS.snapshotBudgetChars),
   snapshotTopK: z.number().min(1).default(DEFAULTS.snapshotTopK),
+  embeddingEnabled: z.boolean().default(DEFAULTS.embeddingEnabled),
+  embeddingModelDir: z.string().default(DEFAULTS.embeddingModelDir),
+  /** 融合权重 0..1（越界由 schema 拒绝，不做运行时夹逼） */
+  embeddingFusionWeight: z.number().min(0).max(1).default(DEFAULTS.embeddingFusionWeight),
   enableExtractor: z.boolean().default(DEFAULTS.enableExtractor),
   enableMaintenance: z.boolean().default(DEFAULTS.enableMaintenance),
   /** 后台整理任务间隔（小时；R2-10/M2：最小 1，非法值由 schema 校验拒绝而非运行时夹逼） */

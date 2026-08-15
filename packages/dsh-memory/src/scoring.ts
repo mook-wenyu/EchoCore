@@ -126,19 +126,26 @@ export function importanceFactor(importance: number): number {
 }
 
 /**
+ * 时间 × 重要性调制因子（0.5..1.0）：memoryScore 与语义融合路径共用。
+ * P3：半衰期随 importance 自适应 + 重要度 ≥ 8 的 salience floor（保活）。
+ */
+export function timeImportanceFactor(entry: MemoryEntry, now: number): number {
+  let recency = recencyFactor(entry.lastAccessAt, now, adaptiveHalfLifeDays(entry.importance))
+  if (entry.importance >= SALIENCE_FLOOR_IMPORTANCE) {
+    recency = Math.max(recency, SALIENCE_FLOOR_RECENCY)
+  }
+  return (0.6 + 0.4 * recency) * importanceFactor(entry.importance)
+}
+
+/**
  * 综合评分（0..1）：相关性主导，时间衰减与重要性为调制因子。
- * P3：半衰期随 importance 自适应（adaptiveHalfLifeDays）；重要度 ≥ 8 的
- * 记忆施加 salience floor（时间因子下限 0.5，保活）。结果确定可单测。
+ * 结果确定可单测。
  */
 export function memoryScore(entry: MemoryEntry, queryTokens: string[], now: number): number {
   const entryTokens = new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
   const relevance = relevanceScore(queryTokens, entryTokens)
   if (relevance <= 0) return 0
-  let recency = recencyFactor(entry.lastAccessAt, now, adaptiveHalfLifeDays(entry.importance))
-  if (entry.importance >= SALIENCE_FLOOR_IMPORTANCE) {
-    recency = Math.max(recency, SALIENCE_FLOOR_RECENCY)
-  }
-  return relevance * (0.6 + 0.4 * recency) * importanceFactor(entry.importance)
+  return relevance * timeImportanceFactor(entry, now)
 }
 
 /** 便捷入口：从原始查询文本与条目直接计算综合评分 */

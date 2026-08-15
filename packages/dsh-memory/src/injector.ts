@@ -21,6 +21,8 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { DEFAULT_WORKSPACE, MEMORY_INJECTION_HEADER, MEMORY_PLUGIN_ID } from './constants.js'
+import { searchWithSemantic, type EmbeddingService } from './embedding.js'
+import type { EmbeddingIndex } from './embed-index.js'
 import { renderBudgetedPack } from './render.js'
 import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
@@ -39,6 +41,10 @@ export interface InjectorDeps {
   store: MemoryStore
   /** 稳定快照服务（P2：实时注入排除快照已含记忆，避免重复注入） */
   snapshot: MemoryStableSnapshot
+  /** P4 语义嵌入（未启用/未就绪时纯关键词路径；undefined = 配置关闭） */
+  embedding?: EmbeddingService
+  /** P4 嵌入索引（条目向量查找；与 embedding 成对出现） */
+  embedIndex?: EmbeddingIndex
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
   config: InjectorConfig
 }
@@ -106,12 +112,15 @@ export class MemoryInjector {
 
     const session = payload.agent.session
     const workspace = session.header.cwd ?? DEFAULT_WORKSPACE
-    const candidates = this.deps.store.search({
+    // P4：语义增强检索（状态门控 + 显式降级；未启用时纯关键词，行为与 P3 前一致）
+    const candidates = (await searchWithSemantic(
+      this.deps.store,
+      this.deps.embedding,
+      this.deps.embedIndex,
       query,
-      workspace,
-      limit: this.deps.config.topK,
-      minScore: this.deps.config.minScore,
-    })
+      { workspace, limit: this.deps.config.topK, minScore: this.deps.config.minScore },
+      (message, error) => this.deps.logger.warn(message, error),
+    )) as MemoryEntry[]
     const fresh = candidates.filter(
       (entry) =>
         // 表层去重：已注入且未被压缩遮蔽的不再注入

@@ -15,7 +15,8 @@
 
 import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 
-import { scoreEntry, tokenize } from './scoring.js'
+import { cosine } from './embedding.js'
+import { relevanceScore, scoreEntry, timeImportanceFactor, tokenize } from './scoring.js'
 import {
   dedupKeyOf,
   newMemoryId,
@@ -47,6 +48,16 @@ export interface SearchOptions {
   includeArchived?: boolean
   /** 是否包含被覆盖条目（D-A；默认否——被 superseded 的条目对检索隐藏，置真时可见用于审计） */
   includeSuperseded?: boolean
+  /**
+   * 语义融合检索（P4，可选）：提供查询向量与条目向量查找时，评分切换为
+   * `(w×relevance + (1-w)×max(0,cosine)) × 时间 × 重要性`——关键词零重合
+   * 但语义相关的条目可被召回。任一项缺失则退回纯关键词路径。
+   */
+  queryEmbedding?: ArrayLike<number>
+  /** 条目向量查找（id → 384 维向量；undefined = 尚无嵌入，该条目只用关键词分） */
+  lookupEmbedding?: (id: string) => number[] | undefined
+  /** 语义融合权重（0..1；默认 0.5） */
+  fusionWeight?: number
 }
 
 /**
@@ -122,6 +133,8 @@ export class MemoryStore {
     now: NowFn = () => Date.now(),
     /** R4-1：畸形 source 条目被检索过滤时的告警回调（装配层注入 logger；无回调则静默过滤） */
     private readonly onCorruptSource?: (id: string) => void,
+    /** P4：嵌入索引联动钩子（onCreate 新建成功后触发、onArchive 归档后触发；fire-and-forget 由调用方负责） */
+    private readonly hooks?: { onCreate?: (entry: MemoryEntry) => void; onArchive?: (id: string) => void },
   ) {
     this.table = table
     this.now = now
@@ -222,6 +235,8 @@ export class MemoryStore {
     for (const target of supersededTargets) {
       await this.markSuperseded(target.id, entry.id, input.by)
     }
+    // P4：嵌入索引联动（新建内容已落库；合并路径内容不变不触发）
+    this.hooks?.onCreate?.(entry)
     return { entry, outcome: { merged: false } }
   }
 
@@ -295,6 +310,8 @@ export class MemoryStore {
         audit: [...current.audit, { action: 'archive' as const, at: this.iso(), by }],
       }))
       this.revisionValue++
+      // P4：嵌入索引联动（归档条目不再参与检索，移除向量防陈旧占用）
+      this.hooks?.onArchive?.(id)
       return true
     } catch (error) {
       if (error instanceof DomainError && error.code === 'missing-key') return false
@@ -346,8 +363,20 @@ export class MemoryStore {
       top = matches.slice(0, limit)
     } else {
       const scored: Array<{ entry: MemoryEntry; score: number }> = []
+      // P4 语义融合：提供查询向量与条目向量查找时启用（关键词零重合但语义相关可召回）
+      const semantic = options.queryEmbedding !== undefined && options.lookupEmbedding !== undefined
+      const weight = options.fusionWeight ?? 0.5
+      const queryTokenList = tokenize(query)
       for (const entry of matches) {
-        const score = scoreEntry(entry, query, now)
+        let score: number
+        if (semantic) {
+          const rel = relevanceScore(queryTokenList, entryTokensOf(entry))
+          const vector = options.lookupEmbedding?.(entry.id)
+          const cos = vector === undefined ? 0 : Math.max(0, cosine(options.queryEmbedding!, vector))
+          score = (weight * rel + (1 - weight) * cos) * timeImportanceFactor(entry, now)
+        } else {
+          score = scoreEntry(entry, query, now)
+        }
         if (score >= minScore) scored.push({ entry, score })
       }
       scored.sort((a, b) => b.score - a.score)
@@ -448,6 +477,11 @@ export class MemoryStore {
 function unionSeqs(a: number[], b: number[]): number[] {
   const set = new Set<number>([...a, ...b])
   return [...set].sort((x, y) => x - y)
+}
+
+/** 条目 token 集合（content + tags；语义融合路径的关键词相关性复用） */
+function entryTokensOf(entry: MemoryEntry): Set<string> {
+  return new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
 }
 
 /** 去重索引键：`workspace::kind::dedupKey`，将合并粒度提升到「workspace + kind + 内容」（O3） */

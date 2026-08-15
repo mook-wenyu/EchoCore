@@ -47,6 +47,7 @@
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-workspace": "^0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.0",
+    "@huggingface/transformers": "^4.2.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

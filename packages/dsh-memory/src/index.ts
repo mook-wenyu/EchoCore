@@ -10,9 +10,14 @@
  * 平面规则：本插件不发布服务，组合行可松散挂载（见实现计划 §2.3）。
  */
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 import type { Context } from '@deepseek-ai/cordis'
 
 import { Config, DEFAULTS, type Config as ConfigType, type ResolvedConfig } from './config.js'
+import { EmbeddingIndex } from './embed-index.js'
+import { EmbeddingService, EmbeddingUnavailableError } from './embedding.js'
 import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
 import { registerMemoryRpc } from './host-rpc.js'
 import { MemoryInjector, type InjectorConfig } from './injector.js'
@@ -43,6 +48,16 @@ export function apply(ctx: Context, config: ConfigType): Promise<void> {
   return mountMemory(ctx, resolved, logger)
 }
 
+/** 嵌入索引文件默认路径（与 memory.json 同数据目录） */
+function defaultEmbeddingsFile(): string {
+  return join(homedir(), '.dsh', 'storages', 'memory-embeddings.json')
+}
+
+/** 嵌入模型目录默认路径（空配置时；含 onnx/model_quantized.onnx 与 tokenizer 文件） */
+function defaultEmbeddingModelDir(): string {
+  return join(homedir(), '.dsh', 'storages', 'embedding-model')
+}
+
 /** 装配各模块：打开领域 → 构造存储与提取器 → 挂接生命周期 */
 async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnType<Context['logger']>): Promise<void> {
   const domain = await ctx.storageDomain.open(memoryDomainSpec)
@@ -52,9 +67,48 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
   })
 
   // R4-1：畸形 source（手工篡改 memory.json）被检索过滤时告警一次，可观测性由装配层提供
-  const store = new MemoryStore(domain.table(MEMORY_TABLE), undefined, (id) => {
-    logger.warn(`[dsh-memory] 发现 source 结构畸形的记忆条目（已从检索/浏览过滤，可用 memory_audit ${id} 查看）：${id}`)
-  })
+  // P4 hooks：onCreate/onArchive 闭包引用后赋值的 embedIndex（let，延迟求值——
+  // 嵌入启用时索引在下方初始化；未启用时恒 undefined，hook 空操作）
+  const store = new MemoryStore(
+    domain.table(MEMORY_TABLE),
+    undefined,
+    (id) => {
+      logger.warn(`[dsh-memory] 发现 source 结构畸形的记忆条目（已从检索/浏览过滤，可用 memory_audit ${id} 查看）：${id}`)
+    },
+    {
+      // 新建记忆增量嵌入（fire-and-forget，嵌入失败仅记录，检索保持关键词）
+      onCreate: (entry) => embedIndex?.indexEntry(entry),
+      onArchive: (id) => embedIndex?.remove(id),
+    },
+  )
+
+  // P4：语义嵌入（显式启用；初始化失败记录并保持关键词检索——嵌入是一等
+  // 状态（EmbeddingService.state），非静默兜底）
+  let embeddingService: EmbeddingService | undefined
+  let embedIndex: EmbeddingIndex | undefined
+  if (config.embeddingEnabled) {
+    const modelDir = config.embeddingModelDir !== '' ? config.embeddingModelDir : defaultEmbeddingModelDir()
+    embeddingService = new EmbeddingService({ enabled: true, modelDir })
+    embedIndex = new EmbeddingIndex({
+      file: defaultEmbeddingsFile(),
+      service: embeddingService,
+      listAll: () => store.listRecent(Number.MAX_SAFE_INTEGER),
+      logWarn: (message, error) => logger.warn(message, error),
+    })
+    try {
+      await embeddingService.init()
+      await embedIndex.load()
+      // 全量补齐缺失嵌入（后台；~1.2s/1260 条，不阻塞装配完成）
+      void embedIndex.ensureAll()
+      logger.info(`[dsh-memory] 语义嵌入已就绪（模型：${modelDir}）`)
+    } catch (error) {
+      if (error instanceof EmbeddingUnavailableError) {
+        logger.error(`[dsh-memory] ${error.message}（检索保持关键词模式；可用 scripts/download-embedding-model.mjs 下载模型后重启）`)
+      } else {
+        throw error
+      }
+    }
+  }
 
   // 提取器：双通道（压缩遮蔽 + 轮次增量），纯观察不阻塞主循环
   // R2-4（B4）：schemastery 加载即填充默认值，?? 是死分支——直接读 config 字段
@@ -84,10 +138,10 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
     now: () => Date.now(),
   })
   snapshotService.install(ctx)
-  new MemoryInjector({ store, snapshot: snapshotService, logger, config: injectorConfig }).install(ctx)
+  new MemoryInjector({ store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger, config: injectorConfig }).install(ctx)
 
   // 模型工具：recall / search / note / forget / audit / status
-  registerMemoryTools(ctx, { store })
+  registerMemoryTools(ctx, { store, embedding: embeddingService, embedIndex, logger })
 
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
   registerSnapshot(ctx, { store, logger })
