@@ -259,24 +259,29 @@ function DetailPane(props: { entry: MemoryDetailView; onArchive: () => void }): 
   )
 }
 
-// ── 样式（最小内联，跟随主题变量） ─────────────────────────────────────
+// ── 样式（最小内联，跟随官方主题 token --dsw-*） ─────────────────────
+// DSH 主题系统：`--dsw-*` 前缀（primitive `--dsw-static-*` + 语义 alias
+// `--dsw-alias-*`），声明于 body、明暗经 `body[data-ds-dark-theme]` 切换。
+// 官方 UI 全部裸 `var(--dsw-*)` 零 fallback（369 处实证）——本面板同步该模式，
+// 不再使用不存在的 `--dsh-*` 变量与硬编码 fallback（用户报告的风格不同步根因）。
 
 const panelStyle: React.CSSProperties = { padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }
-const statsStyle: React.CSSProperties = { fontSize: 13, fontWeight: 600, opacity: 0.85 }
+const statsStyle: React.CSSProperties = { font: 'var(--dsw-font-xs-13)', fontWeight: 600, color: 'var(--dsw-alias-label-secondary)' }
 const listStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 360, overflowY: 'auto' }
-const detailStyle: React.CSSProperties = { border: '1px solid var(--dsh-border, #ccc)', borderRadius: 6, padding: 8 }
-const metaStyle: React.CSSProperties = { fontSize: 12, opacity: 0.75, margin: '2px 0' }
+const detailStyle: React.CSSProperties = { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: 8 }
+const metaStyle: React.CSSProperties = { font: 'var(--dsw-font-xxs-12)', color: 'var(--dsw-alias-label-tertiary)', margin: '2px 0' }
 const inputStyle: React.CSSProperties = { marginRight: 8, padding: '4px 8px' }
 const selectStyle: React.CSSProperties = { marginRight: 8, padding: '4px 8px' }
 const buttonStyle: React.CSSProperties = { padding: '4px 10px', cursor: 'pointer' }
-const errorStyle: React.CSSProperties = { color: 'var(--dsh-danger, #c0392b)', fontSize: 13 }
+const errorStyle: React.CSSProperties = { color: 'var(--dsw-alias-state-error-primary)', fontSize: 13 }
 
 function rowStyle(active: boolean): React.CSSProperties {
   return {
     padding: '6px 8px',
-    border: '1px solid var(--dsh-border, #ddd)',
+    border: '1px solid var(--dsw-alias-border-l1)',
     borderRadius: 4,
     cursor: 'pointer',
-    background: active ? 'var(--dsh-accent-soft, #eef4ff)' : undefined,
+    // 选中行背景：官方交互 hover 底色（settings 面板的通用选中/悬停语义）
+    background: active ? 'var(--dsw-alias-interactive-bg-hover)' : undefined,
   }
 }
