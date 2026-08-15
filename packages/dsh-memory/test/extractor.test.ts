@@ -7,7 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { MemoryExtractor, type ExtractorConfig } from '../src/extractor.js'
+import { MemoryExtractor } from '../src/extractor.js'
 import { MemoryStore } from '../src/store.js'
 import { FakeCtx, FakeTable, settle } from './helpers.js'
 
@@ -81,6 +81,19 @@ function disposePayload(id: string, session: Session): { agent: { id: string; se
   return { agent: { id, session } }
 }
 
+/**
+ * 构造足以越过模块常量 MIN_EXTRACT_CHARS=2000 的长文本（供增量通道触发提取）。
+ * 配置常量化后阈值固定为 2000 字符，测试文本必须超过它才能驱动增量提取。
+ */
+function longText(seed: string, targetChars = 2200): string {
+  return seed.repeat(Math.ceil(targetChars / seed.length))
+}
+
+/** 构造超过模块常量 MAX_EXTRACT_CHARS=12000 的长文本（供截尾测试） */
+function veryLongText(seed: string, targetChars = 14000): string {
+  return seed.repeat(Math.ceil(targetChars / seed.length))
+}
+
 /** 构造 compaction/summary 事件 */
 function compactionSummaryEvent(seq: number, shadowedSeqs: number[]): SessionEvent {
   return {
@@ -101,25 +114,16 @@ function compactionSummaryEvent(seq: number, shadowedSeqs: number[]): SessionEve
   } as SessionEvent
 }
 
-/** 配置工厂 */
-function config(overrides: Partial<ExtractorConfig> = {}): ExtractorConfig {
-  return {
-    enableExtractor: true,
-    minExtractChars: 100,
-    maxExtractChars: 12000,
-    extractMaxTokens: 100,
-    ...overrides,
-  }
-}
-
-/** 组装被测对象 */
-function setup(options: { output?: string | Error; config?: ExtractorConfig } = {}) {
+/** 组装被测对象（配置常量化后：提取极参数已固化为模块常量
+ * MIN_EXTRACT_CHARS=2000 / MAX_EXTRACT_CHARS=12000 / EXTRACT_MAX_TOKENS=2048，
+ * 不再经 config 注入，构造只传 store/llm/logger）。 */
+function setup(options: { output?: string | Error } = {}) {
   const ctx = new FakeCtx()
   const table = new FakeTable()
   const store = new MemoryStore(table)
   const llm = new FakeLlm(options.output ?? '{"memories":[{"kind":"fact","content":"项目使用 pnpm","importance":7}]}')
   const logger = { warn: () => {}, info: () => {} }
-  const extractor = new MemoryExtractor({ store, llm, logger, config: config(options.config) })
+  const extractor = new MemoryExtractor({ store, llm, logger })
   extractor.install(ctx as unknown as Context)
   const listener = ctx.listener('session/event')
   if (listener === undefined) throw new Error('session/event 监听未注册')
@@ -135,7 +139,7 @@ describe('MemoryExtractor 通道 B（增量）', () => {
     await settle()
     expect(llm.calls).toBe(0) // 文本不足阈值
 
-    session.events.push(userEvent(4, '这是一条足够长的消息内容用来凑足最小提取字符阈值'.repeat(6)), turnEndEvent(5, 2))
+    session.events.push(userEvent(4, longText('这是一条足够长的消息内容用来凑足最小提取字符阈值')), turnEndEvent(5, 2))
     listener(session, session.events[3] as SessionEvent)
     listener(session, session.events[4] as SessionEvent)
     await settle()
@@ -150,7 +154,7 @@ describe('MemoryExtractor 通道 B（增量）', () => {
     const { llm, listener } = setup()
     const session = makeSession('s1', [
       headerEvent(1),
-      userEvent(2, '第一轮：用户提出需求甲'.repeat(15)),
+      userEvent(2, longText('第一轮：用户提出需求甲')),
       turnEndEvent(3, 1),
     ])
     listener(session, session.events[1] as SessionEvent)
@@ -176,7 +180,7 @@ describe('MemoryExtractor 通道 A（压缩遮蔽）', () => {
 
   it('已处理过的序号不会重复提取（水位防护）', async () => {
     const { store, llm, listener } = setup()
-    const session = makeSession('s1', [headerEvent(1), userEvent(2, '甲'.repeat(200)), turnEndEvent(3, 1)])
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, longText('甲')), turnEndEvent(3, 1)])
     listener(session, session.events[1] as SessionEvent)
     listener(session, session.events[2] as SessionEvent)
     await settle()
@@ -195,12 +199,12 @@ describe('MemoryExtractor 失败与开关', () => {
     const ctx = new FakeCtx()
     const store = new MemoryStore(new FakeTable())
     const logger = { warn: () => {}, info: () => {} }
-    const extractor = new MemoryExtractor({ store, llm: failing, logger, config: config() })
+    const extractor = new MemoryExtractor({ store, llm: failing, logger })
     extractor.install(ctx as unknown as Context)
     const listener = ctx.listener('session/event')
     if (listener === undefined) throw new Error('监听未注册')
 
-    const session = makeSession('s1', [headerEvent(1), userEvent(2, '乙'.repeat(200)), turnEndEvent(3, 1)])
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, longText('乙')), turnEndEvent(3, 1)])
     listener(session, session.events[1] as SessionEvent)
     listener(session, session.events[2] as SessionEvent)
     await settle()
@@ -209,7 +213,7 @@ describe('MemoryExtractor 失败与开关', () => {
 
     // 换健康 llm 后重试：同一批次应被重新提取
     const healthy = new FakeLlm('{"memories":[{"kind":"fact","content":"重试成功"}]}')
-    const extractor2 = new MemoryExtractor({ store, llm: healthy, logger, config: config() })
+    const extractor2 = new MemoryExtractor({ store, llm: healthy, logger })
     const ctx2 = new FakeCtx()
     extractor2.install(ctx2 as unknown as Context)
     const listener2 = ctx2.listener('session/event')
@@ -220,18 +224,9 @@ describe('MemoryExtractor 失败与开关', () => {
     expect(store.stats().total).toBe(1)
   })
 
-  it('enableExtractor=false 时完全静默', async () => {
-    const { llm, listener } = setup({ config: { enableExtractor: false, minExtractChars: 100, maxExtractChars: 12000, extractMaxTokens: 100 } })
-    const session = makeSession('s1', [headerEvent(1), userEvent(2, '丙'.repeat(300)), turnEndEvent(3, 1)])
-    listener(session, session.events[1] as SessionEvent)
-    listener(session, session.events[2] as SessionEvent)
-    await settle()
-    expect(llm.calls).toBe(0)
-  })
-
   it('无路由时跳过提取并告警', async () => {
     const { llm, listener } = setup()
-    const session = makeSession('s1', [userEvent(1, '丁'.repeat(300)), turnEndEvent(2, 1)])
+    const session = makeSession('s1', [userEvent(1, longText('丁')), turnEndEvent(2, 1)])
     listener(session, session.events[0] as SessionEvent)
     listener(session, session.events[1] as SessionEvent)
     await settle()
@@ -240,7 +235,10 @@ describe('MemoryExtractor 失败与开关', () => {
 })
 
 describe('MemoryExtractor 长文本截断（O1-3 maxExtractChars）', () => {
-  function makeExtractor(overrides: Partial<ExtractorConfig>) {
+  // 配置常量化后截断阈值固化为 MAX_EXTRACT_CHARS=12000，无法再按用例调小；
+  // 因此截断用例改用 >12000 的真实长文来驱动"超限截尾"，而"未超限"用例用
+  // 介于 MIN_EXTRACT_CHARS(2000) 与 12000 之间的文本验证原样保留。
+  function makeExtractor() {
     const warns: string[] = []
     const ctx = new FakeCtx()
     const store = new MemoryStore(new FakeTable())
@@ -249,13 +247,6 @@ describe('MemoryExtractor 长文本截断（O1-3 maxExtractChars）', () => {
       store,
       llm,
       logger: { warn: (m: string) => warns.push(m), info: () => {} },
-      config: {
-        enableExtractor: true,
-        minExtractChars: 5,
-        maxExtractChars: 12000,
-        extractMaxTokens: 100,
-        ...overrides,
-      },
     })
     extractor.install(ctx as unknown as Context)
     const listener = ctx.listener('session/event')
@@ -264,9 +255,9 @@ describe('MemoryExtractor 长文本截断（O1-3 maxExtractChars）', () => {
   }
 
   it('超限时截尾保最新，且在 \\n 边界切', async () => {
-    const { warns, llm, listener } = makeExtractor({ maxExtractChars: 40 })
-    // 文本远超上限：头部"旧内容"应在截断中被丢弃，保留尾部
-    const text = `${'旧内容'.repeat(20)}\n${'新内容'.repeat(20)}`
+    const { warns, llm, listener } = makeExtractor()
+    // 文本远超 MAX_EXTRACT_CHARS(12000)：头部"旧内容"应在截断中被丢弃，保留尾段"新内容"
+    const text = `${'旧内容'.repeat(100)}\n${veryLongText('新内容')}`
     const session = makeSession('s1', [headerEvent(1), userEvent(2, text), turnEndEvent(3, 1)])
     listener(session, session.events[1] as SessionEvent)
     listener(session, session.events[2] as SessionEvent)
@@ -278,26 +269,30 @@ describe('MemoryExtractor 长文本截断（O1-3 maxExtractChars）', () => {
   })
 
   it('未超限时保留完整文本且不 warn', async () => {
-    const { warns, llm, listener } = makeExtractor({ maxExtractChars: 5000 })
-    const text = '完整内容会被完整保留下来'
+    const { warns, llm, listener } = makeExtractor()
+    // 文本介于 MIN_EXTRACT_CHARS(2000) 与 MAX_EXTRACT_CHARS(12000) 之间：
+    // 能触发增量提取，但不足截断阈值 → 原样保留、无告警
+    const text = longText('完整内容会被完整保留下来')
     const session = makeSession('s1', [headerEvent(1), userEvent(2, text), turnEndEvent(3, 1)])
     listener(session, session.events[1] as SessionEvent)
     listener(session, session.events[2] as SessionEvent)
     await settle()
     expect(warns).toHaveLength(0)
     expect(llm.lastTranscript).toContain('完整内容会被完整保留下来')
+    expect(llm.lastTranscript.length).toBeGreaterThanOrEqual(2000) // 未截断
   })
 
   it('compaction 通道同样截断', async () => {
-    const { warns, llm, listener } = makeExtractor({ maxExtractChars: 40 })
-    const long = '被压缩的长文本内容'.repeat(10)
+    const { warns, llm, listener } = makeExtractor()
+    const long = veryLongText('被压缩的长文本内容')
     const session = makeSession('s1', [headerEvent(1), userEvent(2, long), assistantEvent(3, 'OK')])
     session.events.push(compactionSummaryEvent(4, [2, 3]))
     listener(session, session.events[3] as SessionEvent)
     await settle()
     expect(llm.calls).toBe(1)
     expect(warns.length).toBeGreaterThan(0)
-    expect(llm.lastTranscript.length).toBeLessThan(100)
+    // 截尾后摘录长度应明显小于原文（>12000 被压到 ≤12000）
+    expect(llm.lastTranscript.length).toBeLessThan(long.length)
   })
 })
 
@@ -310,14 +305,15 @@ describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
       store,
       llm,
       logger: { warn: () => {}, info: () => {} },
-      config: config({ minExtractChars: 1000 }), // 远高于文本量，正常路径不会触发
+      // 配置常量化后阈值固定 MIN_EXTRACT_CHARS=2000，远高于"短文本"量，
+      // 增量通道正常路径不会触发（只挂起），交由会话结束 flush 提取
     })
     extractor.install(ctx as unknown as Context)
     const listener = ctx.listener('session/event')
     const dispose = ctx.listener('agent/disposed')
     if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
     const session = makeSession('s1', [headerEvent(1), userEvent(2, '短文本'), turnEndEvent(3, 1)])
-    // 文本量 < minExtractChars(1000)：增量通道只挂起不提取
+    // 文本量 < minExtractChars(2000)：增量通道只挂起不提取
     listener(session, session.events[1] as SessionEvent)
     listener(session, session.events[2] as SessionEvent)
     await settle()
@@ -337,7 +333,8 @@ describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
       store,
       llm,
       logger: { warn: () => {}, info: () => {} },
-      config: config({ minExtractChars: 1000 }),
+      // 配置常量化：MIN_EXTRACT_CHARS=2000 远高于"短文本"，增量路径只挂起，
+      // 交由会话结束 flush 统一提取
     })
     extractor.install(ctx as unknown as Context)
     const listener = ctx.listener('session/event')
@@ -367,7 +364,6 @@ describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
       store,
       llm,
       logger: { warn: (m: string) => warns.push(m), info: () => {} },
-      config: config({ minExtractChars: 1000 }),
     })
     extractor.install(ctx as unknown as Context)
     const listener = ctx.listener('session/event')
@@ -413,7 +409,7 @@ describe('提取器串行链并发（O7 竞态防回归）', () => {
       store,
       llm,
       logger: { warn: () => {}, info: () => {} },
-      config: config({ minExtractChars: 5 }), // 阈值低于测试文本，确保每回合都触发提取
+      // 配置常量化：MIN_EXTRACT_CHARS=2000；两回合消息均用 longText 越过阈值
     })
     extractor.install(ctx as unknown as Context)
     const listener = ctx.listener('session/event')
@@ -422,9 +418,9 @@ describe('提取器串行链并发（O7 竞态防回归）', () => {
     // 两个回合背靠背投递（第二条在第一条处理中被阻塞时入队）
     const session = makeSession('s1', [
       headerEvent(1),
-      userEvent(2, '第一条记忆文本'),
+      userEvent(2, longText('第一条记忆文本')),
       turnEndEvent(10, 1),
-      userEvent(11, '第二条记忆文本'),
+      userEvent(11, longText('第二条记忆文本')),
       turnEndEvent(20, 2),
     ])
     listener(session, session.events[2] as SessionEvent) // turnEnd(10)
@@ -466,14 +462,14 @@ describe('提取器串行链并发（O7 竞态防回归）', () => {
       store,
       llm,
       logger: { warn: () => {}, info: () => {} },
-      config: config({ minExtractChars: 5 }),
+      // 配置常量化：MIN_EXTRACT_CHARS=2000；用 longText 使批次越过阈值立即入链
     })
     extractor.install(ctx as unknown as Context)
     const listener = ctx.listener('session/event')
     const dispose = ctx.listener('agent/disposed')
     if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
 
-    const session = makeSession('s1', [headerEvent(1), userEvent(2, '待提取文本'), turnEndEvent(10, 1)])
+    const session = makeSession('s1', [headerEvent(1), userEvent(2, longText('待提取文本')), turnEndEvent(10, 1)])
     listener(session, session.events[2] as SessionEvent) // turnEnd 触发批次入链（阻塞中）
     await settle()
     // dispose 在批次未完成时到达：flush 应排队在链后，不打断在途批次

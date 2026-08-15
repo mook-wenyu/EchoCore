@@ -26,21 +26,21 @@ import { DEFAULT_WORKSPACE, MEMORY_INJECTION_HEADER } from './constants.js'
 import { renderBudgetedPack } from './render.js'
 import type { MemoryStore } from './store.js'
 
-/** 稳定快照配置（由插件 Config 解析后的默认值填充） */
-export interface SnapshotConfig {
-  enableSnapshot: boolean
-  /** 快照缓存窗口（ms；窗口内字节不变） */
-  snapshotTtlMs: number
-  /** 快照预算上限（字符） */
-  snapshotBudgetChars: number
-  /** 快照 Top-K 候选上限（预算之外的保险） */
-  snapshotTopK: number
-}
+/**
+ * 快照行为参数（配置常量化）：快照保证在 SNAPSHOT_TTL_MS 窗口内字节不变，
+ * 是缓存感知注入的核心不变量——字节稳定则相邻请求共享同一前缀缓存单元。
+ * 导出供测试以真实常量驱动行为验证。
+ */
+/** 快照缓存窗口（ms；窗口内字节不变，到期即重建） */
+export const SNAPSHOT_TTL_MS = 300_000
+/** 快照预算上限（字符；超限条目跳过并继续后续） */
+export const SNAPSHOT_BUDGET_CHARS = 8192
+/** 快照 Top-K 候选上限（预算之外的保险） */
+export const SNAPSHOT_TOP_K = 30
 
-/** 快照服务依赖（store/now 可注入，便于单测） */
+/** 快照服务依赖（store/now 可注入，便于单测；行为参数已常量化） */
 export interface SnapshotDeps {
   store: MemoryStore
-  config: SnapshotConfig
   now: () => number
 }
 
@@ -63,19 +63,15 @@ export const SNAPSHOT_CONTEXT_ORDER = 130
 export class MemoryStableSnapshot {
   /** workspace → 快照缓存（进程内；重启清空，与 store.revision 同生命周期） */
   private readonly cache = new Map<string, CachedSnapshot>()
-  /** 禁用态共享空集（snapshotIds 的显式返回，避免每次新建 Set） */
-  private static readonly EMPTY_IDS: ReadonlySet<string> = new Set()
 
   constructor(private readonly deps: SnapshotDeps) {}
 
   /**
    * 注册 systemPrompt.context 段（provider 形态：每次 assemble 求值）。
    * provider 内只读缓存/重建快照，返回空串当快照为空（空文本不贡献段）。
-   * 禁用（enableSnapshot=false）时不注册——无快照即无缓存收益，属显式配置
-   * 而非静默降级。
+   * 快照恒启用（行为已常量化），始终注册——无快照即无缓存收益点。
    */
   install(ctx: Context): void {
-    if (!this.deps.config.enableSnapshot) return
     ctx.systemPrompt.context({
       name: SNAPSHOT_CONTEXT_NAME,
       order: SNAPSHOT_CONTEXT_ORDER,
@@ -91,11 +87,9 @@ export class MemoryStableSnapshot {
 
   /**
    * 该 workspace 当前快照含有的记忆 id 集合（供 injector 实时注入去重）。
-   * 禁用时返回空集——实时注入路径不受快照影响（与"不注册段"一致：禁用
-   * 是显式配置，不是空快照）。
+   * 快照恒启用，恒返回真实 id 集（供注入器与快照文本去重）。
    */
   snapshotIds(workspace: string): ReadonlySet<string> {
-    if (!this.deps.config.enableSnapshot) return MemoryStableSnapshot.EMPTY_IDS
     return this.snapshotOf(workspace).ids
   }
 
@@ -113,7 +107,7 @@ export class MemoryStableSnapshot {
 
   /** 重建快照：按重要度取数 → 预算渲染 → 记录 id 集合与失效条件 */
   private build(workspace: string, now: number): CachedSnapshot {
-    const candidates = this.deps.store.listByImportance(workspace, this.deps.config.snapshotTopK)
+    const candidates = this.deps.store.listByImportance(workspace, SNAPSHOT_TOP_K)
     const pack = renderBudgetedPack(
       candidates.map((entry) => ({
         id: entry.id,
@@ -122,7 +116,7 @@ export class MemoryStableSnapshot {
         importance: entry.importance,
         sessionId: entry.source.sessionId,
       })),
-      this.deps.config.snapshotBudgetChars,
+      SNAPSHOT_BUDGET_CHARS,
       MEMORY_INJECTION_HEADER,
       (skipped) => `（另有 ${skipped} 条高重要度记忆未入快照，可用 memory_recall 检索）`,
     )
@@ -131,7 +125,7 @@ export class MemoryStableSnapshot {
       text: pack?.text ?? '',
       ids: new Set(rendered),
       revision: this.deps.store.revision,
-      expiresAt: now + this.deps.config.snapshotTtlMs,
+      expiresAt: now + SNAPSHOT_TTL_MS,
     }
   }
 }

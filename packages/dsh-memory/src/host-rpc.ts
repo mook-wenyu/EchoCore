@@ -170,8 +170,8 @@ function parseIdPayload(payload: unknown): IdPayload {
   return { id }
 }
 
-/** Config schema 的 object 字段字典（transform 包装后字段在 inner 上；逐键白名单用） */
-const CONFIG_DICT = (Config as unknown as { inner: { dict: Record<string, { (value: unknown): unknown }> } }).inner.dict
+/** Config schema 的 object 字段字典（z.object 直接暴露 dict；逐键白名单用） */
+const CONFIG_DICT = (Config as unknown as { dict: Record<string, { (value: unknown): unknown }> }).dict
 
 /**
  * setConfig 载荷校验（严格）：

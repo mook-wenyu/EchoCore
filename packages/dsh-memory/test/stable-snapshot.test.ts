@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
-import { MemoryStableSnapshot, SNAPSHOT_CONTEXT_NAME, SNAPSHOT_CONTEXT_ORDER, type SnapshotConfig } from '../src/stable-snapshot.js'
+import { MemoryStableSnapshot, SNAPSHOT_BUDGET_CHARS, SNAPSHOT_CONTEXT_NAME, SNAPSHOT_CONTEXT_ORDER, SNAPSHOT_TTL_MS } from '../src/stable-snapshot.js'
 import { MemoryStore } from '../src/store.js'
 import { FakeCtx, FakeTable } from './helpers.js'
 
@@ -26,20 +26,13 @@ function fixedNow(): { now: () => number; advance: (ms: number) => void } {
   }
 }
 
-/** 组装被测对象 */
-function setup(config: Partial<SnapshotConfig> = {}) {
+/** 组装被测对象（快照行为已常量化：TTL/预算/TopK 均为模块内固定值） */
+function setup() {
   const ctx = new FakeCtx()
   const table = new FakeTable()
   const store = new MemoryStore(table)
   const clock = fixedNow()
-  const full: SnapshotConfig = {
-    enableSnapshot: true,
-    snapshotTtlMs: 300_000,
-    snapshotBudgetChars: 8192,
-    snapshotTopK: 30,
-    ...config,
-  }
-  const snapshot = new MemoryStableSnapshot({ store, config: full, now: clock.now })
+  const snapshot = new MemoryStableSnapshot({ store, now: clock.now })
   return { ctx, store, snapshot, clock }
 }
 
@@ -71,17 +64,11 @@ function textOf(snapshot: MemoryStableSnapshot, cwd: string | undefined): string
 }
 
 describe('MemoryStableSnapshot 注册', () => {
-  it('启用时注册 memory:snapshot 段（排序 130，位于策略段之后）', () => {
+  it('始终注册 memory:snapshot 段（排序 130，位于策略段之后）', () => {
     const { ctx, snapshot } = setup()
     snapshot.install(ctx as unknown as Context)
     expect(ctx.systemPromptContexts.has(SNAPSHOT_CONTEXT_NAME)).toBe(true)
     expect((ctx.systemPromptContexts.get(SNAPSHOT_CONTEXT_NAME) as { order: number }).order).toBe(SNAPSHOT_CONTEXT_ORDER)
-  })
-
-  it('禁用时不注册（显式配置，非静默降级）', () => {
-    const { ctx, snapshot } = setup({ enableSnapshot: false })
-    snapshot.install(ctx as unknown as Context)
-    expect(ctx.systemPromptContexts.has(SNAPSHOT_CONTEXT_NAME)).toBe(false)
   })
 
   it('无 agent 上下文时回退默认工作区', async () => {
@@ -117,7 +104,7 @@ describe('快照稳定性（缓存感知核心不变量）', () => {
     const { store, snapshot, clock } = setup()
     await seed(store, { content: '唯一记忆' })
     const before = textOf(snapshot, 'D:/ws-a')
-    clock.advance(300_001)
+    clock.advance(SNAPSHOT_TTL_MS + 1)
     const after = textOf(snapshot, 'D:/ws-a')
     expect(after).toBe(before) // 内容未变，重建后字节相同（幂等）
   })
@@ -137,11 +124,12 @@ describe('快照取数与预算', () => {
   })
 
   it('预算截断：超限条目不入快照，且被截断条目的 id 不进 ids 集合', async () => {
-    const { store, snapshot } = setup({ snapshotBudgetChars: 400 })
+    const { store, snapshot } = setup()
     const shortId = await seed(store, { content: '短记忆' })
-    const longId = await seed(store, { content: 'x'.repeat(500) })
+    // 内容远超 SNAPSHOT_BUDGET_CHARS（8192）→ 单条即超预算，被跳过
+    const longId = await seed(store, { content: 'x'.repeat(SNAPSHOT_BUDGET_CHARS + 1000) })
     const ids = snapshot.snapshotIds('D:/ws-a')
-    // 同 importance（7）按创建倒序：长记忆在前；预算 400 放不下 500 字 → 只渲染短记忆
+    // 同 importance（7）按创建倒序：长记忆在前；预算放不下超长单条 → 只渲染短记忆
     expect(ids.has(shortId)).toBe(true)
     expect(ids.has(longId)).toBe(false)
     const text = textOf(snapshot, 'D:/ws-a')

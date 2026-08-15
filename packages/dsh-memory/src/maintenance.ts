@@ -56,19 +56,16 @@ const MAX_STALE_IMPORTANCE = 3
 /** 一天毫秒数 */
 const MS_PER_DAY = 86_400_000
 
-/** 后台整理任务配置（由插件 Config 解析后的默认值填充） */
-export interface MaintenanceConfig {
-  /** 后台记忆整理任务开关 */
-  enableMaintenance: boolean
-  /** 整理间隔（小时；仅在进程有活跃会话事件后计时） */
-  maintenanceIntervalHours: number
-}
+/**
+ * 后台整理间隔（ms；6 小时，与既有的 config 默认 maintenanceIntervalHours=6
+ * 一致，现固定为模块内常量；导出供测试以真实常量驱动定时验证）。
+ */
+export const MAINTENANCE_INTERVAL_MS = 6 * 3_600_000
 
-/** 整理任务依赖（store/logger/config/now 注入，便于单测；无 llm——任务纯规则） */
+/** 整理任务依赖（store/logger/now 注入，便于单测；无 llm——任务纯规则） */
 export interface MemoryMaintenanceDeps {
   store: MemoryStore
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
-  config: MaintenanceConfig
   /** 当前时刻（毫秒）；测试注入固定时钟 */
   now: () => number
 }
@@ -91,21 +88,15 @@ export class MemoryMaintenance {
 
   constructor(private readonly deps: MemoryMaintenanceDeps) {}
 
-  /** 开关（config 默认 enableMaintenance: true） */
-  private get enabled(): boolean {
-    return this.deps.config.enableMaintenance
-  }
-
   /**
    * 注册活动监听与生命周期清理。
    * - 监听 agent/pre-step 与 session/event 作为活动门（纯观察者）；
    * - agent/pre-step 为 waterfall：本类不消费也不改变决定，仅记录活动后
    *   透传 next() 的结果，保证与注入器等其它监听互不干扰；
    * - ctx.effect 注册的 disposer 随插件 fiber 停止轮询、解除活动态。
-   * enableMaintenance=false 时完全不接线（无监听、无定时）。
+   * 整理恒启用（行为已常量化），始终接线监听与定时。
    */
   install(ctx: Context): void {
-    if (!this.enabled) return
     ctx.on('agent/pre-step', async (payload, next) => {
       this.markActivity(payload.agent.session)
       return next() // 透传决定：纯观察者不参与流水线决策
@@ -125,7 +116,6 @@ export class MemoryMaintenance {
 
   /** 活动门：记录最近会话；首次活动时启动定时链 */
   private markActivity(session: Session): void {
-    if (!this.enabled) return
     this.recent = { session }
     if (!this.armed) {
       this.armed = true
@@ -133,11 +123,10 @@ export class MemoryMaintenance {
     }
   }
 
-  /** 调度下一周期（setTimeout 链；清除旧挂起句柄防重入）。R2-10/M2：间隔最小 1 由 config schema 保证，此处不夹逼 */
+  /** 调度下一周期（setTimeout 链；清除旧挂起句柄防重入）。R2-10/M2：间隔固定 6 小时，此处不夹逼 */
   private schedule(): void {
     this.clearTimer()
-    const intervalMs = this.deps.config.maintenanceIntervalHours * 3_600_000
-    this.timer = setTimeout(() => this.onInterval(), intervalMs)
+    this.timer = setTimeout(() => this.onInterval(), MAINTENANCE_INTERVAL_MS)
   }
 
   /** 定时触发：清理句柄引用，异步执行批次（尽力不阻塞事件循环） */
@@ -169,7 +158,6 @@ export class MemoryMaintenance {
    * 后台异步任务绝不让 rejection 逃离（工程必需）。
    */
   async runOnce(): Promise<void> {
-    if (!this.enabled) return
     try {
       const session = this.recent?.session
       if (session === undefined) return // 活动门：进程内尚未出现会话活动

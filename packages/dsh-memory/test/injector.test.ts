@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { MemoryInjector, renderPack, textOfBatch, type InjectorConfig } from '../src/injector.js'
+import { MemoryInjector, renderPack, textOfBatch } from '../src/injector.js'
 import { MemoryStableSnapshot } from '../src/stable-snapshot.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
@@ -61,33 +61,35 @@ async function seed(store: MemoryStore, input: Partial<NewMemoryInput> = {}): Pr
   return result.entry
 }
 
-/** 组装被测对象（R3-1：统一 FakeCtx，监听器经 listener() 取用）。
- * 快照默认禁用：既有用例验证的是实时注入本身（高重要度 seed 会进快照
- * 而被 P2 排除）；快照去重用例（P2 describe）显式启用并可按需收紧 topK
- * 以精确控制快照成员（候选少时低重要度也会进快照，topK 是唯一杠杆）。 */
-function setup(config: Partial<InjectorConfig> = {}, snapshotEnabled = false, snapshotTopK = 30) {
+/**
+ * 长尾记忆构造：内容超出稳定快照预算（SNAPSHOT_BUDGET_CHARS=8192 字符）。
+ *
+ * 快照已常量化（始终启用）后，稳定快照恒含当前 workspace 的 Top-30 高重要度
+ * 短记忆（fetch 预算内）。因此"可实时注入"的记忆只能是快照没收录的长尾——
+ * 注入器 P2 去重的真实语义：快照管稳定 Top 记忆，实时注入补查询相关的长尾。
+ * 测试以"内容超预算 → 快照 renderBudgetedPack 跳过 → id 不进快照集"来精确
+ * 制造长尾记忆，从而使它能被实时注入（对齐 stable-snapshot.test.ts 的
+ * `'x'.repeat(SNAPSHOT_BUDGET_CHARS + 1000)` 取"不在快照"的同一手法）。
+ */
+function longContent(padding: string, overheadChars = 8230): string {
+  return `${padding} ${'x'.repeat(Math.max(0, overheadChars - padding.length))}`
+}
+
+/**
+ * 组装被测对象（R3-1：统一 FakeCtx，监听器经 listener() 取用）。
+ * 配置常量化后：注入参数（TOP_K / MIN_SCORE / INJECT_BUDGET_CHARS）与快照
+ * 行为（SNAPSHOT_TOP_K=30 / SNAPSHOT_BUDGET_CHARS=8192 / SNAPSHOT_TTL_MS）
+ * 均已固化为模块常量，不再经 config 注入——构造只传 store/snapshot/logger。
+ * 快照恒启用；"可被实时注入"的记忆须为快照未收录的长尾（见 longContent）。
+ */
+function setup() {
   const ctx = new FakeCtx()
   const table = new FakeTable()
   const store = new MemoryStore(table)
   const logger = { warn: () => {}, info: () => {} }
-  // P2：快照服务（默认启用；测试可关以验证"禁用不影响实时注入"）
-  const snapshot = new MemoryStableSnapshot({
-    store,
-    config: { enableSnapshot: snapshotEnabled, snapshotTtlMs: 300_000, snapshotBudgetChars: 8192, snapshotTopK },
-    now: () => 1_000_000,
-  })
-  const injector = new MemoryInjector({
-    store,
-    snapshot,
-    logger,
-    config: {
-      enableAutoInject: true,
-      topK: 8,
-      minScore: 0.1,
-      injectBudgetChars: 4096,
-      ...config,
-    },
-  })
+  // P2：稳定快照（恒启用，行为参数已常量化为 SNAPSHOT_* 常量）
+  const snapshot = new MemoryStableSnapshot({ store, now: () => 1_000_000 })
+  const injector = new MemoryInjector({ store, snapshot, logger })
   injector.install(ctx as unknown as Context)
   const preStep = ctx.listener('agent/pre-step') as
     | ((payload: unknown, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>)
@@ -101,7 +103,7 @@ function setup(config: Partial<InjectorConfig> = {}, snapshotEnabled = false, sn
 describe('MemoryInjector pre-step 注入', () => {
   it('命中记忆时追加注入消息并保留下游消息', async () => {
     const { preStep, store } = setup()
-    await seed(store)
+    await seed(store, { content: longContent('pnpm workspace 项目规则') })
     const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么管理'), async () => enterDecision())
     expect(decision.kind).toBe('enter')
     if (decision.kind !== 'enter') return
@@ -119,7 +121,7 @@ describe('MemoryInjector pre-step 注入', () => {
   // 与用户指令消息分离，绝不与指令同块（Injection-Execution Dissociation 防线）
   it('注入消息与用户指令分离（独立 recall 消息，不混入指令块）', async () => {
     const { preStep, store } = setup()
-    await seed(store)
+    await seed(store, { content: longContent('pnpm workspace 项目规则') })
     const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么管理'), async () => enterDecision())
     expect(decision.kind).toBe('enter')
     if (decision.kind !== 'enter') return
@@ -170,18 +172,9 @@ describe('MemoryInjector pre-step 注入', () => {
     expect(decision.messages).toHaveLength(1)
   })
 
-  it('enableAutoInject=false 时完全静默', async () => {
-    const { preStep, store } = setup({ enableAutoInject: false })
-    await seed(store)
-    const decision = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
-    // 无条件断言：开关关闭 → 原样透传 enter（注入发生则消息变 2，断言失败）
-    expect(decision.kind).toBe('enter')
-    expect(decision.messages).toHaveLength(1)
-  })
-
   it('同一记忆已注入且仍在表层时不重复注入', async () => {
     const { preStep, sessionEvents, store } = setup()
-    const entry = await seed(store)
+    const entry = await seed(store, { content: longContent('pnpm workspace 项目规则') })
     const decision = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
     if (decision.kind !== 'enter') return
     expect(decision.messages).toHaveLength(2)
@@ -201,7 +194,7 @@ describe('MemoryInjector pre-step 注入', () => {
 
   it('注入消息被压缩遮蔽后允许重新注入', async () => {
     const { preStep, sessionEvents, store } = setup()
-    await seed(store)
+    await seed(store, { content: longContent('pnpm workspace 项目规则') })
     const first = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
     if (first.kind !== 'enter') return
     const session = makeSession('s1')
@@ -301,7 +294,7 @@ describe('textOfBatch 查询清洗（M8）', () => {
 describe('MemoryInjector 会话生命周期清理（O2-4）', () => {
   it('disposed 清理 injectedSeqs：结束后记忆重新可注入', async () => {
     const { preStep, sessionEvents, disposed, store } = setup()
-    const entry = await seed(store)
+    const entry = await seed(store, { content: longContent('pnpm workspace 项目规则') })
     const session = makeSession('s1')
     // 第一次注入并回填序号
     const first = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
@@ -323,7 +316,7 @@ describe('MemoryInjector 会话生命周期清理（O2-4）', () => {
 
   it('disposed 清理 pendingIds：后续注入序号不再回填旧批次', async () => {
     const { preStep, sessionEvents, disposed, store } = setup()
-    await seed(store)
+    await seed(store, { content: longContent('pnpm workspace 项目规则') })
     const session = makeSession('s1')
     const first = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
     if (first.kind !== 'enter') throw new Error('应注入')
@@ -338,7 +331,8 @@ describe('MemoryInjector 会话生命周期清理（O2-4）', () => {
   })
 })
 
-// P2（OPTIMIZATION_PLAN_3）：实时注入排除稳定快照已含的记忆（混合形态去重）
+// P2（OPTIMIZATION_PLAN_3）：实时注入排除稳定快照已含的记忆（混合形态去重）。
+// 快照已常量化（恒启用，Top-K=30 / 预算 8192），实时注入只补快照未收录的长尾。
 describe('MemoryInjector 快照去重（P2）', () => {
   /** 从注入消息提取文本 */
   function injectedText(decision: PreStepDecision): string {
@@ -348,36 +342,30 @@ describe('MemoryInjector 快照去重（P2）', () => {
     return text
   }
 
-  it('快照已含的高重要度记忆不进实时包，未含的低重要度记忆正常注入', async () => {
-    const { preStep, store } = setup({}, true, 1)
-    // 快照 topK=1 → 只含高重要度（9）；低重要度（3）不在快照 → 实时注入只注入后者
+  it('快照已含的短高重要度记忆不进实时包，未收录的长尾记忆正常注入', async () => {
+    const { preStep, store } = setup()
+    // 短记忆（进预算）高重要度 → 被稳定快照收录 → P2 排除
     await seed(store, { content: 'pnpm workspace 高重要规则', importance: 9 })
-    await seed(store, { content: 'pnpm workspace 一次性备注', importance: 3 })
+    // 超预算长尾记忆（内容 > SNAPSHOT_BUDGET_CHARS）→ 快照跳过 → 可实时注入
+    await seed(store, { content: longContent('pnpm workspace 一次性备注'), importance: 3 })
     const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
     const text = injectedText(decision)
     expect(text).toContain('一次性备注')
     expect(text).not.toContain('高重要规则')
   })
 
-  it('快照禁用时实时注入不受影响（显式配置语义）', async () => {
-    const { preStep, store } = setup({}, false)
-    await seed(store, { content: 'pnpm workspace 规则', importance: 9 })
-    const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
-    const text = injectedText(decision)
-    expect(text).toContain('pnpm workspace 规则')
-  })
-
   it('快照重建（revision 变更）后排除集合更新：离开快照的记忆恢复可注入', async () => {
-    const { preStep, store } = setup({}, true, 1)
-    await seed(store, { content: 'pnpm workspace 旧备注', importance: 5 })
-    // 快照 topK=1：旧备注是唯一候选 → 在快照 → 实时注入排除它
-    const first = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
+    const { preStep, store } = setup()
+    // 候选短记忆最初是仅有的记忆 → 在快照 Top-30 → 实时注入排除它
+    await seed(store, { content: 'pnpm workspace 旧备注', importance: 6 })
+    const first = await preStep(makePayload('s1', 'pnpm workspace 旧备注怎么用'), async () => enterDecision())
     expect(injectedText(first)).not.toContain('旧备注')
-    // 写入更高重要度 → revision 变更 → 快照重建：topK=1 换成权威规则，旧备注离开快照
-    await seed(store, { content: 'pnpm workspace 权威规则', importance: 9 })
-    const second = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
+    // 写入 30 条更高重要度填充 → revision 变更 → 快照重建：候选被挤出 Top-30 → 离开快照
+    for (let i = 0; i < 30; i++) {
+      await seed(store, { content: `快照填充 ${i}`, importance: 10 })
+    }
+    const second = await preStep(makePayload('s1', 'pnpm workspace 旧备注怎么用'), async () => enterDecision())
     expect(injectedText(second)).toContain('旧备注')
-    expect(injectedText(second)).not.toContain('权威规则')
   })
 })
 

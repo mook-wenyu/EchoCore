@@ -50,26 +50,12 @@ export interface MemoryStatsView {
 }
 
 /**
- * 配置视图（与宿主 configView 对齐）：当前生效配置全部字段 +
+ * 配置视图（与宿主 configView 对齐）：当前生效配置字段 +
  * embeddingApiKeyResolved（apiKey 解析状态——字面 key 或 env:NAME 环境变量
  * 引用是否可用；面板展示用，不泄露解析后的 key 值）。
+ * 配置面最小化（用户拍板）：仅远程嵌入 4 项，其余行为参数已固化为代码常量。
  */
 export interface MemoryPanelConfigView {
-  injectBudgetChars: number
-  topK: number
-  minScore: number
-  minExtractChars: number
-  maxExtractChars: number
-  extractMaxTokens: number
-  enableAutoInject: boolean
-  enableSnapshot: boolean
-  snapshotTtlMs: number
-  snapshotBudgetChars: number
-  snapshotTopK: number
-  enableExtractor: boolean
-  enableMaintenance: boolean
-  maintenanceIntervalHours: number
-  embeddingModelDir: string
   embeddingApiBaseUrl: string
   embeddingApiKey: string
   embeddingModel: string
@@ -296,23 +282,8 @@ interface ConfigFieldDef {
   hint?: string
 }
 
-/** 面板可编辑字段清单（全部配置项——用户拍板；apiKey 支持字面 key 或 env:NAME） */
+/** 面板可编辑字段清单（配置面最小化——仅远程嵌入 4 项，用户拍板；apiKey 支持字面 key 或 env:NAME） */
 const CONFIG_FIELDS: ConfigFieldDef[] = [
-  { key: 'injectBudgetChars', label: '注入预算（字符）', type: 'number' },
-  { key: 'topK', label: '自动注入 Top-K', type: 'number' },
-  { key: 'minScore', label: '注入最低综合分（0..1）', type: 'number' },
-  { key: 'enableAutoInject', label: '自动注入开关', type: 'boolean' },
-  { key: 'enableSnapshot', label: '稳定快照开关', type: 'boolean' },
-  { key: 'snapshotTtlMs', label: '快照缓存窗口（ms）', type: 'number' },
-  { key: 'snapshotBudgetChars', label: '快照预算（字符）', type: 'number' },
-  { key: 'snapshotTopK', label: '快照 Top-K 候选', type: 'number' },
-  { key: 'enableExtractor', label: '提取器开关', type: 'boolean' },
-  { key: 'minExtractChars', label: '提取触发阈值（字符）', type: 'number' },
-  { key: 'maxExtractChars', label: '提取摘录上限（字符）', type: 'number' },
-  { key: 'extractMaxTokens', label: '提取输出上限（token）', type: 'number' },
-  { key: 'enableMaintenance', label: '后台整理开关', type: 'boolean' },
-  { key: 'maintenanceIntervalHours', label: '整理间隔（小时）', type: 'number' },
-  { key: 'embeddingModelDir', label: '本地模型目录', type: 'string' },
   { key: 'embeddingApiBaseUrl', label: '远程 API Base URL', type: 'string' },
   {
     key: 'embeddingApiKey',

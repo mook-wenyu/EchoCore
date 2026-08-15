@@ -182,31 +182,35 @@ describe('memory RPC 载荷校验', () => {
 })
 
 describe('memory RPC 配置端点（面板配置）', () => {
-  it('getConfig：返回当前生效配置全部字段与 apiKey 解析状态', async () => {
+  it('getConfig：返回当前生效配置字段与 apiKey 解析状态', async () => {
     const { handler } = setup()
     const result = await handler('getConfig', null)
     expect(result.ok).toBe(true)
     if (!result.ok) return
     const value = result.value as { config: Record<string, unknown> }
-    expect(value.config.injectBudgetChars).toBe(DEFAULTS.injectBudgetChars)
-    expect(value.config.topK).toBe(DEFAULTS.topK)
-    expect(value.config.enableMaintenance).toBe(DEFAULTS.enableMaintenance)
+    expect(value.config.embeddingApiBaseUrl).toBe('')
+    expect(value.config.embeddingApiKey).toBe('')
+    expect(value.config.embeddingModel).toBe('')
+    expect(value.config.embeddingDimension).toBe(DEFAULTS.embeddingDimension)
+    // 配置面最小化防回归：行为参数/开关/本地目录均已删除
     expect('embeddingEnabled' in value.config).toBe(false)
+    expect('topK' in value.config).toBe(false)
+    expect('embeddingModelDir' in value.config).toBe(false)
   })
 
   it('setConfig：合法载荷合并到当前配置并调用 fiber.update（noSave=false 写回）', async () => {
     const { handler, updates } = setup()
-    const result = await handler('setConfig', { topK: 12, minScore: 0.3 })
+    const result = await handler('setConfig', { embeddingModel: 'BAAI/bge-m3', embeddingDimension: 512 })
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(updates).toHaveLength(1)
     // fiber.update 收到合并后完整配置（未传字段保留当前值）
-    expect(updates[0]?.topK).toBe(12)
-    expect(updates[0]?.minScore).toBe(0.3)
-    expect(updates[0]?.injectBudgetChars).toBe(DEFAULTS.injectBudgetChars)
+    expect(updates[0]?.embeddingModel).toBe('BAAI/bge-m3')
+    expect(updates[0]?.embeddingDimension).toBe(512)
+    expect(updates[0]?.embeddingApiBaseUrl).toBe(DEFAULTS.embeddingApiBaseUrl)
     // 响应返回更新后配置
     const value = result.value as { config: Record<string, unknown> }
-    expect(value.config.topK).toBe(12)
+    expect(value.config.embeddingModel).toBe('BAAI/bge-m3')
   })
 
   it('setConfig：未知键拒绝（internal）', async () => {
@@ -218,25 +222,26 @@ describe('memory RPC 配置端点（面板配置）', () => {
     expect(updates).toHaveLength(0)
   })
 
+  it('setConfig：已删除的旧配置键拒绝（配置面最小化后不再是合法键）', async () => {
+    const { handler, updates } = setup()
+    const result = await handler('setConfig', { topK: 12 })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.message).toContain('未知配置键')
+    expect(updates).toHaveLength(0)
+  })
+
   it('setConfig：类型错误拒绝（internal）', async () => {
     const { handler, updates } = setup()
-    const result = await handler('setConfig', { minScore: '不是数字' })
+    const result = await handler('setConfig', { embeddingDimension: '不是数字' })
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(updates).toHaveLength(0)
   })
 
-  it('setConfig：数值越界拒绝（minScore > 1）', async () => {
+  it('setConfig：数值越界拒绝（embeddingDimension 0）', async () => {
     const { handler, updates } = setup()
-    const result = await handler('setConfig', { minScore: 1.5 })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(updates).toHaveLength(0)
-  })
-
-  it('setConfig：跨字段互斥拒绝（minExtractChars > maxExtractChars）', async () => {
-    const { handler, updates } = setup()
-    const result = await handler('setConfig', { minExtractChars: 13000, maxExtractChars: 12000 })
+    const result = await handler('setConfig', { embeddingDimension: 0 })
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(updates).toHaveLength(0)

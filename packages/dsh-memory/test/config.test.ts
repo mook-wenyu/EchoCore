@@ -1,8 +1,8 @@
 /**
  * @module @echocore/dsh-memory/config.test
  *
- * 配置 schema 测试：默认值落位（含历史防回归：16384 预算、400K 键不在 schema）、
- * 枚举/数值校验拒绝非法输入。此前 config.ts 完全无测试。
+ * 配置 schema 测试：默认值落位（配置面最小化后仅远程嵌入 4 项）、
+ * 数值/类型校验拒绝非法输入。
  */
 
 import { describe, expect, it } from 'vitest'
@@ -17,67 +17,46 @@ function parseConfig(raw: Record<string, unknown>): unknown {
 }
 
 describe('Config 默认值', () => {
-  it('空配置填充全部 DEFAULTS（含 16384 预算与新增键）', () => {
+  it('空配置填充远程嵌入 4 项 DEFAULTS（其余行为参数已删除为常量）', () => {
     const config = parseConfig({}) as typeof DEFAULTS
-    expect(config.injectBudgetChars).toBe(16384)
-    expect(config.topK).toBe(8)
-    expect(config.minScore).toBe(0.15)
-    expect(config.minExtractChars).toBe(2000)
-    expect(config.maxExtractChars).toBe(12000)
-    expect(config.extractMaxTokens).toBe(2048)
-    expect(config.enableAutoInject).toBe(true)
-    expect(config.enableExtractor).toBe(true)
-    expect(config.enableMaintenance).toBe(true)
-    expect(config.maintenanceIntervalHours).toBe(6)
-    // 嵌入默认（删除 embeddingEnabled；embeddingApiKey 恢复——字面 key 或 env:NAME）
-    expect('embeddingEnabled' in config).toBe(false)
-    expect(config.embeddingApiKey).toBe('')
     expect(config.embeddingApiBaseUrl).toBe('')
+    expect(config.embeddingApiKey).toBe('')
     expect(config.embeddingModel).toBe('')
     expect(config.embeddingDimension).toBe(1024)
-    expect(config.embeddingModelDir).toBe('')
-  })
-
-  it('防回归：schema 默认值与 DEFAULTS 单源一致（字段存于 dict，default 存于 meta.default——已查证 schemastery）', () => {
-    // P1-1 后 Config 是 transform 包装（跨字段互斥校验），object 字段在 inner 上
-    const dict = ((Config as unknown as { inner: { dict: Record<string, { meta?: { default?: unknown } }> } }).inner).dict
-    expect(dict.injectBudgetChars?.meta?.default).toBe(DEFAULTS.injectBudgetChars)
-    expect(dict.maxExtractChars?.meta?.default).toBe(DEFAULTS.maxExtractChars)
-    expect(dict.enableMaintenance?.meta?.default).toBe(DEFAULTS.enableMaintenance)
-  })
-
-  it('防回归：400K 压缩阈值键已从 schema 移除（迁移到宿主 compaction-basic）', () => {
-    // schemastery validate 保留未知键（不剥离），故断言 schema 对象本身不含该键
-    const inner = (Config as unknown as { inner: Record<string, unknown> }).inner
-    expect('compactThresholdTokens' in inner).toBe(false)
+    // 已删除键（配置面最小化防回归：行为参数/开关/本地目录均不在 schema）
+    for (const removed of [
+      'embeddingEnabled',
+      'embeddingModelDir',
+      'topK',
+      'minScore',
+      'injectBudgetChars',
+      'enableAutoInject',
+      'enableSnapshot',
+      'snapshotTtlMs',
+      'snapshotBudgetChars',
+      'snapshotTopK',
+      'enableExtractor',
+      'minExtractChars',
+      'maxExtractChars',
+      'extractMaxTokens',
+      'enableMaintenance',
+      'maintenanceIntervalHours',
+    ]) {
+      expect(removed in config, `${removed} 应已从配置删除`).toBe(false)
+    }
   })
 
   it('显式配置覆盖默认值', () => {
-    const config = parseConfig({ injectBudgetChars: 8192, enableExtractor: false }) as typeof DEFAULTS
-    expect(config.injectBudgetChars).toBe(8192)
-    expect(config.enableExtractor).toBe(false)
+    const config = parseConfig({ embeddingApiBaseUrl: 'https://api.example.com/v1', embeddingDimension: 512 }) as typeof DEFAULTS
+    expect(config.embeddingApiBaseUrl).toBe('https://api.example.com/v1')
+    expect(config.embeddingDimension).toBe(512)
   })
 
   it('非法类型被拒绝（数字字段传字符串）', () => {
-    expect(() => parseConfig({ topK: 'many' } as unknown as Record<string, unknown>)).toThrow()
+    expect(() => parseConfig({ embeddingDimension: 'many' } as unknown as Record<string, unknown>)).toThrow()
   })
 
-  it('数值越界被拒绝（P1-1：minScore 0..1）', () => {
-    expect(() => parseConfig({ minScore: -0.1 })).toThrow()
-    expect(() => parseConfig({ minScore: 1.1 })).toThrow()
-  })
-
-  it('非正数值被拒绝（P1-1：topK/预算/提取上限 ≥1）', () => {
-    expect(() => parseConfig({ topK: 0 })).toThrow()
-    expect(() => parseConfig({ injectBudgetChars: 0 })).toThrow()
-    expect(() => parseConfig({ minExtractChars: 0 })).toThrow()
-    expect(() => parseConfig({ maxExtractChars: 0 })).toThrow()
-    expect(() => parseConfig({ extractMaxTokens: 0 })).toThrow()
-  })
-
-  it('跨字段互斥被拒绝（P1-1：minExtractChars > maxExtractChars 会致早期消息永久丢失）', () => {
-    expect(() => parseConfig({ minExtractChars: 13000, maxExtractChars: 12000 })).toThrow()
-    // 边界合法：相等时语义为"全量摘录"
-    expect(() => parseConfig({ minExtractChars: 12000, maxExtractChars: 12000 })).not.toThrow()
+  it('非正数值被拒绝（embeddingDimension ≥1）', () => {
+    expect(() => parseConfig({ embeddingDimension: 0 })).toThrow()
   })
 })

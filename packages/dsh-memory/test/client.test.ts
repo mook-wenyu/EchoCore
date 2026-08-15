@@ -88,20 +88,20 @@ describe('createMemoryApi 端点载荷', () => {
   })
 
   it('getConfig：端点 getConfig、空 payload，返回配置视图', async () => {
-    const { api, recorded } = fakeCtx([ok({ config: { topK: 8, embeddingApiKeyResolved: false } })])
+    const { api, recorded } = fakeCtx([ok({ config: { embeddingModel: '', embeddingApiKeyResolved: false } })])
     const config = await api.getConfig()
     expect(recorded).toEqual([{ channel: '/memory', endpoint: 'getConfig', payload: {} }])
-    expect(config.topK).toBe(8)
+    expect(config.embeddingModel).toBe('')
     expect(config.embeddingApiKeyResolved).toBe(false)
   })
 
   it('setConfig：端点 setConfig、payload 为变更项 partial，返回更新后配置', async () => {
-    const { api, recorded } = fakeCtx([ok({ config: { topK: 12, minScore: 0.3 } })])
-    const config = await api.setConfig({ topK: 12, minScore: 0.3 })
+    const { api, recorded } = fakeCtx([ok({ config: { embeddingModel: 'BAAI/bge-m3', embeddingDimension: 512 } })])
+    const config = await api.setConfig({ embeddingModel: 'BAAI/bge-m3', embeddingDimension: 512 })
     expect(recorded).toEqual([
-      { channel: '/memory', endpoint: 'setConfig', payload: { topK: 12, minScore: 0.3 } },
+      { channel: '/memory', endpoint: 'setConfig', payload: { embeddingModel: 'BAAI/bge-m3', embeddingDimension: 512 } },
     ])
-    expect(config.topK).toBe(12)
+    expect(config.embeddingModel).toBe('BAAI/bge-m3')
   })
 })
 

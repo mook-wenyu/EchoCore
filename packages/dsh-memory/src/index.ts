@@ -18,10 +18,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import { Config, DEFAULTS, type Config as ConfigType, type ResolvedConfig } from './config.js'
 import { EmbeddingIndex } from './embed-index.js'
 import { EmbeddingService, EmbeddingUnavailableError, resolveApiKey } from './embedding.js'
-import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
+import { MemoryExtractor } from './extractor.js'
 import { registerMemoryRpc } from './host-rpc.js'
-import { MemoryInjector, type InjectorConfig } from './injector.js'
-import { MemoryMaintenance, type MaintenanceConfig } from './maintenance.js'
+import { MemoryInjector } from './injector.js'
+import { MemoryMaintenance } from './maintenance.js'
 import { MEMORY_TABLE, memoryDomainSpec } from './memory-domain.js'
 import { registerSnapshot } from './snapshot.js'
 import { MemoryStableSnapshot } from './stable-snapshot.js'
@@ -87,9 +87,11 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
   // 语义嵌入（默认启用：远程配置齐 → 远程优先；否则本地模型检测 → 本地；
   // 都无 → disabled 正常禁用态）。初始化失败（后端存在但加载异常）记录并
   // 保持关键词检索——嵌入是一等状态（EmbeddingService.state），非静默兜底。
+  // 本地模型目录固定全局默认（用户拍板：模型是共享资产，目录不配置——
+  // ~/.dsh/storages/embedding-model）。
   let embeddingService: EmbeddingService | undefined
   let embedIndex: EmbeddingIndex | undefined
-  const modelDir = config.embeddingModelDir !== '' ? config.embeddingModelDir : defaultEmbeddingModelDir()
+  const modelDir = defaultEmbeddingModelDir()
   // 远程配置齐判定：baseUrl/model/apiKey 非空（apiKey 经 resolveApiKey 解析——
   // 字面 key 或 env:NAME 环境变量引用；解析为空视为未配置）
   const remoteConfigured =
@@ -133,34 +135,16 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
   }
 
   // 提取器：双通道（压缩遮蔽 + 轮次增量），纯观察不阻塞主循环
-  // R2-4（B4）：schemastery 加载即填充默认值，?? 是死分支——直接读 config 字段
-  const extractorConfig: ExtractorConfig = {
-    enableExtractor: config.enableExtractor,
-    minExtractChars: config.minExtractChars,
-    maxExtractChars: config.maxExtractChars,
-    extractMaxTokens: config.extractMaxTokens,
-  }
-  new MemoryExtractor({ store, llm: ctx.llm, logger, config: extractorConfig }).install(ctx)
+  // （参数已常量化——用户拍板配置面最小化；提取恒启用）
+  new MemoryExtractor({ store, llm: ctx.llm, logger }).install(ctx)
 
-  // 注入器：pre-step 自动注入相关记忆（带预算、去重与溯源标记）
-  const injectorConfig: InjectorConfig = {
-    enableAutoInject: config.enableAutoInject,
-    topK: config.topK,
-    minScore: config.minScore,
-    injectBudgetChars: config.injectBudgetChars,
-  }
+  // 注入器：pre-step 自动注入相关记忆（带预算、去重与溯源标记；参数已常量化，恒启用）
   const snapshotService = new MemoryStableSnapshot({
     store,
-    config: {
-      enableSnapshot: config.enableSnapshot,
-      snapshotTtlMs: config.snapshotTtlMs,
-      snapshotBudgetChars: config.snapshotBudgetChars,
-      snapshotTopK: config.snapshotTopK,
-    },
     now: () => Date.now(),
   })
   snapshotService.install(ctx)
-  new MemoryInjector({ store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger, config: injectorConfig }).install(ctx)
+  new MemoryInjector({ store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger }).install(ctx)
 
   // 模型工具：recall / search / note / forget / audit / status
   registerMemoryTools(ctx, { store, embedding: embeddingService, embedIndex, logger })
@@ -172,12 +156,8 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
   // config 传入供 getConfig/setConfig 端点（setConfig 经 ctx.fiber.update 写回+重启）
   registerMemoryRpc(ctx, store, config)
 
-  // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理；开关与间隔经配置
-  const maintenanceConfig: MaintenanceConfig = {
-    enableMaintenance: config.enableMaintenance,
-    maintenanceIntervalHours: config.maintenanceIntervalHours,
-  }
-  new MemoryMaintenance({ store, logger, config: maintenanceConfig, now: () => Date.now() }).install(ctx)
+  // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）
+  new MemoryMaintenance({ store, logger, now: () => Date.now() }).install(ctx)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }

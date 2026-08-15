@@ -26,20 +26,23 @@ import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS } from './constants.js'
 import { renderEventsText, resolveRoute, runExtraction } from './extract.js'
 import type { MemoryStore } from './store.js'
 
-/** 提取器配置（由插件 Config 解析后的默认值填充） */
-export interface ExtractorConfig {
-  enableExtractor: boolean
-  minExtractChars: number
-  maxExtractChars: number
-  extractMaxTokens: number
-}
+/**
+ * 提取参数常量（12-Factor：内部参数固化，不暴露为配置）。
+ * 用户拍板删除原 enableExtractor/minExtractChars/maxExtractChars/extractMaxTokens
+ * 四项配置，提取行为固定为"恒启用 + 以下默认值"。
+ */
+/** 增量提取触发阈值（字符）：每轮累计的消息文本达到该量才触发一次提取（控制 LLM 调用频率） */
+const MIN_EXTRACT_CHARS = 2000
+/** 摘录长度上限（字符）：超过则截尾保最新（旧内容已在压缩中登记摘要，近期片段信息密度更高） */
+const MAX_EXTRACT_CHARS = 12000
+/** 提取输出 token 上限：限制单次提取调用产出的记忆量，防超长输出 */
+const EXTRACT_MAX_TOKENS = 2048
 
 /** 提取器依赖（llm/store 可注入，便于单测） */
 export interface ExtractorDeps {
   store: MemoryStore
   llm: Pick<LlmRuntime, 'stream'>
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
-  config: ExtractorConfig
 }
 
 /** 待提取批次：跨轮次累计的事件与文本（低于阈值时挂起） */
@@ -131,9 +134,8 @@ export class MemoryExtractor {
     this.chains.delete(sessionId)
   }
 
-  /** 事件入口：只对两类触发事件入队，其余忽略 */
+  /** 事件入口：只对两类触发事件入队，其余忽略（提取恒启用） */
   private onSessionEvent(session: Session, event: SessionEvent): void {
-    if (!this.deps.config.enableExtractor) return
     if (event.type !== 'compaction/summary' && event.type !== 'turn/end') return
     this.enqueue(session, event)
   }
@@ -192,7 +194,7 @@ export class MemoryExtractor {
       ? { events: [...prior.events, ...fresh], text: `${prior.text}\n${freshText}` }
       : { events: fresh, text: freshText }
 
-    if (batch.text.length >= this.deps.config.minExtractChars) {
+    if (batch.text.length >= MIN_EXTRACT_CHARS) {
       await this.extractAndStore(session, batch.events, batch.text)
       this.pending.delete(session.id)
     } else {
@@ -214,10 +216,10 @@ export class MemoryExtractor {
       return
     }
     // 长摘录截尾保最新：两通道（压缩遮蔽 / 轮次增量）共用此闸点，超限才截并告警一次
-    const transcript = truncateKeepLatest(text, this.deps.config.maxExtractChars)
+    const transcript = truncateKeepLatest(text, MAX_EXTRACT_CHARS)
     if (transcript !== text) {
       this.deps.logger.warn(
-        `[dsh-memory] 摘录超 ${this.deps.config.maxExtractChars} 字符，截尾保留最新片段（会话 ${session.id}）`,
+        `[dsh-memory] 摘录超 ${MAX_EXTRACT_CHARS} 字符，截尾保留最新片段（会话 ${session.id}）`,
       )
     }
     // O2-3 决策：不向提取传 signal。
@@ -226,7 +228,7 @@ export class MemoryExtractor {
     // 语义可对应。会话结束后串行链自然终止，disposed flush 的失败也不会再重试，
     // 故无需防御性取消——此处保持不传 signal，避免引入死分支。
     const memories = await runExtraction(
-      { llm: this.deps.llm, provider: route.provider, model: route.model, maxTokens: this.deps.config.extractMaxTokens },
+      { llm: this.deps.llm, provider: route.provider, model: route.model, maxTokens: EXTRACT_MAX_TOKENS },
       transcript,
     )
     const workspace = session.header.cwd ?? DEFAULT_WORKSPACE

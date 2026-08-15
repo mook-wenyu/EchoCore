@@ -10,7 +10,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { MemoryMaintenance, type MaintenanceConfig } from '../src/maintenance.js'
+import { MAINTENANCE_INTERVAL_MS, MemoryMaintenance } from '../src/maintenance.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
@@ -19,8 +19,8 @@ import { FakeCtx, FakeTable } from './helpers.js'
 const NOW = Date.UTC(2025, 0, 15, 0, 0, 0)
 /** 一天毫秒数 */
 const MS_PER_DAY = 86_400_000
-/** 定时器触发所需推进量（config 间隔取 1 小时） */
-const INTERVAL_MS = 3_600_000
+/** 定时器触发所需推进量（整理间隔已常量化：6 小时） */
+const INTERVAL_MS = MAINTENANCE_INTERVAL_MS
 
 /** 构造 request/header 事件（模型路由来源） */
 function headerEvent(seq: number): SessionEvent {
@@ -58,20 +58,14 @@ function makeEntry(overrides: Partial<MemoryEntry> & { id: string }): MemoryEntr
   return { ...base, ...overrides }
 }
 
-/** 配置工厂 */
-function config(overrides: Partial<MaintenanceConfig> = {}): MaintenanceConfig {
-  return { enableMaintenance: true, maintenanceIntervalHours: 1, ...overrides }
-}
-
-/** 组装被测对象：返回 maintenance / ctx / store / 监听器 */
-function setup(overrides: Partial<MaintenanceConfig> = {}) {
+/** 组装被测对象：返回 maintenance / ctx / store / 监听器（整理行为已常量化：恒启用、间隔 6 小时） */
+function setup() {
   const ctx = new FakeCtx()
   const table = new FakeTable()
   const store = new MemoryStore(table, () => NOW)
   const maintenance = new MemoryMaintenance({
     store,
     logger: { warn: () => {}, info: () => {} },
-    config: config(overrides),
     now: () => NOW,
   })
   maintenance.install(ctx as unknown as Context)
@@ -340,19 +334,5 @@ describe('MemoryMaintenance 定时器清理', () => {
     } finally {
       vi.useRealTimers()
     }
-  })
-
-  it('enableMaintenance=false 时完全不接线', async () => {
-    const ctx = new FakeCtx()
-    const store = new MemoryStore(new FakeTable(), () => NOW)
-    const maintenance = new MemoryMaintenance({
-      store,
-      logger: { warn: () => {}, info: () => {} },
-      config: config({ enableMaintenance: false }),
-      now: () => NOW,
-    })
-    maintenance.install(ctx as unknown as Context)
-    expect(ctx.listeners.size).toBe(0) // 未注册任何监听
-    expect(ctx.disposers).toHaveLength(0)
   })
 })

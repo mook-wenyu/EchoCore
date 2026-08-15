@@ -28,13 +28,20 @@ import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
 
-/** 注入器配置（由插件 Config 解析后的默认值填充） */
-export interface InjectorConfig {
-  enableAutoInject: boolean
-  topK: number
-  minScore: number
-  injectBudgetChars: number
-}
+/**
+ * 注入参数常量（12-Factor：内部参数固化，不暴露为配置）。
+ * 用户拍板删除原 enableAutoInject/topK/minScore/injectBudgetChars 四项配置，
+ * 注入行为固定为"全开 + 以下默认值"。
+ */
+/** 注入预算（字符）：≈4K token，与 magic-context 的 injection_budget_tokens:4000 对齐 */
+const INJECT_BUDGET_CHARS = 16384
+/** 每次注入最多召回的相关记忆条数 */
+const TOP_K = 8
+/**
+ * 注入最低综合分（relevance × 时间 × 重要性）。与 store.search 的 minScore
+ * 缺省 fallback（0.15）保持一致，此处显式传入以显式表达注入阈值语义。
+ */
+const MIN_SCORE = 0.15
 
 /** 注入器依赖（store 可注入，便于单测） */
 export interface InjectorDeps {
@@ -46,7 +53,6 @@ export interface InjectorDeps {
   /** P4 嵌入索引（条目向量查找；与 embedding 成对出现） */
   embedIndex?: EmbeddingIndex
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
-  config: InjectorConfig
 }
 
 /** 渲染结果：模型可见文本 + 注入的记忆 id 列表（供回填序号追踪） */
@@ -98,13 +104,12 @@ export class MemoryInjector {
     this.injectedSeqs.delete(agentId)
   }
 
-  /** pre-step waterfall：下游决定为 enter 且批次非空时才注入 */
+  /** pre-step waterfall：下游决定为 enter 且批次非空时才注入（注入恒启用） */
   private async handlePreStep(
     payload: PreStepPayload,
     next: () => Promise<PreStepDecision>,
   ): Promise<PreStepDecision> {
     const decision = await next()
-    if (!this.deps.config.enableAutoInject) return decision
     if (decision.kind !== 'enter' || decision.messages.length === 0) return decision
 
     const query = textOfBatch(payload.messages)
@@ -118,7 +123,7 @@ export class MemoryInjector {
       this.deps.embedding,
       this.deps.embedIndex,
       query,
-      { workspace, limit: this.deps.config.topK, minScore: this.deps.config.minScore },
+      { workspace, limit: TOP_K, minScore: MIN_SCORE },
       (message, error) => this.deps.logger.warn(message, error),
     )) as MemoryEntry[]
     const fresh = candidates.filter(
@@ -131,7 +136,7 @@ export class MemoryInjector {
     )
     if (fresh.length === 0) return decision
 
-    const pack = renderPack(fresh, this.deps.config.injectBudgetChars)
+    const pack = renderPack(fresh, INJECT_BUDGET_CHARS)
     if (pack === undefined) return decision
 
     const message = createUserMessage({
