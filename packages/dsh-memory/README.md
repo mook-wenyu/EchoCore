@@ -126,7 +126,12 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 
 ## 运维：记忆库备份
 
-`memory.json` 是记忆库唯一副本（无备份机制是单点风险）。仓库提供备份脚本：
+记忆库存储为 **SQLite**（`~/.dsh/storages/memory.sqlite`，WAL 模式——结构性解决
+storage-json 整文件原子写的 O(n) 写放大，用户拍板 2026-08-15）。首启自动从旧
+`memory.json` 迁移（逐条校验、坏记录跳过、原文件改名 `.bak` 保留、幂等）。
+
+备份须用 SQLite backup API（WAL 活跃期文件复制会丢未 checkpoint 数据），
+仓库提供脚本：
 
 ```bash
 node packages/dsh-memory/scripts/backup-memory.mjs [备份目录] [保留份数]
