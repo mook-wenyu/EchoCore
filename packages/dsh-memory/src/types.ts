@@ -112,12 +112,18 @@ export interface ExtractedMemory {
   tags?: string[]
 }
 
-/** 记忆统计快照 */
+/** 记忆统计快照（O1 观测闭环：store.stats() 返回基础计数 + 占位，装配层经 runtime 覆盖健康字段） */
 export interface MemoryStats {
   total: number
   active: number
   archived: number
   byKind: Record<MemoryKind, number>
+  /** O1：写链累计失败次数（SqliteKvTable.writeFailures；无自建后端时 0） */
+  writeFailures: number
+  /** O1：嵌入后端状态（disabled/loading/ready/error；未装配 unknown） */
+  embeddingState: string
+  /** O1：上次维护运行时刻（ISO；未运行过 null） */
+  lastMaintenanceAt: string | null
 }
 
 /**

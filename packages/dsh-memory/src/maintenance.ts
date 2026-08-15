@@ -34,7 +34,6 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { resolveRoute } from './extract.js'
-import { tokenize } from './scoring.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
 
@@ -92,6 +91,13 @@ export class MemoryMaintenance {
   private recent: ActiveContext | undefined
   /** 当前挂起的定时句柄（setTimeout 链） */
   private timer: ReturnType<typeof setTimeout> | undefined
+  /** O1：上次 runOnce 完成时刻（ISO；未运行过 null——memory_status 可观测） */
+  private lastRunAtValue: string | null = null
+
+  /** O1：上次维护运行时刻（runOnce 完成时记录；未运行 null） */
+  get lastRunAt(): string | null {
+    return this.lastRunAtValue
+  }
 
   constructor(private readonly deps: MemoryMaintenanceDeps) {}
 
@@ -180,6 +186,8 @@ export class MemoryMaintenance {
       await this.mergeDuplicates(window)
       await this.archiveStale(window)
       await this.normalizeTags(window)
+      // O1：批次完成时刻记录（成功路径；失败由 catch 告警且不更新——可观测"上次成功维护"）
+      this.lastRunAtValue = new Date().toISOString()
     } catch (error) {
       this.deps.logger.warn('[dsh-memory] 后台记忆整理批次执行失败：', error)
     }
@@ -210,7 +218,9 @@ export class MemoryMaintenance {
         if (a.supersededBy !== undefined || b.supersededBy !== undefined) continue
         if (a.workspace !== b.workspace || a.kind !== b.kind) continue
         if (Math.abs(a.importance - b.importance) > MAX_IMPORTANCE_DIFF) continue
-        if (jaccardOf(a.content, b.content) < JACCARD_THRESHOLD) continue
+        // O2：走 store.tokenJaccard 复用 token 缓存（原 jaccardOf 每对双方各
+        // tokenize 一次 ≈39,800 次/批 ≈16s CPU → 缓存后 ≈40ms）
+        if (this.deps.store.tokenJaccard(a, b) < JACCARD_THRESHOLD) continue
         try {
           // 新者判定：createdAt 更大者为新；同刻（并发写入/同批导入）时按 id
           // 字典序大者（与 listRecent 同刻展示序一致）——`>=` 会把先扫描者
@@ -287,17 +297,4 @@ export class MemoryMaintenance {
       }
     }
   }
-}
-
-/**
- * 两段内容的 tokenize Jaccard 相似度（交集 / 并集）。
- * 双方 token 集合均为空时返回 0（不视为重复，避免 0/0）。
- */
-function jaccardOf(a: string, b: string): number {
-  const ta = new Set(tokenize(a))
-  const tb = new Set(tokenize(b))
-  const inter = [...ta].filter((t) => tb.has(t)).length
-  const union = ta.size + tb.size - inter
-  if (union === 0) return 0
-  return inter / union
 }

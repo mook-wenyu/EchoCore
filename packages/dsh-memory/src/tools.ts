@@ -35,6 +35,15 @@ export interface MemoryToolsDeps {
   embedIndex?: EmbeddingIndex
   /** 语义降级/嵌入故障记录（可选；装配层注入 logger） */
   logger?: Pick<ReturnType<Context['logger']>, 'warn'>
+  /** O1 运行健康指标（装配层组装；测试环境不传 → 占位） */
+  runtime?: RuntimeHealth
+}
+
+/** O1：运行健康指标（写链失败/嵌入状态/维护时间——"写失败一眼可见"闭环） */
+export interface RuntimeHealth {
+  writeFailures: number
+  embeddingState: string
+  lastMaintenanceAt: string | null
 }
 
 /** 记忆条目的最小规范形态（工具输出与 RPC 共用） */
@@ -494,7 +503,7 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
   ctx.tools.register(
     defineTool({
       name: 'memory_status',
-      description: '查看记忆库统计：各分类/状态计数。用于了解当前记忆规模。',
+      description: '查看记忆库统计与运行健康：各分类/状态计数、写链失败次数、嵌入后端状态、上次维护时间。',
       parameters: {},
       output: {
         schema: {
@@ -515,6 +524,10 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
               },
               additionalProperties: false,
             },
+            writeFailures: { type: 'integer', required: true },
+            embeddingState: { type: 'string', required: true },
+            // O1：string|null 形态——ValueSchemaSpec 无联合 type，用 'json' 声明
+            lastMaintenanceAt: { type: 'json', required: true },
           },
           additionalProperties: false,
         },
@@ -524,17 +537,23 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
             text: [
               `记忆库统计：共 ${value.total} 条（active ${value.active} / archived ${value.archived}）`,
               `fact ${value.byKind.fact} · preference ${value.byKind.preference} · decision ${value.byKind.decision} · todo ${value.byKind.todo} · insight ${value.byKind.insight}`,
+              `运行健康：写失败 ${value.writeFailures} 次 · 嵌入 ${value.embeddingState} · 上次维护 ${value.lastMaintenanceAt ?? '未运行'}`,
             ].join('\n'),
           },
         ],
       },
       execute: async () => {
         const stats = deps.store.stats()
+        // O1：装配层 runtime 覆盖健康字段（测试/未装配 → 占位）
+        const runtime = deps.runtime
         return {
           total: stats.total,
           active: stats.active,
           archived: stats.archived,
           byKind: stats.byKind,
+          writeFailures: runtime?.writeFailures ?? stats.writeFailures,
+          embeddingState: runtime?.embeddingState ?? stats.embeddingState,
+          lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
         }
       },
     }),

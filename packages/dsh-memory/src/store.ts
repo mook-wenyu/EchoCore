@@ -533,8 +533,25 @@ export class MemoryStore {
   }
 
   /** 统计快照（deleted 已随 D-D 裁决移除——物理删除不留状态，无 deleted 计数） */
-  stats(): MemoryStats {
-    const byKind: Record<MemoryKind, number> = { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 }
+  /**
+   * O2（2026-08-16）：条目对 token Jaccard——复用 entryTokenCache（维护合并
+   * 路径原每对双方各 tokenize 一次 ≈39,800 次/批 ≈16s CPU；缓存后 O(n²)
+   * 集合比较 ≈40ms）。与模块级 jaccardTokenSimilarity（supersede 扫描用）
+   * 语义一致，但走缓存。
+   */
+  tokenJaccard(a: MemoryEntry, b: MemoryEntry): number {
+    const setA = this.cachedTokens(a)
+    const setB = this.cachedTokens(b)
+    if (setA.size === 0 || setB.size === 0) return 0
+    let intersection = 0
+    for (const token of setA) {
+      if (setB.has(token)) intersection++
+    }
+    const union = setA.size + setB.size - intersection
+    return union === 0 ? 0 : intersection / union
+  }
+
+  stats(): MemoryStats {    const byKind: Record<MemoryKind, number> = { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 }
     let active = 0
     let archived = 0
     let total = 0
@@ -544,7 +561,8 @@ export class MemoryStore {
       if (entry.status === 'active') active++
       else archived++
     }
-    return { total, active, archived, byKind }
+    // O1：健康字段占位（store 不感知写链/嵌入/维护——装配层经 runtime 覆盖）
+    return { total, active, archived, byKind, writeFailures: 0, embeddingState: 'unknown', lastMaintenanceAt: null }
   }
 }
 

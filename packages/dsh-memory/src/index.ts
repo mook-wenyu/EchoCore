@@ -200,19 +200,27 @@ export async function mountMemory(
   snapshotService.install(ctx)
   new MemoryInjector({ store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger }).install(ctx)
 
+  // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）
+  const maintenance = new MemoryMaintenance({ store, logger, now: () => Date.now() })
+  maintenance.install(ctx)
+
+  // O1：运行健康指标组装（写链失败/嵌入状态/上次维护——tools status 与 RPC status 共用）
+  const runtime = {
+    writeFailures: table.writeFailures,
+    embeddingState: embeddingService.state,
+    lastMaintenanceAt: maintenance.lastRunAt,
+  }
+
   // 模型工具：recall / search / note / forget / audit / status
   // （G3：snapshot 传入供工具回路去重——快照已注入的记忆不再由工具重复输出）
-  registerMemoryTools(ctx, { store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger })
+  registerMemoryTools(ctx, { store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger, runtime })
 
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
   registerSnapshot(ctx, { store, logger })
 
   // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面；
   // config 传入供 getConfig/setConfig 端点（setConfig 经 ctx.fiber.update 写回+重启）
-  registerMemoryRpc(ctx, store, config)
-
-  // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）
-  new MemoryMaintenance({ store, logger, now: () => Date.now() }).install(ctx)
+  registerMemoryRpc(ctx, store, config, runtime)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }

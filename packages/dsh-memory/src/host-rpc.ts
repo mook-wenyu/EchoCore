@@ -17,7 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 
 import type { MemoryStore } from './store.js'
-import { toDetail, toSummary } from './tools.js'
+import { toDetail, toSummary, type RuntimeHealth } from './tools.js'
 import type { MemoryKind } from './types.js'
 import { Config, DEFAULTS, type ResolvedConfig } from './config.js'
 import { resolveApiKey } from './embedding.js'
@@ -55,15 +55,23 @@ export interface MemoryRpcContext {
   fiber: { update(config: Record<string, unknown>, noSave?: boolean): Promise<void> }
 }
 
-/** 构造 RPC 分发器 */
-export function createMemoryRpcHandler(store: MemoryStore, rpc: MemoryRpcContext): MemoryRpcHandler {
+/** 构造 RPC 分发器（O1：runtime 健康指标可选注入——status 端点覆盖 store 占位） */
+export function createMemoryRpcHandler(store: MemoryStore, rpc: MemoryRpcContext, runtime?: RuntimeHealth): MemoryRpcHandler {
   return async (endpoint, payload) => {
     try {
       if (endpoint === 'list') return ok(await handleList(store, payload))
       if (endpoint === 'search') return ok(await handleSearch(store, payload))
       if (endpoint === 'get') return ok(handleGet(store, payload))
       if (endpoint === 'archive') return ok(await handleArchive(store, payload))
-      if (endpoint === 'status') return ok(store.stats())
+      if (endpoint === 'status') {
+        const stats = store.stats()
+        return ok({
+          ...stats,
+          writeFailures: runtime?.writeFailures ?? stats.writeFailures,
+          embeddingState: runtime?.embeddingState ?? stats.embeddingState,
+          lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
+        })
+      }
       if (endpoint === 'getConfig') return ok({ config: configView(rpc.config) })
       if (endpoint === 'setConfig') return ok(await handleSetConfig(rpc, payload))
       return internalError(`未知记忆端点：${endpoint}`)
@@ -98,14 +106,14 @@ async function handleSetConfig(rpc: MemoryRpcContext, payload: unknown): Promise
  * 运行期必有该服务，删除 optional 守卫（防御性死代码）。
  * ctx.get 返回 unknown，类型强转保留（Cordis 未在 Context 类型声明 connection）。
  */
-export function registerMemoryRpc(ctx: Context, store: MemoryStore, config: ResolvedConfig): void {
+export function registerMemoryRpc(ctx: Context, store: MemoryStore, config: ResolvedConfig, runtime?: RuntimeHealth): void {
   const connection = ctx.get('connection') as {
     rpc: { handle(channel: string, handler: MemoryRpcHandler, options: { authority: string }): () => Promise<void> }
   }
   // 配置端点依赖插件 fiber：setConfig 经 fiber.update 走 Cordis 原生"校验→重启→写回"链路
   const fiber = (ctx as unknown as { fiber: MemoryRpcContext['fiber'] }).fiber
   const rpc: MemoryRpcContext = { config, fiber }
-  const dispose = connection.rpc.handle('/memory', createMemoryRpcHandler(store, rpc), { authority: 'loopback' })
+  const dispose = connection.rpc.handle('/memory', createMemoryRpcHandler(store, rpc, runtime), { authority: 'loopback' })
   ctx.effect(() => () => {
     void dispose()
   })

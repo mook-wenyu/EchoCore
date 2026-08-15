@@ -34,12 +34,13 @@ function fakeSnapshot(snapshotIdsOf: (workspace: string) => ReadonlySet<string> 
 
 /** 组装被测对象：注册全部工具，返回定义表、store 与 table（R3-1：统一 FakeCtx）
  * - store：可注入既有 MemoryStore（去重用例需让工具与播种共享同一存储）；
- * - snapshotOf：通过即可注入快照 id 视图（缺省假快照空集 = 不触发去重）。 */
-function setup(opts?: { snapshotOf?: (workspace: string) => ReadonlySet<string>; store?: MemoryStore }) {
+ * - snapshotOf：通过即可注入快照 id 视图（缺省假快照空集 = 不触发去重）；
+ * - runtime：O1 运行健康指标（缺省不传 = 占位路径）。 */
+function setup(opts?: { snapshotOf?: (workspace: string) => ReadonlySet<string>; store?: MemoryStore; runtime?: RuntimeHealth }) {
   const ctx = new FakeCtx()
   const table = opts?.store !== undefined ? undefined : new FakeTable()
   const store = opts?.store ?? new MemoryStore(table!)
-  registerMemoryTools(ctx as unknown as Context, { store, snapshot: fakeSnapshot(opts?.snapshotOf) })
+  registerMemoryTools(ctx as unknown as Context, { store, snapshot: fakeSnapshot(opts?.snapshotOf), runtime: opts?.runtime })
   return { tools: ctx.toolDefs, store, table }
 }
 
@@ -313,6 +314,27 @@ describe('memory_status', () => {
     const def = toolOf(tools, 'memory_status')
     const result = (await def.execute({}, fakeExec() as never)) as Record<string, unknown>
     expect(result).not.toHaveProperty('deleted')
+  })
+
+  it('O1 运行健康：runtime 注入时覆盖 writeFailures/embeddingState/lastMaintenanceAt；未注入时占位', async () => {
+    const { tools, store } = setup()
+    await seed(store)
+    const def = toolOf(tools, 'memory_status')
+    // 未注入 runtime：占位（0/unknown/null）
+    const plain = (await def.execute({}, fakeExec() as never)) as {
+      writeFailures: number
+      embeddingState: string
+      lastMaintenanceAt: string | null
+    }
+    expect(plain.writeFailures).toBe(0)
+    expect(plain.embeddingState).toBe('unknown')
+    expect(plain.lastMaintenanceAt).toBeNull()
+    // 注入 runtime：装配层值覆盖
+    const rt = { writeFailures: 3, embeddingState: 'ready', lastMaintenanceAt: '2026-08-16T00:00:00.000Z' }
+    const withRuntime = await toolOf(setup({ runtime: rt }).tools, 'memory_status').execute({}, fakeExec() as never)
+    expect(withRuntime.writeFailures).toBe(3)
+    expect(withRuntime.embeddingState).toBe('ready')
+    expect(withRuntime.lastMaintenanceAt).toBe('2026-08-16T00:00:00.000Z')
   })
 })
 
