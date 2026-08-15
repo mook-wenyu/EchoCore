@@ -13,7 +13,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 
 export const name = 'memory-panel'
-export const inject: string[] = []
+// 客户端运行时服务按 inject 声明绑定（未声明则 ctx.get 返回 undefined）：
+// - slots：settings.section 注册（MemoryPanel）
+// - connection：/memory RPC 通道（createMemoryApi）
+export const inject = ['slots', 'connection']
 
 /** 记忆条目展示形态（与宿主 toSummary 对齐） */
 interface MemorySummaryView {

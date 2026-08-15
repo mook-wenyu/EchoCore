@@ -4,13 +4,20 @@
  * 插件配置（schemastery，与 DSH 生态一致）。
  * 组合行 `config:` 中的未知键会被 loader 拒绝；默认值见下。
  * 类型与 schema 分离：interface 供 apply 使用，`Config` 常量供 loader 校验。
+ *
+ * 注：400K 压缩阈值不属于本插件配置——全局压缩由宿主 compaction-basic
+ * 承载（cordis.patch.yml 解禁 + modelPolicies 0.4），见部署文档。
  */
 
 import z from '@deepseek-ai/schemastery'
 
 /** 插件配置（全部可省略，默认值见 Config schema） */
 export interface Config {
-  /** 自动注入预算上限（字符；DSH 固定启发式 ≈ 每 4 字符 1 token，4096 ≈ 1K token） */
+  /**
+   * 自动注入预算上限（字符；DSH 固定启发式 ≈ 每 4 字符 1 token）。
+   * 默认 16384 ≈ 4K token——与 magic-context 全局记忆注入预算
+   * （memory.injection_budget_tokens: 4000）对齐；占 400K 压缩预算 1%。
+   */
   injectBudgetChars?: number
   /** 自动注入 Top-K 条数 */
   topK?: number
@@ -20,8 +27,6 @@ export interface Config {
   minExtractChars?: number
   /** 提取调用输出 token 上限 */
   extractMaxTokens?: number
-  /** 压缩目标阈值（token）：到达后应无感自动压缩（计划 D13，默认 400K） */
-  compactThresholdTokens?: number
   /** 自动注入总开关 */
   enableAutoInject?: boolean
   /** 提取器总开关 */
@@ -30,12 +35,11 @@ export interface Config {
 
 /** 插件配置 schema（loader 校验与默认值填充） */
 export const Config: z<Config> = z.object({
-  injectBudgetChars: z.number().default(4096),
+  injectBudgetChars: z.number().default(16384),
   topK: z.number().default(8),
   minScore: z.number().default(0.15),
   minExtractChars: z.number().default(2000),
   extractMaxTokens: z.number().default(2048),
-  compactThresholdTokens: z.number().default(400000),
   enableAutoInject: z.boolean().default(true),
   enableExtractor: z.boolean().default(true),
 })

@@ -26,7 +26,8 @@ export const name = 'memory'
 // - storageDomain：记忆领域持久化
 // - llm：提取/摘要调用（透传给提取器）
 // - tools：注册六个模型工具（registerMemoryTools 内 ctx.tools.register）
-export const inject = ['storageDomain', 'llm', 'tools']
+// - connection：面板 RPC 通道（registerMemoryRpc 内 ctx.connection.rpc.handle）
+export const inject = ['storageDomain', 'llm', 'tools', 'connection']
 
 export function apply(ctx: Context, config: ConfigType): void {
   const logger = ctx.logger('memory')
@@ -56,7 +57,7 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
     enableAutoInject: config.enableAutoInject ?? true,
     topK: config.topK ?? 8,
     minScore: config.minScore ?? 0.15,
-    injectBudgetChars: config.injectBudgetChars ?? 4096,
+    injectBudgetChars: config.injectBudgetChars ?? 16384,
   }
   new MemoryInjector({ store, logger, config: injectorConfig }).install(ctx)
 

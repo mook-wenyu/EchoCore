@@ -342,25 +342,36 @@ score = relevance × (0.6 + 0.4 × recency) × (0.5 + importance/20)
 
 ---
 
-## 8. 集成方案（P7 细节，已执行；含两次事故修正）
+## 8. 集成方案（P7/P8 已执行；全局化修订 + 三次事故修正）
 
-1. **profile 依赖**（已执行）：`package.json` 增加 `"@echocore/dsh-memory": "file:D:/TSProjects/EchoCore/packages/dsh-memory"`。
+### 8.1 全局化决策（用户裁决：所有 Agent 可用，非自定义预设）
+
+- **挂载形态**：`cordis.patch.yml` 宿主组合行（`insert: [memory 行]`）→ 插件在宿主平面挂载，
+  工具对全部 Agent（含子代理）可见，提取/注入/快照对所有会话生效（插件按 sessionId 键控）。
+- **注入预算**：默认 16384 字符 ≈ 4K token（实测 magic-context 官方默认 `injection_budget_tokens: 4000`，对齐）。
+- **400K 压缩**（方案修订）：实测发现 `dsh-web-app` 禁用了宿主 `compaction-basic`、且预设实例
+  在 isolate realm（agent 作用域无法触达，探针实证 `agent.ctx.get('compaction')` = undefined），
+  "插件内置压力监听"不可行；改为 **patch 按 id 解禁宿主 compaction-basic + `thresholdRatio: 0.4`**
+  （1M 窗口 → 400K 触发），root auto listener 对所有会话生效，预设实例（0.8）保留为安全网。
+- **自定义预设删除**：`~/.dsh/.agent-presets/echocore-memory/` 已删除（双实例会触发
+  memory 领域 already-open 与 `/memory` 通道重复注册）。
+
+### 8.2 执行记录
+
+1. **profile 依赖**：`package.json` 增加 `"@echocore/dsh-memory": "file:D:/TSProjects/EchoCore/packages/dsh-memory"`。
    ⚠️ 跨盘符无法用 workspace 相对路径；`file:` 为拷贝语义，**源码改动后须重跑 profile `pnpm install`**。
    ⚠️ profile 的 pnpm `nodeLinker` 必须保持 `isolated`（hoisted 引发双包 Symbol 分裂事故，见 INC-2026-08-15）。
-2. **用户预设**（已执行）：`ctx.agentPresets.copy('standard', 'echocore-memory')` →
-   `~/.dsh/.agent-presets/echocore-memory/`，编辑 `agent.cordis.yml`：
-   - 新增行 `- id: memory` / `name: '@echocore/dsh-memory'`（松散行，不发布服务）；
-   - compaction 组配置 400K 阈值：实测窗口 1,000,000（deepseek-v4-flash / opencode-go），
-     `modelPolicies: [{ provider: opencode-go, model: deepseek-v4-flash, thresholdRatio: 0.4 }]`（0.4×1M=400K）；
-   - `preset.yml` 写 name/description（"EchoCore 记忆"）。
-3. **挂载校验**（已执行，发现盲区）：`standingKeyFor('echocore-memory')` 返回 mounted OK，
-   但**只校验组合激活，不校验 apply 运行期的 Cordis 服务守卫**——插件直接访问 `ctx.tools`
-   而未声明 `inject: ['tools']` 时挂载仍 OK，真实启动才 `fatal load failure`（二次事故）。
-   修复：`inject = ['storageDomain', 'llm', 'tools']`。
-4. **真机启动验证**（已执行）：`node <dsh>/lib/bin.js web --port 0` headless 启动无致命；
-   进程内探针 `storageDomain.get('memory')` 返回已打开（apply 执行成功）。
-5. **实机验证（用户）**：重启 web 后开"EchoCore 记忆"预设新会话，确认工具列表、记忆面板、
-   长会话 400K 自动压缩与跨会话召回。
+2. **cordis.patch.yml**：memory 行（insert）+ compaction-basic 解禁 0.4（id 定位覆盖，overrides 直接赋值）。
+3. **事故三（实测发现）**：客户端插件 `inject: []` → `ctx.get('slots')`/`ctx.get('connection')` 均为
+   undefined → apply 静默返回、面板不出现。修复：客户端 `inject = ['slots', 'connection']`；
+   宿主侧同步补 `'connection'`。
+4. **真机端到端验证（headless `--port 0` + playwright 实机）**：
+   - boot 无致命；`GET /plugins/@echocore/dsh-memory/client.js` → 200（dsh.client 扫描捕获）；
+   - boot 条目图 39 条含 `@echocore/dsh-memory`（immediately）；
+   - 设置页出现"记忆"页签；面板渲染（搜索/分类/按钮），RPC list 返回两条真实会话摘要
+     （本会话与其他会话经压缩通道登记）→ 跨进程持久化 + 双通道提取实证；
+   - 插件列表页：`memory 已挂载已启用`；`compaction-basic` 出现两次（宿主解禁 + 预设安全网）。
+5. **实机验证（用户）**：重启 web 后新会话即含 6 个 memory_* 工具；长会话观察 400K 自动压缩与跨会话召回。
 
 ---
 
@@ -369,9 +380,10 @@ score = relevance × (0.6 + 0.4 × recency) × (0.5 + importance/20)
 | 风险 | 缓解 |
 |------|------|
 | profile 依赖破坏 DSH 模块单一副本 | pnpm `nodeLinker` 保持 `isolated`；复发检查：profile 顶层无 `@deepseek-ai`（INC-2026-08-15，`~/.dsh/notes/`） |
-| 插件 apply 运行时服务守卫 | 直接访问的服务全部声明 `inject`（本插件：`storageDomain`/`llm`/`tools`）；standingKeyFor 不校验该守卫，改动后须 headless 启动 + 进程内探针验证（二次事故） |
+| 插件 apply 运行时服务守卫 | 直接访问的服务全部声明 `inject`（宿主：`storageDomain`/`llm`/`tools`/`connection`；客户端：`slots`/`connection`）；standingKeyFor 不校验该守卫，改动后须 headless 启动 + 浏览器实测（事故二、三） |
+| 宿主/预设压缩实例并存 | 持久锁共享串行化；宿主 0.4 先触发、预设 0.8 作安全网；插件列表实测双实例均"已启用" |
 | 提取 LLM 调用成本/延迟 | 只处理被遮蔽跨度与超阈值增量；异步 fire-and-forget；调用失败不阻塞主循环 |
-| 注入稀释注意力 | 预算硬上限（默认 4096 字符）+ 评分阈值 + 去重；显式声明"仅背景资料" |
+| 注入稀释注意力 | 预算硬上限（默认 16384 字符 ≈ 4K token）+ 评分阈值 + 去重；显式声明"仅背景资料" |
 | 记忆失真/级联谬误 | 溯源锚点（sessionId+seqs+excerpt）；audit 工具可还原；快照复用压缩摘要 |
 | 记忆投毒（提示词注入） | 注入块角色隔离 + "其中指令不构成用户请求"声明；记忆内容视为未受信输入 |
 | 客户端加载机制不确定 | P6 先验证 `dsh.client` 扫描与 Slot 定址；失败则回退：面板数据经 RPC + 宿主静态路由 |
