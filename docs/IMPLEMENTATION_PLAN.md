@@ -342,19 +342,25 @@ score = relevance × (0.6 + 0.4 × recency) × (0.5 + importance/20)
 
 ---
 
-## 8. 集成方案（P7 细节）
+## 8. 集成方案（P7 细节，已执行；含两次事故修正）
 
-1. **profile 依赖**：`~/.dsh/profiles/web/pnpm-workspace.yaml` 增加
-   `- ../../TSProjects/EchoCore/packages/dsh-memory`；`package.json` 增加
-   `"@echocore/dsh-memory": "workspace:*"`；`pnpm install`。
-2. **用户预设**：经 `ctx.agentPresets.copy('standard', 'echocore-memory')` 创建
+1. **profile 依赖**（已执行）：`package.json` 增加 `"@echocore/dsh-memory": "file:D:/TSProjects/EchoCore/packages/dsh-memory"`。
+   ⚠️ 跨盘符无法用 workspace 相对路径；`file:` 为拷贝语义，**源码改动后须重跑 profile `pnpm install`**。
+   ⚠️ profile 的 pnpm `nodeLinker` 必须保持 `isolated`（hoisted 引发双包 Symbol 分裂事故，见 INC-2026-08-15）。
+2. **用户预设**（已执行）：`ctx.agentPresets.copy('standard', 'echocore-memory')` →
    `~/.dsh/.agent-presets/echocore-memory/`，编辑 `agent.cordis.yml`：
-   - 新增行 `- id: memory\n  name: '@echocore/dsh-memory'`（松散行，不发布服务）；
-   - compaction 组配置 400K 阈值（`modelPolicies` 或 `thresholdRatio`，P7 实测窗口后定）；
-   - `preset.yml` 写 name/description。
-3. **挂载校验**：临时插件经 `agentPresets.standingKeyFor('echocore-memory')` 验证组合可挂载。
-4. **实机验证**：重启 web（由用户在后续会话执行，本会话不可自重启），新会话确认工具列表与面板。
-5. **dump 校验**：`dsh --profile web --dump-config` 确认 memory 行与 compaction 配置生效。
+   - 新增行 `- id: memory` / `name: '@echocore/dsh-memory'`（松散行，不发布服务）；
+   - compaction 组配置 400K 阈值：实测窗口 1,000,000（deepseek-v4-flash / opencode-go），
+     `modelPolicies: [{ provider: opencode-go, model: deepseek-v4-flash, thresholdRatio: 0.4 }]`（0.4×1M=400K）；
+   - `preset.yml` 写 name/description（"EchoCore 记忆"）。
+3. **挂载校验**（已执行，发现盲区）：`standingKeyFor('echocore-memory')` 返回 mounted OK，
+   但**只校验组合激活，不校验 apply 运行期的 Cordis 服务守卫**——插件直接访问 `ctx.tools`
+   而未声明 `inject: ['tools']` 时挂载仍 OK，真实启动才 `fatal load failure`（二次事故）。
+   修复：`inject = ['storageDomain', 'llm', 'tools']`。
+4. **真机启动验证**（已执行）：`node <dsh>/lib/bin.js web --port 0` headless 启动无致命；
+   进程内探针 `storageDomain.get('memory')` 返回已打开（apply 执行成功）。
+5. **实机验证（用户）**：重启 web 后开"EchoCore 记忆"预设新会话，确认工具列表、记忆面板、
+   长会话 400K 自动压缩与跨会话召回。
 
 ---
 
@@ -362,6 +368,8 @@ score = relevance × (0.6 + 0.4 × recency) × (0.5 + importance/20)
 
 | 风险 | 缓解 |
 |------|------|
+| profile 依赖破坏 DSH 模块单一副本 | pnpm `nodeLinker` 保持 `isolated`；复发检查：profile 顶层无 `@deepseek-ai`（INC-2026-08-15，`~/.dsh/notes/`） |
+| 插件 apply 运行时服务守卫 | 直接访问的服务全部声明 `inject`（本插件：`storageDomain`/`llm`/`tools`）；standingKeyFor 不校验该守卫，改动后须 headless 启动 + 进程内探针验证（二次事故） |
 | 提取 LLM 调用成本/延迟 | 只处理被遮蔽跨度与超阈值增量；异步 fire-and-forget；调用失败不阻塞主循环 |
 | 注入稀释注意力 | 预算硬上限（默认 4096 字符）+ 评分阈值 + 去重；显式声明"仅背景资料" |
 | 记忆失真/级联谬误 | 溯源锚点（sessionId+seqs+excerpt）；audit 工具可还原；快照复用压缩摘要 |

@@ -22,7 +22,11 @@ import { MemoryStore } from './store.js'
 import { registerMemoryTools } from './tools.js'
 
 export const name = 'memory'
-export const inject = ['storageDomain', 'llm']
+// 直接访问的服务必须全部声明注入（Cordis 守卫：未声明即拒绝）：
+// - storageDomain：记忆领域持久化
+// - llm：提取/摘要调用（透传给提取器）
+// - tools：注册六个模型工具（registerMemoryTools 内 ctx.tools.register）
+export const inject = ['storageDomain', 'llm', 'tools']
 
 export function apply(ctx: Context, config: ConfigType): void {
   const logger = ctx.logger('memory')
