@@ -290,6 +290,20 @@ describe('MemoryStore D-A 后向引用（supersede, O3）', () => {
     expect(store.stats().total).toBe(2)
   })
 
+  it('supersede 触发 onSupersede 钩子（P2-1：装配层联动清理被覆盖条目的嵌入向量）', async () => {
+    const superseded: string[] = []
+    const store = new MemoryStore(new FakeTable(), nowFn, undefined, {
+      onSupersede: (id) => superseded.push(id),
+    })
+    const oldE = (await store.create(input({ kind: 'decision', content: OLD }))).entry
+    await store.create(input({ kind: 'decision', content: NEW }))
+    expect(superseded).toEqual([oldE.id])
+    // 不覆盖时钩子不触发
+    const untouched = (await store.create(input({ kind: 'fact', content: '独立事实条目' }))).entry
+    expect(untouched.supersededBy).toBeUndefined()
+    expect(superseded).toEqual([oldE.id])
+  })
+
   it('检索默认排除被覆盖条目', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
     await store.create(input({ kind: 'decision', content: OLD }))

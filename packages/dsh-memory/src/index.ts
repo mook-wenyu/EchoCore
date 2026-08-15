@@ -79,6 +79,8 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
       // 新建记忆增量嵌入（fire-and-forget，嵌入失败仅记录，检索保持关键词）
       onCreate: (entry) => embedIndex?.indexEntry(entry),
       onArchive: (id) => embedIndex?.remove(id),
+      // P2-1：被覆盖条目联动移除向量（检索已隐藏，向量不再有语义召回价值）
+      onSupersede: (id) => embedIndex?.remove(id),
     },
   )
 

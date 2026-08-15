@@ -133,8 +133,8 @@ export class MemoryStore {
     now: NowFn = () => Date.now(),
     /** R4-1：畸形 source 条目被检索过滤时的告警回调（装配层注入 logger；无回调则静默过滤） */
     private readonly onCorruptSource?: (id: string) => void,
-    /** P4：嵌入索引联动钩子（onCreate 新建成功后触发、onArchive 归档后触发；fire-and-forget 由调用方负责） */
-    private readonly hooks?: { onCreate?: (entry: MemoryEntry) => void; onArchive?: (id: string) => void },
+    /** P4：嵌入索引联动钩子（onCreate 新建成功后触发、onArchive 归档后触发、onSupersede 被覆盖标记后触发；fire-and-forget 由调用方负责） */
+    private readonly hooks?: { onCreate?: (entry: MemoryEntry) => void; onArchive?: (id: string) => void; onSupersede?: (targetId: string) => void },
   ) {
     this.table = table
     this.now = now
@@ -270,6 +270,9 @@ export class MemoryStore {
       audit: [...current.audit, { action: 'supersede' as const, at: this.iso(), by, detail: `被记忆 #${newId} 覆盖` }],
     }))
     this.revisionValue++
+    // P2-1：被覆盖条目已从检索隐藏，其嵌入向量不再有检索价值——联动移除，
+    // 防止索引文件随 supersede 链无限增长（与 onArchive 同路径）。
+    this.hooks?.onSupersede?.(targetId)
   }
 
   /** 读一条（同步，内存权威态） */
