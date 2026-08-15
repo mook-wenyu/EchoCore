@@ -43,6 +43,11 @@ export const DEFAULTS = {
   embeddingModelDir: '',
   /** 远程嵌入 API base URL（OpenAI 兼容 /embeddings 端点；空串 = 未配置远程） */
   embeddingApiBaseUrl: '',
+  /**
+   * 远程嵌入 API key（用户拍板规则：可直接写字面 key，或写 `env:NAME` 引用环境变量；
+   * 空串 = 未配置。DeepSeek 官方无 embeddings API，key 需另配供应商）
+   */
+  embeddingApiKey: '',
   /** 远程嵌入模型名（如 BAAI/bge-m3、Qwen/Qwen3-Embedding-0.6B） */
   embeddingModel: '',
   /** 远程嵌入维度（OpenAI 兼容生态无 384 维——bge-m3 固定 1024、Qwen3-0.6B 可 512/256/64；按供应商文档配置） */
@@ -83,6 +88,8 @@ export interface Config {
   embeddingModelDir?: string
   /** 远程嵌入 API base URL（OpenAI 兼容 /embeddings；空串 = 未配置远程） */
   embeddingApiBaseUrl?: string
+  /** 远程嵌入 API key（字面 key 或 env:NAME 环境变量引用；空串 = 未配置） */
+  embeddingApiKey?: string
   /** 远程嵌入模型名 */
   embeddingModel?: string
   /** 远程嵌入维度（默认 1024=bge-m3；本地固定 384 不随此配置） */
@@ -130,6 +137,8 @@ export const Config = z.transform(
     embeddingModelDir: z.string().default(DEFAULTS.embeddingModelDir),
     /** 远程嵌入 base URL（OpenAI 兼容端点） */
     embeddingApiBaseUrl: z.string().default(DEFAULTS.embeddingApiBaseUrl),
+    /** 远程嵌入 API key（字面 key 或 env:NAME 引用；运行时 resolveApiKey 解析） */
+    embeddingApiKey: z.string().default(DEFAULTS.embeddingApiKey),
     /** 远程嵌入模型名 */
     embeddingModel: z.string().default(DEFAULTS.embeddingModel),
     /** 远程嵌入维度（正数；本地 384 不随此配置） */

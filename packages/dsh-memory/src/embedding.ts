@@ -48,10 +48,28 @@ export class EmbeddingUnavailableError extends Error {
 /** 嵌入服务运行状态（一等状态，装配层与调用方据此决策） */
 export type EmbeddingState = 'disabled' | 'loading' | 'ready' | 'error'
 
-/** 远程嵌入 API key 环境变量名（用户拍板：apiKey 不落盘配置，从环境变量读取） */
-export const EMBEDDING_API_KEY_ENV = 'EMBEDDING_API_KEY'
+/** 远程嵌入 API key 环境变量引用前缀（用户拍板：`env:NAME` = 从环境变量 NAME 取值；无前缀 = 字面 key） */
+export const API_KEY_ENV_PREFIX = 'env:'
 
-/** 远程嵌入配置（OpenAI 兼容 /embeddings 端点；apiKey 不在此——环境变量提供） */
+/**
+ * 解析远程嵌入 API key（用户拍板规则，纯函数可单测）：
+ * - 配置值以 `env:` 开头 → 取 `env:` 后名字对应的环境变量值；
+ * - 无前缀 → 视为字面 key 直接用（字面 key 永不被环境变量劫持）；
+ * - 解析结果为空（未配置/环境变量未设/空白）→ undefined（远程不可用判定依据）。
+ */
+export function resolveApiKey(configured: string): string | undefined {
+  const trimmed = configured.trim()
+  if (trimmed === '') return undefined
+  if (trimmed.startsWith(API_KEY_ENV_PREFIX)) {
+    const name = trimmed.slice(API_KEY_ENV_PREFIX.length).trim()
+    if (name === '') return undefined
+    const value = process.env[name]
+    return value !== undefined && value !== '' ? value : undefined
+  }
+  return trimmed
+}
+
+/** 远程嵌入配置（OpenAI 兼容 /embeddings 端点；apiKey 为原始配置值——含 env: 前缀，运行时解析） */
 export interface RemoteEmbeddingConfig {
   /** 端点 base URL（如 https://api.siliconflow.cn/v1；尾部斜杠自动剥除） */
   baseUrl: string
@@ -59,6 +77,8 @@ export interface RemoteEmbeddingConfig {
   model: string
   /** 期望输出维度（供应商文档声明；返回维度 ≠ 此值时报错防混维） */
   dimension: number
+  /** API key 原始配置值（字面 key 或 env:NAME 引用） */
+  apiKey: string
 }
 
 /** 本地嵌入后端接口（pipeline 的窄形态，便于测试注入） */
@@ -119,11 +139,11 @@ export function defaultFetchRemoteEmbeddings(
   return remoteEmbedFetch(input, config)
 }
 
-/** OpenAI 兼容 /embeddings 请求实现（纯函数形态，便于直接单测；apiKey 从环境变量读取） */
+/** OpenAI 兼容 /embeddings 请求实现（纯函数形态，便于直接单测；apiKey 经 resolveApiKey 解析） */
 export async function remoteEmbedFetch(input: string[], config: RemoteEmbeddingConfig): Promise<Float32Array[]> {
-  const apiKey = process.env[EMBEDDING_API_KEY_ENV]
-  if (apiKey === undefined || apiKey === '') {
-    throw new EmbeddingUnavailableError(`远程嵌入不可用：环境变量 ${EMBEDDING_API_KEY_ENV} 未设置`)
+  const apiKey = resolveApiKey(config.apiKey)
+  if (apiKey === undefined) {
+    throw new EmbeddingUnavailableError(`远程嵌入不可用：embeddingApiKey 未配置或引用的环境变量未设置（支持字面 key 或 env:NAME）`)
   }
   const base = config.baseUrl.replace(/\/+$/, '')
   const response = await fetch(`${base}/embeddings`, {

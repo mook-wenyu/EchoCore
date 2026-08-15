@@ -11,13 +11,38 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { EmbeddingIndex } from '../src/embed-index.js'
-import { EmbeddingService, EmbeddingUnavailableError, cosine } from '../src/embedding.js'
+import { EmbeddingService, EmbeddingUnavailableError, cosine, resolveApiKey } from '../src/embedding.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeTable } from './helpers.js'
+
+describe('resolveApiKey（env: 前缀解析，用户拍板规则）', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('env: 前缀 → 从同名环境变量取值', () => {
+    vi.stubEnv('MY_EMBEDDING_KEY', 'sk-from-env')
+    expect(resolveApiKey('env:MY_EMBEDDING_KEY')).toBe('sk-from-env')
+  })
+
+  it('无前缀 → 视为字面 key 直接用（不被环境变量劫持）', () => {
+    vi.stubEnv('sk-literal-abc', 'env-value-should-not-win')
+    expect(resolveApiKey('sk-literal-abc')).toBe('sk-literal-abc')
+  })
+
+  it('env: 引用的环境变量未设置 → 返回 undefined（远程不可用判定依据）', () => {
+    expect(resolveApiKey('env:NOT_SET_ANYWHERE')).toBeUndefined()
+  })
+
+  it('空串/空白 → undefined', () => {
+    expect(resolveApiKey('')).toBeUndefined()
+    expect(resolveApiKey('   ')).toBeUndefined()
+  })
+})
 
 describe('cosine', () => {
   it('同向向量余弦为 1', () => {
@@ -328,14 +353,14 @@ describe('EmbeddingIndex', () => {
   it('并发 indexEntry 持久化串行互斥：最终文件完整可解析（P0-1 竞态回归）', async () => {
     const { file, index } = await setup()
     // 慢嵌入制造并发窗口：多条 fire-and-forget 同时进入 embedOne → persist
-    // （20ms/条：全量并行跑时留足时序余量，防轮询超时误报）
+    // （10ms/条：全量并行跑时留足时序余量，防轮询超时误报）
     const slow = new EmbeddingIndex({
       file,
       service: {
         state: 'ready',
         dimension: 384,
         embed: async (text: string) => {
-          await new Promise((resolve) => setTimeout(resolve, 20))
+          await new Promise((resolve) => setTimeout(resolve, 10))
           const v = new Float32Array(384)
           v[0] = text.length
           return v
@@ -349,10 +374,10 @@ describe('EmbeddingIndex', () => {
       content: `内容${i}`,
     })) as unknown as MemoryEntry[]
     for (const entry of entries) slow.indexEntry(entry)
-    // 等全部落地（8 × 20ms 串行化后约 160ms；轮询文件内容达到 8 条或超时）
+    // 等全部落地（8 × 10ms 串行化后约 80ms；轮询文件内容达到 8 条或超时）
     const { readFile } = await import('node:fs/promises')
     let parsed: Record<string, number[]> | undefined
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < 300; i++) {
       await new Promise((resolve) => setTimeout(resolve, 25))
       try {
         parsed = JSON.parse(await readFile(file, 'utf8')) as Record<string, number[]>

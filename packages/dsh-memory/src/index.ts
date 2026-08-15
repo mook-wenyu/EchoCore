@@ -17,7 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 
 import { Config, DEFAULTS, type Config as ConfigType, type ResolvedConfig } from './config.js'
 import { EmbeddingIndex } from './embed-index.js'
-import { EmbeddingService, EMBEDDING_API_KEY_ENV, EmbeddingUnavailableError } from './embedding.js'
+import { EmbeddingService, EmbeddingUnavailableError, resolveApiKey } from './embedding.js'
 import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
 import { registerMemoryRpc } from './host-rpc.js'
 import { MemoryInjector, type InjectorConfig } from './injector.js'
@@ -90,13 +90,12 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
   let embeddingService: EmbeddingService | undefined
   let embedIndex: EmbeddingIndex | undefined
   const modelDir = config.embeddingModelDir !== '' ? config.embeddingModelDir : defaultEmbeddingModelDir()
-  // 远程配置齐判定：baseUrl/model 两项非空且环境变量 EMBEDDING_API_KEY 已设
-  // （apiKey 不落盘配置——用户拍板；dimension 有默认值）
+  // 远程配置齐判定：baseUrl/model/apiKey 非空（apiKey 经 resolveApiKey 解析——
+  // 字面 key 或 env:NAME 环境变量引用；解析为空视为未配置）
   const remoteConfigured =
     config.embeddingApiBaseUrl !== '' &&
     config.embeddingModel !== '' &&
-    process.env[EMBEDDING_API_KEY_ENV] !== undefined &&
-    process.env[EMBEDDING_API_KEY_ENV] !== ''
+    resolveApiKey(config.embeddingApiKey) !== undefined
   embeddingService = new EmbeddingService({
     modelDir,
     remote: remoteConfigured
@@ -104,6 +103,7 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
           baseUrl: config.embeddingApiBaseUrl,
           model: config.embeddingModel,
           dimension: config.embeddingDimension,
+          apiKey: config.embeddingApiKey,
         }
       : undefined,
   })
