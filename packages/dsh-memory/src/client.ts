@@ -34,6 +34,7 @@ interface MemorySummaryView {
 
 /** 详情展示形态（与宿主 toDetail 对齐） */
 interface MemoryDetailView extends MemorySummaryView {
+  workspace: string
   source: { sessionId: string; eventSeqs: number[]; excerpt: string }
   accessCount: number
   audit: Array<{ action: string; at: string; by: string; detail?: string }>
@@ -47,6 +48,13 @@ export interface MemoryStatsView {
   active: number
   archived: number
   byKind: Record<string, number>
+  /**
+   * O1 观测闭环扩展（可选项）：宿主 status 端点尚未下发这些字段时缺失，
+   * 面板以可选访问展示——缺则整行不渲染（防旧宿主/防未来字段名漂移）。
+   */
+  writeFailures?: number
+  embeddingState?: string
+  lastMaintenanceAt?: string | null
 }
 
 /**
@@ -166,27 +174,67 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
   const [entries, setEntries] = React.useState<MemorySummaryView[]>([])
   const [query, setQuery] = React.useState('')
   const [kind, setKind] = React.useState('')
+  const [workspace, setWorkspace] = React.useState('')
+  const [workspaceOptions, setWorkspaceOptions] = React.useState<string[]>([])
   const [selected, setSelected] = React.useState<MemoryDetailView | undefined>(undefined)
   const [stats, setStats] = React.useState<MemoryStatsView | undefined>(undefined)
   const [error, setError] = React.useState('')
   // 详情请求序号：openDetail 竞态守卫——只采纳最新一次请求的响应
   const requestSeq = React.useRef(0)
+  // 工作区下拉来源构建守卫：列表条目摘要（toSummary）不含 workspace 字段，
+  // 只能从详情（get）取样推导；用 ref 保证只取样一次，避免每次 refresh 重访详情。
+  const workspacesDerivedRef = React.useRef(false)
 
-  const refresh = React.useCallback(
-    async (q: string, k: string): Promise<void> => {
+  /**
+   * 从已装载的条目推导工作区下拉选项（union 到现有集合再升序）。
+   * 摘要视图不携带 workspace（toSummary 丢弃字段，见 tools.ts），仅详情有；
+   * 故对本次条目异步拉详情取样。取样上限固定，避免大库里 N 次 RPC 风暴——
+   * 面板是跨项目管理浏览工具，覆盖"当前可见库"的工作区即足筛选项。
+   */
+  const deriveWorkspaces = React.useCallback(
+    async (items: MemorySummaryView[]): Promise<void> => {
+      if (workspacesDerivedRef.current || items.length === 0) return
+      workspacesDerivedRef.current = true
       try {
-        setError('')
-        const items = q.trim() === '' ? await props.api.list() : await props.api.search(q, k === '' ? undefined : k)
-        setEntries(items)
+        const sample = items.slice(0, 50)
+        const details = await Promise.all(sample.map((item) => props.api.get(item.id).catch(() => undefined)))
+        const set = new Set<string>()
+        for (const d of details) if (d !== undefined && d.workspace !== undefined) set.add(d.workspace)
+        // 详情类型带必选 workspace；跨版本 host 可能尚未下发（client/host 分开部署），缺则不进集合。
+        setWorkspaceOptions((prev) => Array.from(new Set([...prev, ...set])).sort())
       } catch (err) {
+        // 推导失败不阻断列表/搜索——重置守卫允许下次再试
+        workspacesDerivedRef.current = false
         setError(err instanceof Error ? err.message : String(err))
       }
     },
     [props.api],
   )
 
+  const refresh = React.useCallback(
+    async (q: string, k: string, w: string): Promise<void> => {
+      try {
+        setError('')
+        let items: MemorySummaryView[]
+        // workspace 选中时走 search 路径传参（list API 无 workspace 参数）；
+        // 未选且空查询回退 list()（按最近排序的大库浏览），否则 search。
+        if (w !== '') {
+          items = await props.api.search(q.trim() === '' ? '' : q, k === '' ? undefined : k, undefined, w)
+        } else {
+          items = q.trim() === '' ? await props.api.list() : await props.api.search(q, k === '' ? undefined : k)
+        }
+        setEntries(items)
+        // 推导工作区下拉选项（守卫保证仅首次取样一次）
+        void deriveWorkspaces(items)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      }
+    },
+    [props.api, deriveWorkspaces],
+  )
+
   React.useEffect(() => {
-    void refresh('', '')
+    void refresh('', '', '')
     void props.api.status().then(setStats).catch((err) => setError(err instanceof Error ? err.message : String(err)))
     return () => {
       requestSeq.current++ // 卸载清理：作废未决请求
@@ -210,14 +258,14 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
     try {
       await props.api.archive(id)
       setSelected(undefined)
-      await refresh(query, kind)
+      await refresh(query, kind, workspace)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
   }
 
   const onSearch = (): void => {
-    void refresh(query, kind)
+    void refresh(query, kind, workspace)
   }
 
   const rows = entries.map((entry) =>
@@ -243,8 +291,18 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
     stats !== undefined
       ? React.createElement(
           'div',
-          { style: statsStyle },
-          `共 ${stats.total} 条记忆（${stats.active} 条活跃）`,
+          null,
+          React.createElement('div', { style: statsStyle }, `共 ${stats.total} 条记忆（${stats.active} 条活跃）`),
+          // O1 观测闭环扩展：宿主下发新字段则展示（可选访问，缺则不渲染）
+          stats.writeFailures !== undefined && stats.writeFailures > 0
+            ? React.createElement('div', { style: { ...statsStyle, ...warnStyle } }, `写失败 ${stats.writeFailures} 次`)
+            : null,
+          stats.embeddingState !== undefined
+            ? React.createElement('div', { style: metaStyle }, `嵌入状态：${stats.embeddingState}`)
+            : null,
+          stats.lastMaintenanceAt !== undefined && stats.lastMaintenanceAt !== null
+            ? React.createElement('div', { style: metaStyle }, `上次维护：${stats.lastMaintenanceAt}`)
+            : null,
         )
       : null,
     React.createElement(
@@ -260,6 +318,17 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
         'select',
         { value: kind, onChange: (event: React.ChangeEvent<HTMLSelectElement>) => setKind(event.target.value), style: selectStyle },
         KIND_LABELS.map(([value, label]) => React.createElement('option', { key: value, value }, label)),
+      ),
+      React.createElement(
+        'select',
+        {
+          value: workspace,
+          onChange: (event: React.ChangeEvent<HTMLSelectElement>) => setWorkspace(event.target.value),
+          style: selectStyle,
+        },
+        // O4 workspace 过滤：默认"全部工作区" + 从已装载条目详情推导的工作区集合
+        React.createElement('option', { key: '', value: '' }, '全部工作区'),
+        workspaceOptions.map((ws) => React.createElement('option', { key: ws, value: ws }, ws)),
       ),
       React.createElement('button', { onClick: onSearch, style: buttonStyle }, '搜索'),
     ),
@@ -447,6 +516,8 @@ const buttonStyle: React.CSSProperties = {
   color: 'var(--dsw-alias-label-primary)',
 }
 const errorStyle: React.CSSProperties = { color: 'var(--dsw-alias-state-error-primary)', fontSize: 13 }
+/** O1 写失败警告：error 语义 tint + 轻微加粗，紧跟统计行 */
+const warnStyle: React.CSSProperties = { color: 'var(--dsw-alias-state-error-primary)' }
 
 function rowStyle(active: boolean): React.CSSProperties {
   return {

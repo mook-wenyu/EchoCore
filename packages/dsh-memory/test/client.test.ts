@@ -60,6 +60,20 @@ describe('createMemoryApi 端点载荷', () => {
     ])
   })
 
+  it('search：workspace 透传（O4——面板 workspace 过滤依赖该参数到宿主）', async () => {
+    const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
+    await api.search('重构', 'todo', 'active', 'D:\\ProjA')
+    expect(recorded).toEqual([
+      { channel: '/memory', endpoint: 'search', payload: { query: '重构', kind: 'todo', status: 'active', limit: 50, workspace: 'D:\\ProjA' } },
+    ])
+  })
+
+  it('search：workspace 缺省时不出现在 payload（跨项目全库浏览语义保留）', async () => {
+    const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
+    await api.search('重构')
+    expect(recorded).toEqual([{ channel: '/memory', endpoint: 'search', payload: { query: '重构', limit: 50 } }])
+  })
+
   it('get：payload 为 { id }', async () => {
     const { api, recorded } = fakeCtx([ok({ found: true, entry: {} })])
     const result = await api.get('id-1')
