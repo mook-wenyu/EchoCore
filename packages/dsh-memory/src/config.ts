@@ -103,25 +103,50 @@ export interface Config {
 export type ResolvedConfig = Required<Config>
 
 /** 插件配置 schema（loader 校验与默认值填充；默认值全部引用 DEFAULTS 单源） */
-export const Config: z<Config> = z.object({
-  injectBudgetChars: z.number().default(DEFAULTS.injectBudgetChars),
-  topK: z.number().default(DEFAULTS.topK),
-  minScore: z.number().default(DEFAULTS.minScore),
-  minExtractChars: z.number().default(DEFAULTS.minExtractChars),
-  maxExtractChars: z.number().default(DEFAULTS.maxExtractChars),
-  extractMaxTokens: z.number().default(DEFAULTS.extractMaxTokens),
-  enableAutoInject: z.boolean().default(DEFAULTS.enableAutoInject),
-  enableSnapshot: z.boolean().default(DEFAULTS.enableSnapshot),
-  /** 快照缓存窗口下限 1s（防配置 0 导致每轮重建，破坏"稳定"语义） */
-  snapshotTtlMs: z.number().min(1000).default(DEFAULTS.snapshotTtlMs),
-  snapshotBudgetChars: z.number().min(1).default(DEFAULTS.snapshotBudgetChars),
-  snapshotTopK: z.number().min(1).default(DEFAULTS.snapshotTopK),
-  embeddingEnabled: z.boolean().default(DEFAULTS.embeddingEnabled),
-  embeddingModelDir: z.string().default(DEFAULTS.embeddingModelDir),
-  /** 融合权重 0..1（越界由 schema 拒绝，不做运行时夹逼） */
-  embeddingFusionWeight: z.number().min(0).max(1).default(DEFAULTS.embeddingFusionWeight),
-  enableExtractor: z.boolean().default(DEFAULTS.enableExtractor),
-  enableMaintenance: z.boolean().default(DEFAULTS.enableMaintenance),
-  /** 后台整理任务间隔（小时；R2-10/M2：最小 1，非法值由 schema 校验拒绝而非运行时夹逼） */
-  maintenanceIntervalHours: z.number().min(1).default(DEFAULTS.maintenanceIntervalHours),
-})
+export const Config = z.transform(
+  z.object({
+    /** P1-1：注入预算 ≥1（0 会让注入永远空转） */
+    injectBudgetChars: z.number().min(1).default(DEFAULTS.injectBudgetChars),
+    /** P1-1：Top-K ≥1（0 无注入候选） */
+    topK: z.number().min(1).default(DEFAULTS.topK),
+    /** P1-1：综合分 0..1（负值放行噪声、>1 全拒——越界由 schema 拒绝，不做运行时夹逼） */
+    minScore: z.number().min(0).max(1).default(DEFAULTS.minScore),
+    /** P1-1：提取触发阈值 ≥1 */
+    minExtractChars: z.number().min(1).default(DEFAULTS.minExtractChars),
+    /** P1-1：提取摘录上限 ≥1 */
+    maxExtractChars: z.number().min(1).default(DEFAULTS.maxExtractChars),
+    /** P1-1：提取输出上限 ≥1 */
+    extractMaxTokens: z.number().min(1).default(DEFAULTS.extractMaxTokens),
+    enableAutoInject: z.boolean().default(DEFAULTS.enableAutoInject),
+    enableSnapshot: z.boolean().default(DEFAULTS.enableSnapshot),
+    /** 快照缓存窗口下限 1s（防配置 0 导致每轮重建，破坏"稳定"语义） */
+    snapshotTtlMs: z.number().min(1000).default(DEFAULTS.snapshotTtlMs),
+    snapshotBudgetChars: z.number().min(1).default(DEFAULTS.snapshotBudgetChars),
+    snapshotTopK: z.number().min(1).default(DEFAULTS.snapshotTopK),
+    embeddingEnabled: z.boolean().default(DEFAULTS.embeddingEnabled),
+    embeddingModelDir: z.string().default(DEFAULTS.embeddingModelDir),
+    /** 融合权重 0..1（越界由 schema 拒绝，不做运行时夹逼） */
+    embeddingFusionWeight: z.number().min(0).max(1).default(DEFAULTS.embeddingFusionWeight),
+    enableExtractor: z.boolean().default(DEFAULTS.enableExtractor),
+    enableMaintenance: z.boolean().default(DEFAULTS.enableMaintenance),
+    /** 后台整理任务间隔（小时；R2-10/M2：最小 1，非法值由 schema 校验拒绝而非运行时夹逼） */
+    maintenanceIntervalHours: z.number().min(1).default(DEFAULTS.maintenanceIntervalHours),
+  }),
+  (value) => {
+    // P1-1 跨字段互斥：min > max 时 extractor 截尾保最新会丢头部且 lastSeq 已推进
+    // ——早期消息永久丢失；此约束必须拒绝而非夹逼（夹逼会掩盖配置错误）。
+    // value 类型含 null（schema 输入形态），但 validate 后 default 已填充——
+    // 用 ResolvedConfig 收紧类型（运行时恒有值，与装配层一致）。
+    const resolved = value as ResolvedConfig
+    if (resolved.minExtractChars > resolved.maxExtractChars) {
+      throw new z.ValidationError(
+        `minExtractChars (${resolved.minExtractChars}) 不能大于 maxExtractChars (${resolved.maxExtractChars})`,
+        {},
+      )
+    }
+    return resolved
+  },
+) as unknown as z<Config>
+// 类型断言理由：schemastery 的 transform 静态方法返回 Schema<TypeS, T>（输入形态含
+// null），与 z<Config> 的 meta.default 结构不兼容——输出在运行时经 default 填充，
+// 断言只收窄类型不改变行为（与 R2-4/B4 的显式解析同语义）。

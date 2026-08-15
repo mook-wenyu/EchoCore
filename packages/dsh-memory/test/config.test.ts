@@ -32,7 +32,8 @@ describe('Config 默认值', () => {
   })
 
   it('防回归：schema 默认值与 DEFAULTS 单源一致（字段存于 dict，default 存于 meta.default——已查证 schemastery）', () => {
-    const dict = (Config as unknown as { dict: Record<string, { meta?: { default?: unknown } }> }).dict
+    // P1-1 后 Config 是 transform 包装（跨字段互斥校验），object 字段在 inner 上
+    const dict = ((Config as unknown as { inner: { dict: Record<string, { meta?: { default?: unknown } }> } }).inner).dict
     expect(dict.injectBudgetChars?.meta?.default).toBe(DEFAULTS.injectBudgetChars)
     expect(dict.maxExtractChars?.meta?.default).toBe(DEFAULTS.maxExtractChars)
     expect(dict.enableMaintenance?.meta?.default).toBe(DEFAULTS.enableMaintenance)
@@ -40,7 +41,8 @@ describe('Config 默认值', () => {
 
   it('防回归：400K 压缩阈值键已从 schema 移除（迁移到宿主 compaction-basic）', () => {
     // schemastery validate 保留未知键（不剥离），故断言 schema 对象本身不含该键
-    expect('compactThresholdTokens' in Config).toBe(false)
+    const inner = (Config as unknown as { inner: Record<string, unknown> }).inner
+    expect('compactThresholdTokens' in inner).toBe(false)
   })
 
   it('显式配置覆盖默认值', () => {
@@ -51,5 +53,24 @@ describe('Config 默认值', () => {
 
   it('非法类型被拒绝（数字字段传字符串）', () => {
     expect(() => parseConfig({ topK: 'many' } as unknown as Record<string, unknown>)).toThrow()
+  })
+
+  it('数值越界被拒绝（P1-1：minScore 0..1）', () => {
+    expect(() => parseConfig({ minScore: -0.1 })).toThrow()
+    expect(() => parseConfig({ minScore: 1.1 })).toThrow()
+  })
+
+  it('非正数值被拒绝（P1-1：topK/预算/提取上限 ≥1）', () => {
+    expect(() => parseConfig({ topK: 0 })).toThrow()
+    expect(() => parseConfig({ injectBudgetChars: 0 })).toThrow()
+    expect(() => parseConfig({ minExtractChars: 0 })).toThrow()
+    expect(() => parseConfig({ maxExtractChars: 0 })).toThrow()
+    expect(() => parseConfig({ extractMaxTokens: 0 })).toThrow()
+  })
+
+  it('跨字段互斥被拒绝（P1-1：minExtractChars > maxExtractChars 会致早期消息永久丢失）', () => {
+    expect(() => parseConfig({ minExtractChars: 13000, maxExtractChars: 12000 })).toThrow()
+    // 边界合法：相等时语义为"全量摘录"
+    expect(() => parseConfig({ minExtractChars: 12000, maxExtractChars: 12000 })).not.toThrow()
   })
 })
