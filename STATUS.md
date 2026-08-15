@@ -23,6 +23,7 @@
 - **E2 apiKey 双形态**（c1b4885）：embeddingApiKey 支持字面 key 与 `env:NAME` 环境变量引用（env: 前缀显式标记，resolveApiKey 纯函数，字面 key 不被环境变量劫持）
 - **E3 面板配置**（7d34588 + d759bb7）：RPC 端点 getConfig/setConfig（严格载荷校验：未知键/类型/越界/跨字段互斥拒绝；setConfig 经 `ctx.fiber.update` 整体校验 → 写回 cordis.patch.yml → 重启插件生效——Cordis 原生链路，数据不丢）；记忆面板底部配置区块（字段驱动 DRY 表单，apiKey 解析状态展示，保存即生效）
 - **E4 配置面最小化**（707f014）：19 项 → **4 项**（仅远程嵌入 baseUrl/apiKey/model/dimension）；其余 15 项固化为模块内常量——注入（INJECT_BUDGET_CHARS/TOP_K/MIN_SCORE）、提取（MIN/MAX_EXTRACT_CHARS/EXTRACT_MAX_TOKENS）、快照（SNAPSHOT_TTL_MS/BUDGET_CHARS/TOP_K）、维护（MAINTENANCE_INTERVAL_MS）、四个 enable 开关全删（行为恒启用）、本地模型目录固定全局（模型是共享资产，用户修正方向）；依据 12-Factor + FSE'15 Too Many Knobs；净减 216 行；P2 注入测试适配快照恒启用（长尾种子验证"快照管稳定 Top、实时注入补长尾"）
+- **F1-F5 防上下文污染**（126bfcf）：用户质疑"注入相关性不足→污染→失忆"成立（审计：快照 26-29 条来自 9-13 会话无条件注入；0.15 门槛形同虚设；过时记忆无过滤——风险分级高）。五线修复：①快照按来源会话浅聚（SNAPSHOT_PER_SESSION_CAP=3）；②相关性硬门槛 MIN_RELEVANCE_SCORE=0.3（依据：noisy 检索摧毁已知答案 51-64%、mem0 0.65-0.75、magic-context 0.6）；③渲染创建日期（模型可判新旧）；④supersede 30 天时间窗口（SUPERSEDE_WINDOW_MS）；⑤快照重建降频（SNAPSHOT_MIN_REBUILD_INTERVAL_MS=60s 保前缀缓存）。272 测试全绿
 - **接口契约变更**（累计）：配置项 19→4；`InjectorConfig/ExtractorConfig/SnapshotConfig/MaintenanceConfig` 接口删除；`MemoryStableSnapshot.EMPTY_IDS` 删除；CONFIG_DICT 改读 `Config.dict`（transform 包装移除后）；EmbeddingIndexDeps.service 加 `dimension`；`createMemoryRpcHandler(store, rpc)`/`registerMemoryRpc(ctx, store, config)`；MemoryPanelApi 加 getConfig/setConfig；MemoryPanelConfigView 仅 5 字段
 - **提交**：92a2725（PLAN4）→ d5a9eda（A1）→ 16a6677（A2）→ 2e20f1f（A3）→ 35911f6（A4）→ 8d4a36f（B1）→ cca7d8d（B2）→ 2bcd2a5（B3）→ 本轮文档
 
