@@ -4,30 +4,31 @@
 
 ## 一、架构健康度
 
-- 模块总数：14（types / constants / config / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / host-rpc / maintenance + client.ts 浏览器半 + scripts/build-client.mjs）
-- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants 被复用，无环
-- 违规跨模块调用：无（工具与注入共用 `formatMemoryLine` 属有意复用；`shortSessionId` 三处渲染共用）
-- 单元测试 **162 个全绿**；类型检查与构建通过
+- 模块总数：15（types / constants / config / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / host-rpc / maintenance / render + client.ts 浏览器半 + scripts/build-client.mjs）
+- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants/render 被复用，无环
+- 单元测试 **188 个全绿**（16 文件）；类型检查与构建通过；部署副本已同步并真机验证
+- 测试基建统一：FakeCtx 五合一（helpers.ts，多监听/服务注册/effect/logger/tools 捕获）、FakeTable 失败注入（failNextWrite + 真实 DomainError missing-key）
 
-## 二、本次变更影响范围
+## 二、本次变更影响范围（第二轮优化）
 
-- **功能**：优化计划全部阶段落地——腐化防线（O1：prompt 三规则、回述双层过滤、摘录上限、批次 flush）、生命周期（O2：disposed 清理五 Map、装配失败可见）、存储正确性（O3：update 白名单、合并粒度加 kind、归档守卫、排序 tie-breaker）、D-A 后向引用（supersededBy 标记 + 检索排除 + 审计链）、O4 接口收敛（D-D 删除 restore/hardDelete/deleted、RPC status 消费、死代码清理）、O5 客户端（inject 对齐、竞态守卫）、O6 访问追踪节流、O8-M 后台整理（重复合并/过期降级/标签整理）
-- **bug 修复**：会话短 id 截断（`session-` 前缀被 slice 吃掉）——injector/tools/client 三处渲染统一走 `shortSessionId`
-- **文件**：`packages/dsh-memory/src/`（constants/extract/extractor/injector/index/store/tools/client/maintenance 新）+ `test/`（10 文件，含 types/config/client/maintenance 新）+ README + docs/OPTIMIZATION_PLAN.md
-- **接口契约变更**：`store.update` 白名单剔除 content；`SearchOptions.includeSuperseded` 新增；`MemoryStats` 无 deleted；`MemoryEntry` 增 supersededBy/supersedes；`Config` 增 maxExtractChars/enableMaintenance/maintenanceIntervalHours（DEFAULTS 单源）；客户端 `dsh.client.inject: ['slots','connection']`
-- **提交**：79564d9（地基）→ 96492bb（O1+O2）→ 15da3b7（O8-M）→ 0b7a94e（O3+D-A+O6）→ 18ab29a（O4+O5）→ d5ac162（O7）
+- **R2 结构性修复**：装配失败上抛（apply 返回 promise，Cordis fiber 拒绝可见）；store 异常语义精确化（仅 missing-key 转业务值，真实异常上抛）；connection 守卫删除（inject 契约保证存在）；配置解析边界（ResolvedConfig 取代逐字段 `??`）；sessionIdOf 缺失即抛（禁止 workspace 键伪造来源）；mergedWithId 语义修正（消除伪造空串）；render.ts 渲染单源（B7）；snapshot 常量复用；config minimum:1；平衡 JSON 扫描；倒序遍历
+- **R3 测试基建**：FakeCtx 统一、FakeTable 失败注入、index 装配测试（inject 契约/B1 上抛/卸载）、memory-domain schema 测试（**发现并修复真实缺陷：schema 缺 importance 0..10 边界**）
+- **R4 记忆投毒轻量加固**（用户裁决本期实施）：source 完整性防线（畸形条目从检索/浏览过滤 + 告警回调）、注入声明强化（"可能过时或被覆盖"）、注入隔离钉住测试
+- **R5 部署同步**：`--dsw-*` 主题修复（518663f）此前从未 build——已重新构建并刷新 profile 副本，**真机验证通过**（3090 实例：console 零错误、记忆面板渲染真实数据）
+- **接口契约变更**：`apply` 返回 Promise（失败即加载失败）；`registerMemoryRpc` 去 logger 参数；`memory_note` 输出 `existingId` → `mergedWithId`（可选）；`MemoryStore` 构造新增可选 `onCorruptSource` 回调；`maintenanceIntervalHours` schema 加 min 1
+- **提交**：计划文档 → R2（refactor）→ R3（test）→ 1d787e8（R4）→ R5 文档
 
 ## 三、已知风险点（诚实自曝）
 
-1. **O8-M 范围裁剪**：supersede 复核任务未实现（store.update 白名单不支持 supersededBy 变更，域隔离限制）；LLM 合并裁决未做（纯规则 KISS）——均已写入 maintenance.ts 注释。
-2. **部署副本待刷新**：源码变更后 `~/.dsh/profiles/web` 的 file: 拷贝是旧版本——**需重跑 profile `pnpm install`**（集成阶段已做源码侧全部验证，部署侧刷新待执行）。
-3. 上下文腐化**残余向量**：近义去重（语义相同表达不同）仍不支持（已知限制）；assistant 回述依赖 prompt 规则 + 段落标记双防线（source 级过滤无法覆盖 assistant 消息）。
-4. `client.test.ts` 的 react 解析依赖（vitest 环境需 react 模块）——已通过，但构建产物变化时可能再现。
-5. 记忆条目语义合并仍无 LLM 裁决（D-A 是纯规则 Jaccard；STALE 论文显示规则覆盖不全）。
+1. **R3-5 组件渲染测试降级**：MemoryPanel 组件层依赖浏览器 DOM（jsdom/testing-library），测试环境未引入——createMemoryApi 全方法已覆盖，组件层靠真机验证（本轮已做）。
+2. **记忆投毒强防线未做**：来源绑定加密签名/运行时校验（MemPoison/SMSR 论文级）列为后续演进；当前轻量加固（声明+隔离+source 完整性）覆盖主向量，本地单用户场景足够。
+3. **extractor 失败重试的重复 LLM 调用**：数据完整性优先的已知成本（pending/水位保留 → 重试重复提取 → dedup 兜底），已注释说明，未引入防抖（YAGNI）。
+4. M6 字段双源（types.ts 与 zod schema）记录不实施（字段级派生收益低）。
+5. 近义去重（语义相同表达不同）仍不支持（第一轮已知限制延续）。
 
 ## 四、下次最该做的事
 
-1. 重跑 profile `pnpm install` 刷新部署副本；用户重启 web 后验证：注入记忆显示"来自会话 63bbf845"（短 id 修复）、后台整理任务 6h 后运行（memory_status 可见统计变化）。
-2. 长会话压测：400K 自动压缩 → 记忆提取 → 新会话召回；构造"新决策覆盖旧决策"场景验证 supersede 标记与检索排除。
-3. 观察 `~/.dsh/storages/memory.json`：supersededBy 字段、maintenance 归档（stale）、重复合并效果。
-4. 后续演进候选：supersede 复核的 store 专用方法、LLM 合并裁决、近义去重。
+1. **长会话压测**：400K 自动压缩 → 记忆提取 → 新会话召回；构造"新决策覆盖旧决策"验证 supersede 链（第一轮遗留项，未做运行时验证）。
+2. 观察 `~/.dsh/storages/memory.json`：supersededBy 字段、maintenance 归档效果、R4 source 校验是否误报（真实数据量下）。
+3. 记忆投毒强防线评估：读 MemPoison（arXiv:2607.14651）/SMSR（arXiv:2606.12703）论文后裁决是否实施来源绑定。
+4. MemoryPanel 组件测试：若引入 jsdom/testing-library 依赖则补组件渲染测试（R3-5 升级）。
