@@ -343,6 +343,53 @@ describe('MemoryStore D-A 后向引用（supersede, O3）', () => {
   })
 })
 
+/**
+ * F4：supersede 时间窗口。防"过时记忆持续注入"——新表述只在 30 天窗口内覆盖
+ * 同主题旧记忆；超过 30 天的旧表述可能是另一个阶段的独立事实，不应被自动覆盖。
+ * 用可变时钟：同主题旧记忆 createdAt 落在窗口内/外分别验证 supersede 是否触发。
+ */
+describe('MemoryStore supersede 时间窗口（F4）', () => {
+  // 与既有 D-A 用例同款 Jaccard≥0.7 的一对决策表述（实测 0.778）
+  const OLD = '决定采用评分检索'
+  const NEW = '决定采用评分检索方案'
+  // 30 天窗口 + 缓冲（避免毫秒边界抖动），构造"已超窗"的旧记忆
+  const AFTER_WINDOW_MS = 30 * 86_400_000 + 60_000
+
+  it('同主题 Jaccard≥0.7 但创建超 30 天的旧记忆不被 supersede（新记忆正常创建，旧保持 active 无 supersededBy）', async () => {
+    // 可变时钟：先让旧记忆落在 now - 30 天之前，再于"现在"创建新表述
+    let clock = FIXED_NOW
+    const store = new MemoryStore(new FakeTable(), () => clock)
+    const oldE = (await store.create(input({ kind: 'decision', content: OLD }))).entry
+    // 推进时钟越过 30 天窗口 → 新表述创建时，old 的 createdAt 已在窗口外
+    clock = FIXED_NOW + AFTER_WINDOW_MS
+
+    const newE = (await store.create(input({ kind: 'decision', content: NEW }))).entry
+    // 新条目正常创建（非合并、新建成功）
+    expect(newE.supersedes).toBeUndefined()
+    expect(store.getById(newE.id)?.status).toBe('active')
+    // 旧记忆不被覆盖：保持 active、无 supersededBy（仍旧可检索/可访问）
+    expect(store.getById(oldE.id)?.supersededBy).toBeUndefined()
+    expect(store.getById(oldE.id)?.status).toBe('active')
+    // 两条独立事实共存（未被合并成一条，因为各自独立）
+    expect(store.stats().total).toBe(2)
+  })
+
+  it('窗口内（<30 天）同主题仍正常 supersede（防回归）', async () => {
+    // 可变时钟：旧记忆创建后推进但在窗口内，新表述应正常覆盖旧表述
+    let clock = FIXED_NOW
+    const store = new MemoryStore(new FakeTable(), () => clock)
+    const oldE = (await store.create(input({ kind: 'decision', content: OLD }))).entry
+    // 推进时钟至"10 天后"（远在窗口内），新表述创建
+    clock = FIXED_NOW + 10 * 86_400_000
+
+    const newE = (await store.create(input({ kind: 'decision', content: NEW }))).entry
+    expect(store.getById(oldE.id)?.supersededBy).toBe(newE.id)
+    expect(store.getById(newE.id)?.supersedes).toBe(oldE.id)
+    // 被覆盖条目仍 active 仅检索隐藏
+    expect(store.getById(oldE.id)?.status).toBe('active')
+  })
+})
+
 describe('MemoryStore 排序 tie-breaker（O3）', () => {
   it('createdAt 相同时按 id 稳定排序（search 空查询 / listBySession / listRecent）', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)

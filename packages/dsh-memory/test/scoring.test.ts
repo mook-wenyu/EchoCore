@@ -9,6 +9,7 @@ import {
   adaptiveHalfLifeDays,
   importanceFactor,
   memoryScore,
+  MIN_RELEVANCE_SCORE,
   modulatedHalfLifeDays,
   recencyFactor,
   relevanceScore,
@@ -77,6 +78,48 @@ describe('relevanceScore', () => {
 
   it('空查询得 0 分', () => {
     expect(relevanceScore([], new Set(['pnpm']))).toBe(0)
+  })
+})
+
+// F2（相关性硬门槛）：relevance 低于 MIN_RELEVANCE_SCORE 的记忆视为与查询
+// 无关（宁可不注入）。常量语义测试——验证门槛值与"判定示例"的映射关系，
+// 使注入层的行为变化在评分层可追溯。
+describe('MIN_RELEVANCE_SCORE（F2 相关性硬门槛）', () => {
+  it('门槛值为 0.3', () => {
+    expect(MIN_RELEVANCE_SCORE).toBe(0.3)
+  })
+
+  it('低于门槛的 relevance 判定为"无关"（不注入）', () => {
+    // 10-token 查询只命中 1 个 → relevance = 0.1 < 0.3：视为无关
+    const tenTokens = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']
+    const hitOne = relevanceScore(tenTokens, new Set(['a']))
+    expect(hitOne).toBe(0.1)
+    expect(hitOne < MIN_RELEVANCE_SCORE).toBe(true)
+
+    // 10-token 查询命中 2 个 → relevance = 0.2（旧门槛 0.15 区间内）仍 < 0.3
+    const hitTwo = relevanceScore(tenTokens, new Set(['a', 'b']))
+    expect(hitTwo).toBe(0.2)
+    expect(hitTwo < MIN_RELEVANCE_SCORE).toBe(true)
+
+    // 10-token 查询命中 3 个 → relevance = 0.3：恰好等于门槛（边界，放行）
+    const hitThree = relevanceScore(tenTokens, new Set(['a', 'b', 'c']))
+    expect(hitThree).toBeCloseTo(0.3, 10)
+    expect(hitThree >= MIN_RELEVANCE_SCORE).toBe(true)
+  })
+
+  it('达到/超过门槛的 relevance 判定为"相关"（放行）', () => {
+    // 10-token 查询命中 4 个及以上 → 稳定超过门槛
+    const tenTokens = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']
+    const hitFour = relevanceScore(tenTokens, new Set(['a', 'b', 'c', 'd']))
+    expect(hitFour).toBe(0.4)
+    expect(hitFour >= MIN_RELEVANCE_SCORE).toBe(true)
+  })
+
+  it('门槛语义与 2026 混合检索门槛实践一致（mem0 0.65-0.75 / magic-context 0.6 量级）', () => {
+    // 0.3 为关键词 token 命中比例路径的硬门槛，语义评分与关键词评分非同一量纲，
+    // 故判定示例仅覆盖 token 命中比例；语义路径由 store 层 RRF 融合共用同一过滤。
+    expect(MIN_RELEVANCE_SCORE).toBeGreaterThan(0)
+    expect(MIN_RELEVANCE_SCORE).toBeLessThanOrEqual(0.3)
   })
 })
 

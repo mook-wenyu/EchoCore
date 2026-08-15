@@ -37,6 +37,19 @@ export const SNAPSHOT_TTL_MS = 300_000
 export const SNAPSHOT_BUDGET_CHARS = 8192
 /** 快照 Top-K 候选上限（预算之外的保险） */
 export const SNAPSHOT_TOP_K = 30
+/**
+ * 快照按来源会话浅聚上限（F1 防污染：快照取数保持重要度优先，但每个来源
+ * 会话最多入选此条数——防止单一/少数会话的高重要度记忆垄断快照（审计实测：
+ * 快照 26-29 条来自 9-13 个不同会话，其中大量与当前会话无关），多会话均
+ * 衡后无关噪音占比下降，同时保留项目级背景价值）。
+ */
+export const SNAPSHOT_PER_SESSION_CAP = 3
+/**
+ * 快照重建最小间隔（ms）（F5 缓存保护：store.revision 变化会触发快照重建，
+ * 但高重要度新记忆会挤动 Top 边界、频繁重建破坏前缀缓存字节稳定。revision
+ * 变化且距上次重建小于此间隔 → 复用旧快照，防连续写入抖动）。
+ */
+export const SNAPSHOT_MIN_REBUILD_INTERVAL_MS = 60_000
 
 /** 快照服务依赖（store/now 可注入，便于单测；行为参数已常量化） */
 export interface SnapshotDeps {
@@ -52,6 +65,8 @@ interface CachedSnapshot {
   revision: number
   /** 构建时刻 + TTL（到期即失效） */
   expiresAt: number
+  /** 构建时刻（F5 重建降频判定用） */
+  rebuiltAt: number
 }
 
 /** systemPrompt.context 段名（与现有 dsh 段不冲突；重复注册会抛错，命名即契约） */
@@ -100,21 +115,40 @@ export class MemoryStableSnapshot {
     if (cached !== undefined && cached.revision === this.deps.store.revision && cached.expiresAt > now) {
       return cached
     }
+    // F5：revision 变化但距上次重建小于最小间隔 → 复用旧快照（防高重要度
+    // 新记忆频繁挤动 Top 边界、破坏前缀缓存字节稳定；TTL 到期仍强制重建）
+    if (cached !== undefined && now - cached.rebuiltAt < SNAPSHOT_MIN_REBUILD_INTERVAL_MS && cached.expiresAt > now) {
+      return cached
+    }
     const built = this.build(workspace, now)
     this.cache.set(workspace, built)
     return built
   }
 
-  /** 重建快照：按重要度取数 → 预算渲染 → 记录 id 集合与失效条件 */
+  /**
+   * 重建快照：按重要度取数 → 按来源会话浅聚（F1）→ 预算渲染。
+   * F1 防污染：纯重要度取数会让少数会话的高重要度记忆垄断快照（实测 26-29
+   * 条来自 9-13 个会话，大量与当前会话无关）；浅聚后每会话至多
+   * SNAPSHOT_PER_SESSION_CAP 条，多会话均衡，无关噪音占比下降。
+   */
   private build(workspace: string, now: number): CachedSnapshot {
     const candidates = this.deps.store.listByImportance(workspace, SNAPSHOT_TOP_K)
+    const perSession = new Map<string, number>()
+    const balanced = candidates.filter((entry) => {
+      const count = perSession.get(entry.source.sessionId) ?? 0
+      if (count >= SNAPSHOT_PER_SESSION_CAP) return false
+      perSession.set(entry.source.sessionId, count + 1)
+      return true
+    })
     const pack = renderBudgetedPack(
-      candidates.map((entry) => ({
+      balanced.map((entry) => ({
         id: entry.id,
         kind: entry.kind,
         content: entry.content,
         importance: entry.importance,
         sessionId: entry.source.sessionId,
+        // F3：渲染创建日期——模型可判断记忆新旧（防把过时记忆当现行事实）
+        createdAt: entry.createdAt,
       })),
       SNAPSHOT_BUDGET_CHARS,
       MEMORY_INJECTION_HEADER,
@@ -126,6 +160,7 @@ export class MemoryStableSnapshot {
       ids: new Set(rendered),
       revision: this.deps.store.revision,
       expiresAt: now + SNAPSHOT_TTL_MS,
+      rebuiltAt: now,
     }
   }
 }

@@ -10,21 +10,28 @@
 
 import { shortSessionId } from './constants.js'
 
-/** 渲染记忆行所需的最小视图形状（MemoryEntry 与工具输出均满足） */
+/** 渲染记忆行所需的最小视图形状（MemoryEntry 与工具输出均满足；createdAt 可选——工具输出无此字段） */
 export interface MemoryLineView {
   id: string
   kind: string
   content: string
   importance: number
   sessionId: string
+  /** 创建时间 ISO（F3 防污染：渲染时效字段，模型可判断记忆新旧；缺省不渲染） */
+  createdAt?: string
 }
 
-/** 单条记忆渲染：分类、内容、重要度、短 id（可追溯）、来源会话短 id */
+/**
+ * 单条记忆渲染：分类、内容、重要度、短 id（可追溯）、来源会话短 id、创建日期。
+ * F3（防上下文污染）：渲染创建日期——模型可判断记忆新旧，避免把过时记忆
+ * 当现行事实（审计证据：无时效字段时模型只能依赖笼统"可能过时"声明）。
+ */
 export function formatMemoryLine(entry: MemoryLineView): string {
   const memoryId = entry.id.slice(0, 8)
   // 短会话 id 去 'session-' 前缀（直接 slice 会截到前缀本身，见 shortSessionId 注释）
   const sourceSession = shortSessionId(entry.sessionId)
-  return `- [${entry.kind}] ${entry.content}（重要度 ${entry.importance}，记忆 #${memoryId}，来自会话 ${sourceSession}）`
+  const created = entry.createdAt !== undefined ? `，创建于 ${entry.createdAt.slice(0, 10)}` : ''
+  return `- [${entry.kind}] ${entry.content}（重要度 ${entry.importance}，记忆 #${memoryId}，来自会话 ${sourceSession}${created}）`
 }
 
 /** 预算渲染结果：文本 + 实际渲染条目的 id 列表（跳过制下不能按前 N 条推断） */

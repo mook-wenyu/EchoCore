@@ -9,7 +9,7 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { MemoryInjector, renderPack, textOfBatch } from '../src/injector.js'
-import { MemoryStableSnapshot } from '../src/stable-snapshot.js'
+import { MemoryStableSnapshot, SNAPSHOT_MIN_REBUILD_INTERVAL_MS } from '../src/stable-snapshot.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
@@ -81,14 +81,23 @@ function longContent(padding: string, overheadChars = 8230): string {
  * 行为（SNAPSHOT_TOP_K=30 / SNAPSHOT_BUDGET_CHARS=8192 / SNAPSHOT_TTL_MS）
  * 均已固化为模块常量，不再经 config 注入——构造只传 store/snapshot/logger。
  * 快照恒启用；"可被实时注入"的记忆须为快照未收录的长尾（见 longContent）。
+ * 快照时钟可拨动（F5 重建降频测试需推进 SNAPSHOT_MIN_REBUILD_INTERVAL_MS）。
  */
 function setup() {
   const ctx = new FakeCtx()
   const table = new FakeTable()
   const store = new MemoryStore(table)
   const logger = { warn: () => {}, info: () => {} }
+  // 可拨动时钟：起点 1_000_000（与历史固定值一致，未拨动时行为不变）
+  let t = 1_000_000
+  const clock = {
+    now: () => t,
+    advance: (ms: number) => {
+      t += ms
+    },
+  }
   // P2：稳定快照（恒启用，行为参数已常量化为 SNAPSHOT_* 常量）
-  const snapshot = new MemoryStableSnapshot({ store, now: () => 1_000_000 })
+  const snapshot = new MemoryStableSnapshot({ store, now: clock.now })
   const injector = new MemoryInjector({ store, snapshot, logger })
   injector.install(ctx as unknown as Context)
   const preStep = ctx.listener('agent/pre-step') as
@@ -97,7 +106,7 @@ function setup() {
   const sessionEvents = ctx.listener('session/event') as ((session: Session, event: SessionEvent) => void) | undefined
   const disposed = ctx.listener('agent/disposed') as ((payload: { agent: { id: string; session: Session } }) => void) | undefined
   if (preStep === undefined || sessionEvents === undefined) throw new Error('监听未注册')
-  return { ctx, store, injector, snapshot, preStep, sessionEvents, disposed }
+  return { ctx, store, injector, snapshot, preStep, sessionEvents, disposed, clock }
 }
 
 describe('MemoryInjector pre-step 注入', () => {
@@ -161,6 +170,21 @@ describe('MemoryInjector pre-step 注入', () => {
     const empty = await preStep({ agent: { id: 's1', session: makeSession('s1') }, messages: [{ id: 'x', role: 'user', content: [], source: { kind: 'user' } }] }, async () => enterDecision())
     expect(empty.kind).toBe('enter')
     expect(empty.messages).toHaveLength(1)
+  })
+
+  // F2（相关性硬门槛）：旧 MIN_SCORE=0.15 会放行、但新硬门槛 0.3 会拦截的
+  // "低相关"记忆不再注入。构造 10-token 查询仅命中 2 个（relevance=0.2 → 区间
+  // 0.15-0.3 内）：新近 fresh 条目 factor≈0.75 → score≈0.15，恰好落在
+  // [旧门槛, 新门槛) 之间——旧版本注入消息，新版本拒绝（行为变化验证）。
+  it('低相关记忆（relevance 落在 0.15-0.3 区间）不再注入（F2 硬门槛）', async () => {
+    const { preStep, store } = setup()
+    // 记忆仅含查询 10 个词 token 中的前 2 个 → relevance = 2/10 = 0.2
+    await seed(store, { content: longContent('alpha beta 一次性备注'), importance: 5 })
+    const query = 'alpha beta gamma delta epsilon zeta eta theta iota kappa'
+    const decision = await preStep(makePayload('s1', query), async () => enterDecision())
+    // 无条件断言（防弱断言静默跳过）：低相关记忆不注入 → 消息保持原样 1 条
+    expect(decision.kind).toBe('enter')
+    expect(decision.messages).toHaveLength(1)
   })
 
   it('workspace 隔离：他项目记忆不注入', async () => {
@@ -355,15 +379,17 @@ describe('MemoryInjector 快照去重（P2）', () => {
   })
 
   it('快照重建（revision 变更）后排除集合更新：离开快照的记忆恢复可注入', async () => {
-    const { preStep, store } = setup()
+    const { preStep, store, clock } = setup()
     // 候选短记忆最初是仅有的记忆 → 在快照 Top-30 → 实时注入排除它
     await seed(store, { content: 'pnpm workspace 旧备注', importance: 6 })
     const first = await preStep(makePayload('s1', 'pnpm workspace 旧备注怎么用'), async () => enterDecision())
     expect(injectedText(first)).not.toContain('旧备注')
-    // 写入 30 条更高重要度填充 → revision 变更 → 快照重建：候选被挤出 Top-30 → 离开快照
+    // 写入 30 条更高重要度填充 → revision 变更 → 快照重建：候选被挤出 Top-30 → 离开快照。
+    // F5 重建降频：须越过 SNAPSHOT_MIN_REBUILD_INTERVAL_MS 才实际重建
     for (let i = 0; i < 30; i++) {
       await seed(store, { content: `快照填充 ${i}`, importance: 10 })
     }
+    clock.advance(SNAPSHOT_MIN_REBUILD_INTERVAL_MS + 1)
     const second = await preStep(makePayload('s1', 'pnpm workspace 旧备注怎么用'), async () => enterDecision())
     expect(injectedText(second)).toContain('旧备注')
   })

@@ -24,6 +24,7 @@ import { DEFAULT_WORKSPACE, MEMORY_INJECTION_HEADER, MEMORY_PLUGIN_ID } from './
 import { searchWithSemantic, type EmbeddingService } from './embedding.js'
 import type { EmbeddingIndex } from './embed-index.js'
 import { renderBudgetedPack } from './render.js'
+import { MIN_RELEVANCE_SCORE } from './scoring.js'
 import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
@@ -38,10 +39,15 @@ const INJECT_BUDGET_CHARS = 16384
 /** 每次注入最多召回的相关记忆条数 */
 const TOP_K = 8
 /**
- * 注入最低综合分（relevance × 时间 × 重要性）。与 store.search 的 minScore
- * 缺省 fallback（0.15）保持一致，此处显式传入以显式表达注入阈值语义。
+ * 注入最低综合分（relevance × 时间 × 重要性）。
+ * F2（防上下文污染）：0.15 → 0.3。旧 0.15 形同虚设——relevance 是单边召回率
+ * （query token 命中比例），1-2 个 token 重合即放行；门槛抬高依据见
+ * scoring.MIN_RELEVANCE_SCORE 注释（mem0/magic-context 门槛实践 +
+ * noisy 检索摧毁已知答案 51-64%）。与 store.search 的 minScore 采用同一
+ * 门槛常量，本处显式传入以表达注入阈值语义；语义融合（RRF）路径也走同一
+ * minScore，单榜靠前语义条目依旧可召回（门槛只筛双榜皆弱杂音）。
  */
-const MIN_SCORE = 0.15
+const MIN_SCORE = MIN_RELEVANCE_SCORE
 
 /** 注入器依赖（store 可注入，便于单测） */
 export interface InjectorDeps {
@@ -210,6 +216,8 @@ export function renderPack(entries: MemoryEntry[], budgetChars: number): Rendere
       content: entry.content,
       importance: entry.importance,
       sessionId: entry.source.sessionId,
+      // F3：渲染创建日期——模型可判断记忆新旧（防把过时记忆当现行事实）
+      createdAt: entry.createdAt,
     })),
     budgetChars,
     MEMORY_INJECTION_HEADER,

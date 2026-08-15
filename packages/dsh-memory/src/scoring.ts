@@ -38,6 +38,26 @@ export const SALIENCE_FLOOR_IMPORTANCE = 8
 /** salience floor 的时间因子下限（recency ≥ 0.5 → 时间调制因子 ≥ 0.8） */
 export const SALIENCE_FLOOR_RECENCY = 0.5
 
+/**
+ * 相关性硬门槛（F2，防上下文污染）：relevance 低于此值的记忆视为与查询无关，
+ * 宁可不注入（弱相关注入 > 无注入）。
+ *
+ * 依据：
+ * - 行业门槛实践——mem0 0.65-0.75（embedding 分数）、magic-context
+ *   auto_search.score_threshold=0.6；本实现语义评分与关键词评分非同一量纲，
+ *   此处仅约束关键词路径的 relevance；
+ * - "低质注入会摧毁精确能力"有量化支撑：noisy retrieval 使已知答案准确率
+ *   下降 51-64%，宁缺毋滥；
+ * - 关键词路径的 relevance 是 query token 命中比例（relevanceScore），
+ *   0.3 ≈ 10-token 查询命中 3 个 token——低于此通常只是同片段巧合重合，
+ *   不构成真正的语义相关。
+ *
+ * 语义融合路径（P4/B1 RRF）共用同一过滤：store.search 的 minScore 统一以
+ * 本常量为兜底，语义单榜靠前条目（单榜分 = 1/(k+1)/归一化 ≈ 0.5）不受影响，
+ * 零重合的高语义相关条目仍可单榜召回——门槛只筛"双榜皆弱的杂音"，不伤语义召回。
+ */
+export const MIN_RELEVANCE_SCORE = 0.3
+
 /** CJK 统一表意文字区段（含扩展 A） */
 function isCjk(ch: string): boolean {
   const code = ch.codePointAt(0) ?? 0

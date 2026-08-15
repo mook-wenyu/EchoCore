@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
-import { MemoryStableSnapshot, SNAPSHOT_BUDGET_CHARS, SNAPSHOT_CONTEXT_NAME, SNAPSHOT_CONTEXT_ORDER, SNAPSHOT_TTL_MS } from '../src/stable-snapshot.js'
+import { MemoryStableSnapshot, SNAPSHOT_BUDGET_CHARS, SNAPSHOT_CONTEXT_NAME, SNAPSHOT_CONTEXT_ORDER, SNAPSHOT_MIN_REBUILD_INTERVAL_MS, SNAPSHOT_PER_SESSION_CAP, SNAPSHOT_TTL_MS } from '../src/stable-snapshot.js'
 import { MemoryStore } from '../src/store.js'
 import { FakeCtx, FakeTable } from './helpers.js'
 
@@ -88,16 +88,19 @@ describe('快照稳定性（缓存感知核心不变量）', () => {
     expect(second).toBe(first)
   })
 
-  it('TTL 到期后重建（可感知新记忆）', async () => {
+  it('revision 变更且超过最小重建间隔后重建（F5：60s 内防挤动）', async () => {
     const { store, snapshot, clock } = setup()
     await seed(store, { content: '旧记忆内容' })
     const before = textOf(snapshot, 'D:/ws-a')
     await seed(store, { content: 'TTL 后的新记忆' })
-    // revision 已变 → 立即重建，不等 TTL
+    // F5：revision 已变但距上次重建 < SNAPSHOT_MIN_REBUILD_INTERVAL_MS → 复用旧快照
+    const withinWindow = textOf(snapshot, 'D:/ws-a')
+    expect(withinWindow).toBe(before)
+    // 越过最小重建间隔 → 重建，新记忆入快照
+    clock.advance(SNAPSHOT_MIN_REBUILD_INTERVAL_MS + 1)
     const afterRevision = textOf(snapshot, 'D:/ws-a')
     expect(afterRevision).not.toBe(before)
     expect(afterRevision).toContain('TTL 后的新记忆')
-    clock.advance(0)
   })
 
   it('仅 TTL 到期（无内容变更）也重建', async () => {
@@ -165,6 +168,45 @@ describe('快照取数与预算', () => {
     expect(textA).not.toContain('乙工作区')
     expect(textB).toContain('乙工作区')
     expect(textB).not.toContain('甲工作区')
+  })
+
+  it('按来源会话浅聚（F1）：每会话至多 SNAPSHOT_PER_SESSION_CAP 条', async () => {
+    const { store, snapshot } = setup()
+    // 3 个会话各播种 4 条同重要度、内容互异（Jaccard<0.7 不触发 supersede）的记忆
+    const FACTS: string[][] = [
+      ['量子物理纠缠态测量实验', 'pnpm 包管理器版本升级策略', '前端构建产物优化体积', '后端接口限流阈值调整'],
+      ['数据库索引设计规范', '日志采集链路延迟排查', '缓存淘汰策略选型', '部署流水线超时设置'],
+      ['代码评审流程约定', '测试环境数据脱敏规则', '性能基准测试方法', '异常上报渠道配置'],
+    ]
+    for (let s = 0; s < 3; s++) {
+      for (let i = 0; i < 4; i++) {
+        // 注意：浅聚按 entry.source.sessionId（渲染来源会话）——顶层 sessionId 与 source 都要覆盖
+        await seed(store, {
+          sessionId: `s-${s + 1}`,
+          source: { sessionId: `s-${s + 1}`, eventSeqs: [1], excerpt: '原文' },
+          content: FACTS[s]![i]!,
+        })
+      }
+    }
+    const ids = snapshot.snapshotIds('D:/ws-a')
+    // 浅聚语义：12 条候选（每会话 4 条）→ 每会话至多 SNAPSHOT_PER_SESSION_CAP 条 = 共 9 条。
+    // 不断言具体哪条被拒（同刻 createdAt 的 tie-breaker 是随机 id，仅总量确定）。
+    expect(ids.size).toBe(3 * SNAPSHOT_PER_SESSION_CAP)
+    const perSession = new Map<string, number>()
+    for (const id of ids) {
+      const sessionId = store.getById(id)?.source.sessionId ?? '?'
+      perSession.set(sessionId, (perSession.get(sessionId) ?? 0) + 1)
+    }
+    for (let s = 1; s <= 3; s++) {
+      expect(perSession.get(`s-${s}`)).toBe(SNAPSHOT_PER_SESSION_CAP)
+    }
+  })
+
+  it('渲染创建日期（F3）：快照文本含"创建于"（模型可判断新旧）', async () => {
+    const { store, snapshot } = setup()
+    await seed(store, { content: '带时间戳的记忆' })
+    const text = textOf(snapshot, 'D:/ws-a')
+    expect(text).toContain('创建于')
   })
 })
 

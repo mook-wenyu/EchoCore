@@ -66,6 +66,15 @@ export interface SearchOptions {
 const JACCARD_SIMILARITY_THRESHOLD = 0.7
 
 /**
+ * F4 supersede 时间窗口（毫秒）：30 天。
+ * 新表述只在窗口内覆盖同主题旧记忆；超过窗口的旧表述——即便 Jaccard≥0.7——
+ * 也不再被自动覆盖。依据：时间跨度大的同主题记忆可能是不同阶段产生的
+ * 独立事实（旧的未必"错"），自动覆盖会误删历史脉络；仅 30 天内的高重合
+ * 微调才视为对同一事实的更新（supersede / D-A 前向引用只作用于近期表述）。
+ */
+const SUPERSEDE_WINDOW_MS = 30 * 86_400_000
+
+/**
  * 访问追踪节流窗口（毫秒）：同一「会话 + 记忆」在该窗口内最多落盘一次，
  * 避免高频检索反复回写 lastAccessAt/accessCount（O6 性能）。
  */
@@ -241,10 +250,14 @@ export class MemoryStore {
 
   /**
    * 扫描被本次新建表述覆盖的旧条目（D-A 后向引用候选）。
-   * 条件：同 workspace 同 kind、active、tokenize 集合 Jaccard 重合度 ≥ 0.7、创建不晚于新条目。
+   * 条件：同 workspace 同 kind、active、tokenize 集合 Jaccard 重合度 ≥ 0.7、
+   * 创建不晚于新条目、且创建时间落在 30 天窗口内（F4：超窗旧表述可能是
+   * 不同阶段的独立事实，不参与自动覆盖）。
    * 返回按创建时间升序（同刻按 id 升序）排列的命中列表，供 supersedes 引用与逐条标记。
    */
   private findSupersededTargets(input: NewMemoryInput, nowIso: string): MemoryEntry[] {
+    // F4 窗口下界：本次新表述创建时刻往前推 30 天；候选旧记忆必须创建于该时刻之后
+    const windowFloor = Date.parse(nowIso) - SUPERSEDE_WINDOW_MS
     const matched: MemoryEntry[] = []
     for (const [, entry] of this.table.entries()) {
       if (entry.workspace !== input.workspace) continue
@@ -253,6 +266,8 @@ export class MemoryStore {
       // “创建不晚于新条目”：新建条目的 createdAt=now，所有既有条目皆早于或同时，恒真；
       // 保留该判断以显式表达「只覆盖先于/同时存在的事实」语义（并发同刻创建时亦覆盖更早落库者）。
       if (entry.createdAt > nowIso) continue
+      // F4：超窗旧记忆不参与 supersede 判定——时间跨度大的同主题可能是独立阶段事实
+      if (Date.parse(entry.createdAt) < windowFloor) continue
       if (jaccardTokenSimilarity(entry.content, input.content) < JACCARD_SIMILARITY_THRESHOLD) continue
       matched.push(entry)
     }
