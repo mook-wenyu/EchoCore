@@ -124,6 +124,21 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 - **远程 API 返回维度 ≠ 配置维度 → 显式报错**（防混维）；本地依赖体积 +374.9MB
   （onnxruntime-node 全平台预编译），无模型文件时零本地运行时成本
 
+## 检索（2026-08-15 升级）
+
+**中文分词（J1）**：tokenize 为「英文词 + [jieba](https://github.com/napi-rs/node-rs/tree/main/crates/jieba) 中文词 + 2-gram 兜底」
+并集——jieba 给真实词边界（修 2-gram 的"项目/项目偏"重叠歧义），2-gram 保证
+未登录词（OOV）的任意 2 字子串召回不丢（"项目偏好"中"目偏"仍可检索）；
+jieba 中文单字过滤（防稀释相关性分母）+ 输出去重。引擎 @node-rs/jieba
+（N-API 预编译，Windows 免编译工具链，默认词典随包）。
+
+**预分词列（J2）**：SQLite `content_tokens` 列存 jieba 词空格分隔（写入路径
+同步派生）——未来 5 万条规模建 FTS5 unicode61 索引的直接数据源（当前只写
+不读，YAGNI）。
+
+**性能**：tokenize 条目级缓存（R1，检索热路径零重建）+ 嵌入索引 10s 去抖
+持久化（R2，消灭 7MB 整写）+ RPC search 可选 workspace 过滤（R3）。
+
 ## 运维：记忆库备份
 
 记忆库存储为 **SQLite**（`~/.dsh/storages/memory.sqlite`，WAL 模式——结构性解决
