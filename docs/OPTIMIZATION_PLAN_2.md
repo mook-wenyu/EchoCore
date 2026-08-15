@@ -199,6 +199,35 @@ R2（结构性，代码）→ R3（测试基建，含 R2 全部回归）→ R4�
 - 本计划文档随阶段更新（实施记录）
 - 收尾：README / STATUS.md 更新
 
+## 7. 实施记录（2026-08-15，188 测试全绿）
+
+### 契约查证结果（实施前完成，非猜测）
+
+| 编号 | 结论 | 依据 |
+|------|------|------|
+| V5 | Cordis `ctx.plugin()` fiber "rejecting on config or startup errors"——apply 返回 rejected promise 即插件加载失败 | @deepseek-ai/cordis lib/types/registry.d.ts:117-120 |
+| V6 | inject 语义 "it only loads while all are available"——声明即必有，optional 守卫是死代码 | registry.d.ts:57 |
+| V7 | `KvTable.update` 缺失 key rejects `DomainError('missing-key')`；后端失败以 StorageError 原样传播不重包 | dsh-storage-domain domain.d.ts:73、error.d.ts:22-24 |
+| V8 | `ToolRunContext.agent?: Agent` 类型可选；工具执行路径必有 agent（无 agent 原生直调被拒） | dsh-tools index.d.ts:207,214 |
+| V9 | dsh-tools schema `required?: true` 是可选标注，非强制 | dsh-tools schema.d.ts:73-75 |
+| V10 | client.test 只测 createMemoryApi 纯逻辑；MemoryPanel 组件渲染依赖浏览器 DOM，测试环境无 jsdom | client.test.ts 现状 |
+
+### 阶段提交
+
+| 阶段 | 提交 | 要点 |
+|------|------|------|
+| 计划 | （文档） | 本计划 + 六项用户裁决 |
+| R2 | （refactor） | B1 装配上抛（apply 返回 promise）；B2 异常语义（DomainError missing-key 精确转换，其余上抛）；B3 connection 守卫删除（双处）；B4 配置解析边界（ResolvedConfig，删 `??` 死分支）；B5 sessionIdOf 缺失即抛；B6 mergedWithId 语义修正；B7 render.ts 渲染单源；B8 snapshot 常量复用；M2 config minimum:1；M3 平衡 JSON 扫描；M4 倒序遍历；B9 失败语义注释（数据不丢，重复 LLM 调用是完整性优先成本）；M1 复核修正（getById 同步读，20 条窗口无性能问题，保留重读语义并注释防误伤）；M5 bind 强转删除（类型自然兼容）；M6 记录不实施（YAGNI） |
+| R3 | （test） | FakeCtx 五合一入 helpers（多监听 Set/服务注册表/effect 收集/tools 捕获/logger 收集）；FakeTable failNextWrite 失败注入 + DomainError missing-key；index.test（inject 契约/装配/卸载/B1 上抛）；memory-domain.test（schema 拒绝非法枚举/负数重要度——发现真实缺陷：schema 无 importance 边界，已修 min 0 max 10）；client.test connection 缺失语义更新（TypeError 契约违例）；R3-5 降级记录（组件渲染依赖 DOM）；R3-6 复核（条件守卫均有 expect 先行，O7 已处理） |
+| R4 | 1d787e8 | source 完整性防线（isSourceWellFormed + search/listRecent 过滤 + 装配层告警回调）；注入声明强化（"可能过时或被覆盖"）；注入隔离钉住测试（R4-3） |
+| R5 | （docs） | README 去重/测试数/安全声明；本实施记录；STATUS.md |
+
+### 未决项（记录，不在本期）
+
+- R3-5 MemoryPanel 组件渲染测试：依赖浏览器 DOM（jsdom/testing-library），测试环境未引入——组件渲染层保持人工真机验证（部署清单已含面板实测）；
+- M6 字段双源（types.ts 与 zod schema）：字段级派生收益低，YAGNI 记录；
+- 记忆投毒强防线（来源绑定加密签名/运行时校验）依论文（MemPoison/SMSR/Injection-Execution Dissociation）列为后续演进候选——本地单用户场景当前轻量加固已覆盖主向量。
+
 ## 参考来源
 
 - 论文：MemPoison（arXiv:2607.14651）；SMSR（arXiv:2606.12703）；Injection–Execution Dissociation（arXiv:2605.08442）
