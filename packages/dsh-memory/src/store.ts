@@ -16,7 +16,7 @@
 import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 import { cosine } from './embedding.js'
-import { relevanceScore, rrfScore, scoreEntry, timeImportanceFactor, tokenize } from './scoring.js'
+import { relevanceScore, rrfScore, timeImportanceFactor, tokenize } from './scoring.js'
 import {
   dedupKeyOf,
   newMemoryId,
@@ -143,13 +143,22 @@ export class MemoryStore {
    * - update（tags 白名单可变更 → tokenize 输入变化）→ 删该 id；
    * - create 合并路径不改 content（tokenize 输入不变）→ 缓存保持有效；
    * - archive/markSuperseded 不改 content → 缓存保持有效。
+   * M7（2026-08-16）：上限保护——缓存超限且未命中时整体清空重建
+   * （防 10 万条规模无界内存：每条 token Set ≈ 1-1.5KB，超限清空代价
+   * 一次全量重建 vs 常驻 100-150MB）。
    */
   private readonly entryTokenCache = new Map<string, Set<string>>()
+  /** M7：缓存条数上限（超限未命中 → 整体清空重建） */
+  private static readonly TOKEN_CACHE_MAX = 5000
 
   /** R1：取条目 token 集合（缓存命中返回；未命中计算并缓存） */
   private cachedTokens(entry: MemoryEntry): Set<string> {
     let tokens = this.entryTokenCache.get(entry.id)
     if (tokens === undefined) {
+      if (this.entryTokenCache.size >= MemoryStore.TOKEN_CACHE_MAX) {
+        // M7：超限清空（下次检索全量重建；防止随库增长无界常驻）
+        this.entryTokenCache.clear()
+      }
       tokens = new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
       this.entryTokenCache.set(entry.id, tokens)
     }
@@ -451,6 +460,10 @@ export class MemoryStore {
       const key = `${entry.sessionId}::${entry.id}`
       const last = this.lastTrackedAt.get(key)
       if (last !== undefined && now - last < ACCESS_TRACK_WINDOW_MS) continue
+      // M7：节流表上限（只增不减的键随库增长无界——超限清空，节流失效一次无碍）
+      if (this.lastTrackedAt.size >= MemoryStore.TOKEN_CACHE_MAX) {
+        this.lastTrackedAt.clear()
+      }
       this.lastTrackedAt.set(key, now)
       void this.table
         .update(entry.id, (current) => ({

@@ -8,7 +8,6 @@ import { describe, expect, it } from 'vitest'
 import {
   adaptiveHalfLifeDays,
   importanceFactor,
-  memoryScore,
   MIN_RELEVANCE_SCORE,
   modulatedHalfLifeDays,
   recencyFactor,
@@ -16,11 +15,15 @@ import {
   rrfScore,
   SALIENCE_FLOOR_IMPORTANCE,
   SALIENCE_FLOOR_RECENCY,
-  scoreEntry,
   timeImportanceFactor,
   tokenize,
 } from '../src/scoring.ts'
 import { type MemoryEntry } from '../src/types.ts'
+
+/** 条目 token 集合（content+tags，M4：与 store 检索同源） */
+function tokensOf(entry: MemoryEntry): Set<string> {
+  return new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
+}
 
 /** 构造一个最小记忆条目（测试辅助） */
 function entry(overrides: Partial<MemoryEntry>): MemoryEntry {
@@ -184,29 +187,29 @@ describe('importanceFactor', () => {
   })
 })
 
-describe('memoryScore / scoreEntry', () => {
+describe('时间×重要性调制（原 memoryScore 语义，M4 统一为 timeImportanceFactor）', () => {
   const now = Date.parse('2026-01-15T00:00:00.000Z')
 
   it('无关条目得 0 分', () => {
     const e = entry({})
-    expect(scoreEntry(e, '完全无关的话题xyz', now)).toBe(0)
+    expect(relevanceScore(tokenize('完全无关的话题xyz'), tokensOf(e))).toBe(0)
   })
 
   it('相关且重要的条目得分更高（重要性调制）', () => {
     const low = entry({ id: 'a', importance: 1 })
     const high = entry({ id: 'b', importance: 10 })
-    expect(memoryScore(high, ['pnpm'], now)).toBeGreaterThan(memoryScore(low, ['pnpm'], now))
+    expect(timeImportanceFactor(high, now)).toBeGreaterThan(timeImportanceFactor(low, now))
   })
 
   it('更近访问的条目得分更高（时间衰减调制）', () => {
     const stale = entry({ id: 'a', lastAccessAt: '2025-01-01T00:00:00.000Z' })
     const fresh = entry({ id: 'b', lastAccessAt: '2026-01-14T00:00:00.000Z' })
-    expect(memoryScore(fresh, ['pnpm'], now)).toBeGreaterThan(memoryScore(stale, ['pnpm'], now))
+    expect(timeImportanceFactor(fresh, now)).toBeGreaterThan(timeImportanceFactor(stale, now))
   })
 
   it('标签参与相关性命中', () => {
     const tagged = entry({ tags: ['架构'] })
-    expect(scoreEntry(tagged, '架构', now)).toBeGreaterThan(0)
+    expect(relevanceScore(tokenize('架构'), tokensOf(tagged))).toBeGreaterThan(0)
   })
 })
 
@@ -233,7 +236,7 @@ describe('adaptiveHalfLifeDays（P3）', () => {
   })
 })
 
-describe('memoryScore 衰减增强（P3）', () => {
+describe('衰减增强调制（P3，timeImportanceFactor）', () => {
   const now = Date.parse('2026-01-15T00:00:00.000Z')
   const VERY_OLD = '2025-01-01T00:00:00.000Z' // 一年前
 
@@ -241,14 +244,14 @@ describe('memoryScore 衰减增强（P3）', () => {
     const high = entry({ id: 'a', importance: 9, lastAccessAt: VERY_OLD })
     const low = entry({ id: 'b', importance: 3, lastAccessAt: VERY_OLD })
     // 同 relevance（内容相同）；imp 9 半衰期 28 天 + floor，imp 3 半衰期 ~3.5 天无 floor
-    expect(memoryScore(high, ['pnpm'], now)).toBeGreaterThan(memoryScore(low, ['pnpm'], now))
+    expect(timeImportanceFactor(high, now)).toBeGreaterThan(timeImportanceFactor(low, now))
   })
 
   it('salience floor：importance ≥ 8 时时间因子被钳制（保活）', () => {
     const floored = entry({ id: 'a', importance: SALIENCE_FLOOR_IMPORTANCE, lastAccessAt: VERY_OLD })
     const below = entry({ id: 'b', importance: SALIENCE_FLOOR_IMPORTANCE - 1, lastAccessAt: VERY_OLD })
     // 一年远大于两者的半衰期：无 floor 时 recency ≈ 0（因子 0.6）；有 floor 时 recency=0.5（因子 0.8）
-    expect(memoryScore(floored, ['pnpm'], now)).toBeGreaterThan(memoryScore(below, ['pnpm'], now))
+    expect(timeImportanceFactor(floored, now)).toBeGreaterThan(timeImportanceFactor(below, now))
   })
 
   it('floor 常量语义：recency 下限 0.5 → 时间调制因子下限 0.8', () => {
@@ -270,7 +273,7 @@ describe('memoryScore 衰减增强（P3）', () => {
       lastAccessAt: '2026-01-10T00:00:00.000Z', // 5 天前（窗口内）
     })
     // active 保活（因子 ≥0.8），dormant 无 floor（因子可低于 active）
-    expect(memoryScore(active, ['pnpm'], now)).toBeGreaterThan(memoryScore(dormant, ['pnpm'], now))
+    expect(timeImportanceFactor(active, now)).toBeGreaterThan(timeImportanceFactor(dormant, now))
     // dormant 的时间因子无 floor：recency=exp(-ln2/28d×380d)≈极低 → 因子≈0.6+0.4×0≈0.6×importanceFactor
     const dormantFactor = timeImportanceFactor(dormant, now)
     expect(dormantFactor).toBeLessThan(0.8)
@@ -291,7 +294,7 @@ describe('memoryScore 衰减增强（P3）', () => {
   it('新近访问仍占优（自适应半衰期不逆转"新"优势）', () => {
     const fresh = entry({ id: 'a', importance: 9, lastAccessAt: '2026-01-14T00:00:00.000Z' })
     const old = entry({ id: 'b', importance: 9, lastAccessAt: '2025-12-01T00:00:00.000Z' })
-    expect(memoryScore(fresh, ['pnpm'], now)).toBeGreaterThan(memoryScore(old, ['pnpm'], now))
+    expect(timeImportanceFactor(fresh, now)).toBeGreaterThan(timeImportanceFactor(old, now))
   })
 })
 
@@ -316,7 +319,7 @@ describe('modulatedHalfLifeDays（访问频率调制衰减，B2）', () => {
     const VERY_OLD = '2025-01-01T00:00:00.000Z' // 一年前
     const visited = entry({ id: 'a', importance: 5, lastAccessAt: VERY_OLD, accessCount: 15 })
     const ignored = entry({ id: 'b', importance: 5, lastAccessAt: VERY_OLD, accessCount: 0 })
-    expect(memoryScore(visited, ['pnpm'], now)).toBeGreaterThan(memoryScore(ignored, ['pnpm'], now))
+    expect(timeImportanceFactor(visited, now)).toBeGreaterThan(timeImportanceFactor(ignored, now))
   })
 })
 

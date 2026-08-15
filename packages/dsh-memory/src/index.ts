@@ -101,10 +101,17 @@ export async function mountMemory(
   const table = new SqliteKvTable<MemoryEntry>(db, MEMORY_TABLE, (entry) => jiebaWords(entry.content).join(' '))
   if (table.size === 0) {
     const legacyFile = overrides.legacyJsonFile ?? legacyMemoryJsonFile()
-    const { migrated, skipped } = await migrateMemoryJson(legacyFile, table, (raw) =>
+    const { migrated, skipped, corrupt } = await migrateMemoryJson(legacyFile, table, (raw) =>
       memoryEntrySchema.safeParse(raw).success,
     )
-    if (migrated > 0 || skipped > 0) {
+    if (corrupt) {
+      // D2：旧文件 JSON 损坏——记录告警并改名 .bak 保留，插件以空库启动
+      // （与 embed-index 损坏降级语义对齐；坏文件可人工恢复）
+      logger.warn(`[dsh-memory] 旧记忆库 ${legacyFile} 已损坏（JSON 解析失败）——以空库启动，坏文件改名 .bak 保留`)
+      await rename(legacyFile, `${legacyFile}.bak`).catch(() => {
+        logger.warn('[dsh-memory] 损坏文件改名 .bak 失败（保留原位置）')
+      })
+    } else if (migrated > 0 || skipped > 0) {
       logger.info(`[dsh-memory] 记忆库已迁移至 SQLite：${migrated} 条导入，${skipped} 条跳过（原 memory.json 已改名 .bak 保留）`)
       // 原文件改名保留（迁移完成后旧文件不再作为数据源——防重复迁移）
       await rename(legacyFile, `${legacyFile}.bak`).catch(() => {

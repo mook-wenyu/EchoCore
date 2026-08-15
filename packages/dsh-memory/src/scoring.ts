@@ -244,22 +244,7 @@ function isRecentlyActive(entry: MemoryEntry, now: number): boolean {
 }
 
 /**
- * 综合评分（0..1）：相关性主导，时间衰减与重要性为调制因子。
- * 结果确定可单测。
- */
-export function memoryScore(entry: MemoryEntry, queryTokens: string[], now: number): number {
-  const entryTokens = new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
-  const relevance = relevanceScore(queryTokens, entryTokens)
-  if (relevance <= 0) return 0
-  return relevance * timeImportanceFactor(entry, now)
-}
-
-/** 便捷入口：从原始查询文本与条目直接计算综合评分 */
-export function scoreEntry(entry: MemoryEntry, query: string, now: number): number {
-  return memoryScore(entry, tokenize(query), now)
-}
-
-/** RRF 平滑常数（业界标准 k=60：cuuun/lin 2019，RRF 论文推荐） */
+ * RRF 平滑常数（业界标准 k=60：cuuun/lin 2019，RRF 论文推荐） */
 const RRF_K = 60
 
 /**

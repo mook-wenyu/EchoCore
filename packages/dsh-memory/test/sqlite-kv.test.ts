@@ -132,6 +132,38 @@ describe('SqliteKvTable', () => {
     db.close()
     rmSync(join(path, '..'), { recursive: true, force: true })
   })
+
+  it('D1 写链失败自恢复：单条写失败不卡死后续链，且计数可观测', async () => {
+    const path = tmpDbPath()
+    const db = new DatabaseSync(path)
+    const table = new SqliteKvTable<{ id: string; n: number }>(db)
+    await table.put('a', { id: 'a', n: 1 })
+    // 破坏链：注入一次失败（直接改内部——通过删除表使 upsert 抛错）
+    // 更可控的方式：用坏表名构造？——这里用「关闭 db 后写」模拟 I/O 失败
+    const before = table.writeFailures
+    // 注入失败：对已删除的数据库连接操作（db.close 后 put → run 抛错）
+    // 但 close 后无法恢复——改用「删除表」触发 run 抛错
+    db.exec('DROP TABLE entries')
+    await expect(table.put('b', { id: 'b', n: 2 })).rejects.toThrow()
+    // 计数已累加
+    expect(table.writeFailures).toBe(before + 1)
+    // 链未卡死：重建表后后续写仍落盘
+    db.exec('CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, value TEXT NOT NULL, content_tokens TEXT)')
+    await table.put('c', { id: 'c', n: 3 })
+    const row = db.prepare('SELECT value FROM entries WHERE id = ?').get('c') as { value: string }
+    expect(JSON.parse(row.value)).toEqual({ id: 'c', n: 3 })
+    db.close()
+    rmSync(join(path, '..'), { recursive: true, force: true })
+  })
+
+  it('M1 busy_timeout 显式 5000（多进程并发写有重试窗口）', () => {
+    const path = tmpDbPath()
+    const { db } = setup(path)
+    const timeout = (db.prepare('PRAGMA busy_timeout').get() as { timeout: number }).timeout
+    expect(timeout).toBe(5000)
+    db.close()
+    rmSync(join(path, '..'), { recursive: true, force: true })
+  })
 })
 
 void DomainError

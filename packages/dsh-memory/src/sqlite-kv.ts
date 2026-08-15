@@ -32,23 +32,31 @@ import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
  * SQLite 表。幂等语义：由调用方保证"表为空才迁移"；坏记录（校验失败）
  * 跳过并计数——绝不因单条坏数据中断整体迁移（迁移是一次性启动路径，
  * 坏条目保留在 .bak 原文件中可追溯）。
+ * D2（2026-08-16 风险修复）：**整个文件 JSON 损坏**（SyntaxError）不阻断
+ * 插件启动——返回 corrupt 标记，调用方记录告警并把坏文件改名 .bak 保留，
+ * 插件以空库启动（与 embed-index 损坏降级语义对齐；坏文件可人工恢复）。
  * @param jsonPath memory.json 绝对路径（不存在 = 无迁移）
  * @param table 目标 SqliteKvTable（须为空表）
  * @param isValid 记录校验（memoryEntrySchema.safeParse）
- * @returns 迁移数（坏记录计入 skipped）
+ * @returns 迁移数（坏记录计入 skipped；文件损坏 corrupt=true）
  */
 export async function migrateMemoryJson<V>(
   jsonPath: string,
   table: SqliteKvTable<V>,
   isValid: (raw: unknown) => boolean,
-): Promise<{ migrated: number; skipped: number }> {
+): Promise<{ migrated: number; skipped: number; corrupt: boolean }> {
   let raw: string
   try {
     raw = await readFile(jsonPath, 'utf8')
   } catch {
-    return { migrated: 0, skipped: 0 } // 无旧文件 = 首次全新启动
+    return { migrated: 0, skipped: 0, corrupt: false } // 无旧文件 = 首次全新启动
   }
-  const document = JSON.parse(raw) as { tables?: { entries?: Record<string, unknown> } }
+  let document: { tables?: { entries?: Record<string, unknown> } }
+  try {
+    document = JSON.parse(raw) as { tables?: { entries?: Record<string, unknown> } }
+  } catch {
+    return { migrated: 0, skipped: 0, corrupt: true } // 整文件损坏：调用方降级处理
+  }
   const entries = document.tables?.entries ?? {}
   let migrated = 0
   let skipped = 0
@@ -60,7 +68,7 @@ export async function migrateMemoryJson<V>(
     await table.put(id, record as V)
     migrated++
   }
-  return { migrated, skipped }
+  return { migrated, skipped, corrupt: false }
 }
 
 /** 值 JSON 序列化（SQLite 存 TEXT；对象形态仅存在于内存权威态） */
@@ -106,6 +114,10 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
   ) {
     // WAL：写事务日志追加（~4MB checkpoint），主库不重写——O(1) 写的前提
     this.db.exec('PRAGMA journal_mode = WAL')
+    // M1（2026-08-16 风险修复）：busy_timeout 默认 0——多进程/并发写立即
+    // SQLITE_BUSY 无重试窗口（SQLite 官方论坛确认 fair 默认 20 年未改）。
+    // 显式 5s 等待窗口：单实例不触发（无竞争），多实例/维护撞车时有重试余地。
+    this.db.exec('PRAGMA busy_timeout = 5000')
     this.db.exec(
       `CREATE TABLE IF NOT EXISTS "${tableName}" (id TEXT PRIMARY KEY, value TEXT NOT NULL, content_tokens TEXT)`,
     )
@@ -174,9 +186,30 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
     }).then(() => next)
   }
 
-  /** 写链入队（串行持久化；任务失败沿 promise 上抛——非吞错） */
+  /**
+   * 写链入队（串行持久化）。
+   * D1（2026-08-16 风险修复）：任务失败**不卡死后续链**——失败当刻计数并
+   * 重新上抛（本次调用方可感知），下一次 enqueue 经 rejection 分支接续执行
+   * 后续任务。否则一次 I/O 失败（磁盘满/锁）会让链永久 rejected、后续持久化
+   * 全部丢失（内存权威 Map 已更新——重启回滚断点前数据的隐蔽数据丢失路径）。
+   */
   private enqueue(task: () => void): Promise<void> {
-    this.chain = this.chain.then(task)
+    const run = () => {
+      try {
+        task()
+      } catch (error) {
+        this.writeFailuresValue++
+        throw error
+      }
+    }
+    this.chain = this.chain.then(run, run)
     return this.chain
   }
+
+  /** D1：写链累计失败次数（调用方/状态工具可观测；计数单调不归零） */
+  get writeFailures(): number {
+    return this.writeFailuresValue
+  }
+
+  private writeFailuresValue = 0
 }

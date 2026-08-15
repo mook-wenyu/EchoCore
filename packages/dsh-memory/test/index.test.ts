@@ -202,6 +202,26 @@ describe('插件组合根（index.ts）', () => {
     rmSync(store.dir, { recursive: true, force: true })
   })
 
+  it('D2 迁移坏 JSON：不阻断插件启动（告警 + .bak 保留 + 空库）', async () => {
+    const store = tmpStore()
+    // 整个文件 JSON 损坏（半截写入）
+    writeFileSync(store.jsonFile, '{"tables": {"entries": {"a": {"id": "a"', 'utf8')
+    const { ctx } = setup()
+    await mountMemory(ctx as never, { ...DEFAULTS } as never, { warn: () => {}, info: () => {} } as never, {
+      dbFile: store.dbFile,
+      legacyJsonFile: store.jsonFile,
+    })
+    // 插件正常启动（不拒绝）；坏文件改名 .bak 保留；库为空
+    expect(ctx.toolDefs.has('memory_recall')).toBe(true)
+    expect(await import('node:fs/promises').then((fs) => fs.access(`${store.jsonFile}.bak`).then(() => true).catch(() => false))).toBe(true)
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(store.dbFile)
+    const count = (db.prepare('SELECT COUNT(*) AS c FROM entries').get() as { c: number }).c
+    expect(count).toBe(0)
+    db.close()
+    await cleanup(ctx, store.dir)
+  })
+
   it('装配成功后 store 可写可查（六工具注册）', async () => {
     const store = tmpStore()
     const { ctx } = setup()
