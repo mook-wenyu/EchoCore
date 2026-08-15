@@ -29,6 +29,13 @@ describe('Config 默认值', () => {
     expect(config.enableExtractor).toBe(true)
     expect(config.enableMaintenance).toBe(true)
     expect(config.maintenanceIntervalHours).toBe(6)
+    // 嵌入默认（删除 embeddingEnabled 后：无开关，远程默认未配置）
+    expect('embeddingEnabled' in config).toBe(false)
+    expect(config.embeddingApiBaseUrl).toBe('')
+    expect(config.embeddingApiKey).toBe('')
+    expect(config.embeddingModel).toBe('')
+    expect(config.embeddingDimension).toBe(1024)
+    expect(config.embeddingModelDir).toBe('')
   })
 
   it('防回归：schema 默认值与 DEFAULTS 单源一致（字段存于 dict，default 存于 meta.default——已查证 schemastery）', () => {

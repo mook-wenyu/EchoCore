@@ -48,9 +48,9 @@ export function apply(ctx: Context, config: ConfigType): Promise<void> {
   return mountMemory(ctx, resolved, logger)
 }
 
-/** 嵌入索引文件默认路径（与 memory.json 同数据目录） */
-function defaultEmbeddingsFile(): string {
-  return join(homedir(), '.dsh', 'storages', 'memory-embeddings.json')
+/** 嵌入索引文件路径（按维度隔离：本地 384 / 远程配置值——不同维度混用会使余弦失真） */
+function defaultEmbeddingsFile(dimension: number): string {
+  return join(homedir(), '.dsh', 'storages', `memory-embeddings-${dimension}.json`)
 }
 
 /** 嵌入模型目录默认路径（空配置时；含 onnx/model_quantized.onnx 与 tokenizer 文件） */
@@ -84,31 +84,48 @@ async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnT
     },
   )
 
-  // P4：语义嵌入（显式启用；初始化失败记录并保持关键词检索——嵌入是一等
-  // 状态（EmbeddingService.state），非静默兜底）
+  // 语义嵌入（默认启用：远程配置齐 → 远程优先；否则本地模型检测 → 本地；
+  // 都无 → disabled 正常禁用态）。初始化失败（后端存在但加载异常）记录并
+  // 保持关键词检索——嵌入是一等状态（EmbeddingService.state），非静默兜底。
   let embeddingService: EmbeddingService | undefined
   let embedIndex: EmbeddingIndex | undefined
-  if (config.embeddingEnabled) {
-    const modelDir = config.embeddingModelDir !== '' ? config.embeddingModelDir : defaultEmbeddingModelDir()
-    embeddingService = new EmbeddingService({ enabled: true, modelDir })
-    embedIndex = new EmbeddingIndex({
-      file: defaultEmbeddingsFile(),
-      service: embeddingService,
-      listAll: () => store.listRecent(Number.MAX_SAFE_INTEGER),
-      logWarn: (message, error) => logger.warn(message, error),
-    })
-    try {
-      await embeddingService.init()
+  const modelDir = config.embeddingModelDir !== '' ? config.embeddingModelDir : defaultEmbeddingModelDir()
+  // 远程配置齐判定：baseUrl/apiKey/model 三项全非空（dimension 有默认值）
+  const remoteConfigured =
+    config.embeddingApiBaseUrl !== '' && config.embeddingApiKey !== '' && config.embeddingModel !== ''
+  embeddingService = new EmbeddingService({
+    modelDir,
+    remote: remoteConfigured
+      ? {
+          baseUrl: config.embeddingApiBaseUrl,
+          apiKey: config.embeddingApiKey,
+          model: config.embeddingModel,
+          dimension: config.embeddingDimension,
+        }
+      : undefined,
+  })
+  try {
+    await embeddingService.init()
+    if (embeddingService.state === 'ready') {
+      // 索引文件按后端维度隔离（本地 384 / 远程配置值）——不同维度不得混用
+      embedIndex = new EmbeddingIndex({
+        file: defaultEmbeddingsFile(embeddingService.dimension),
+        service: embeddingService,
+        listAll: () => store.listRecent(Number.MAX_SAFE_INTEGER),
+        logWarn: (message, error) => logger.warn(message, error),
+      })
       await embedIndex.load()
       // 全量补齐缺失嵌入（后台；~1.2s/1260 条，不阻塞装配完成）
       void embedIndex.ensureAll()
-      logger.info(`[dsh-memory] 语义嵌入已就绪（模型：${modelDir}）`)
-    } catch (error) {
-      if (error instanceof EmbeddingUnavailableError) {
-        logger.error(`[dsh-memory] ${error.message}（检索保持关键词模式；可用 scripts/download-embedding-model.mjs 下载模型后重启）`)
-      } else {
-        throw error
-      }
+      logger.info(`[dsh-memory] 语义嵌入已就绪（后端：${embeddingService.backendLabel}，维度：${embeddingService.dimension}）`)
+    } else {
+      logger.info('[dsh-memory] 语义嵌入未启用：无远程配置且无本地模型（关键词检索）')
+    }
+  } catch (error) {
+    if (error instanceof EmbeddingUnavailableError) {
+      logger.error(`[dsh-memory] ${error.message}（检索保持关键词模式）`)
+    } else {
+      throw error
     }
   }
 

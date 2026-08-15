@@ -19,16 +19,15 @@ import { dirname } from 'node:path'
 
 import type { MemoryEntry } from './types.js'
 
-/** 索引文件内嵌的维度校验（防手工编辑损坏产生垃圾向量） */
-export const EMBEDDING_DIMENSION = 384
-
 /** 嵌入索引依赖 */
 export interface EmbeddingIndexDeps {
-  /** 索引文件绝对路径（JSON：{ [id]: number[] }） */
+  /** 索引文件绝对路径（JSON：{ [id]: number[] }；装配层按后端维度隔离命名） */
   file: string
-  /** 嵌入服务（state==='ready' 才调用 embed） */
+  /** 嵌入服务（state==='ready' 才调用 embed；dimension = 后端输出维度，动态校验用） */
   service: {
     state: string
+    /** 后端输出维度（本地 384 / 远程配置值）——索引校验与持久化按此维度 */
+    dimension: number
     embed(text: string): Promise<Float32Array>
   }
   /** 全量构建取数（listRecent(超大 limit) 语义 = 全量 active 列表） */
@@ -69,7 +68,7 @@ export class EmbeddingIndex {
     for (const [id, vector] of Object.entries(parsed)) {
       if (
         Array.isArray(vector) &&
-        vector.length === EMBEDDING_DIMENSION &&
+        vector.length === this.deps.service.dimension &&
         vector.every((n) => typeof n === 'number' && Number.isFinite(n))
       ) {
         this.vectors.set(id, vector as number[])

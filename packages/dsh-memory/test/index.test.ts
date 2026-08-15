@@ -13,6 +13,31 @@ import { describe, expect, it, vi } from 'vitest'
 import { apply, inject } from '../src/index.js'
 import { FakeCtx, FakeTable } from './helpers.js'
 
+/**
+ * mock 嵌入服务为"禁用态"（无模型无远程的正常态）——装配测试关注组合根
+ * 接线与失败传播，不加载真实 ONNX 模型（22MB，环境依赖）；ready 分支的
+ * 索引构建由 embedding.test.ts 的 EmbeddingIndex 测试独立覆盖。
+ * EmbeddingUnavailableError 保留真实类（装配层 instanceof 判定）。
+ */
+vi.mock('../src/embedding.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/embedding.js')>()
+  return {
+    ...actual,
+    EmbeddingService: class {
+      state = 'disabled'
+      dimension = 384
+      backendLabel = 'local'
+      async init(): Promise<void> {}
+      async embed(): Promise<Float32Array> {
+        throw new Error('mock 嵌入未就绪（index.test 不测 ready 路径）')
+      }
+      async embedMany(): Promise<Float32Array[]> {
+        throw new Error('mock 嵌入未就绪（index.test 不测 ready 路径）')
+      }
+    },
+  }
+})
+
 /** 假 storageDomain：可注入 open 失败；记录 open 调用与 close disposer */
 class FakeStorageDomain {
   opened = 0

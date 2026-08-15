@@ -42,38 +42,136 @@ describe('cosine', () => {
   })
 })
 
-describe('EmbeddingService 状态机', () => {
-  /** 假 pipeline（不加载真实模型） */
-  function fakePipeline() {
+describe('EmbeddingService 状态机（远程优先回退本地）', () => {
+  /** 假本地后端：384 维（首位=文本长度，其余 0） */
+  function fakeLocalBackend() {
     return {
-      async call(_text: string) {
-        return { data: new Float32Array([1, 0]) }
+      async embed(text: string) {
+        const v = new Float32Array(384)
+        v[0] = text.length
+        return v
       },
     }
   }
 
-  it('禁用时 state=disabled 且 embed 抛 EmbeddingUnavailableError', async () => {
-    const service = new EmbeddingService({ enabled: false, modelDir: '/nonexistent' })
-    await service.init()
+  /** 假远程调用：按配置维度返回全 1 向量 */
+  function fakeRemote(input: string[], config: { dimension: number }) {
+    return Promise.resolve(
+      input.map(() => {
+        const v = new Float32Array(config.dimension)
+        v.fill(1)
+        return v
+      }),
+    )
+  }
+
+  const remoteConfig = { baseUrl: 'https://api.example.com/v1', apiKey: 'k', model: 'm', dimension: 512 }
+
+  it('无远程配置且无本地模型 → disabled（正常禁用态，不抛错）', async () => {
+    const service = new EmbeddingService({
+      modelDir: '/nonexistent',
+      hasLocalModel: async () => false,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: fakeRemote,
+    })
+    await expect(service.init()).resolves.toBeUndefined()
     expect(service.state).toBe('disabled')
     await expect(service.embed('任意文本')).rejects.toThrow('语义嵌入不可用')
   })
 
-  it('启用但模型加载失败 → state=error 且抛 EmbeddingUnavailableError', async () => {
-    // 模型目录不存在 → pipeline 加载失败（allowRemoteModels=false 下无远程回退）
-    const service = new EmbeddingService({ enabled: true, modelDir: 'C:/不存在目录/embedding-model' })
+  it('无远程配置 + 本地模型存在 → ready(local)，dimension=384', async () => {
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: fakeRemote,
+    })
+    await service.init()
+    expect(service.state).toBe('ready')
+    expect(service.dimension).toBe(384)
+    const v = await service.embed('测试')
+    expect(v).toHaveLength(384)
+  })
+
+  it('远程配置齐 + 远程验证成功 → ready(remote)，dimension=配置值（远程优先）', async () => {
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      remote: remoteConfig,
+      hasLocalModel: async () => true, // 本地也有，但远程优先
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: fakeRemote,
+    })
+    await service.init()
+    expect(service.state).toBe('ready')
+    expect(service.dimension).toBe(512)
+    const v = await service.embed('测试')
+    expect(v).toHaveLength(512)
+  })
+
+  it('远程验证失败 + 本地模型存在 → 自动回退 ready(local)', async () => {
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      remote: remoteConfig,
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: async () => {
+        throw new Error('网络不可达')
+      },
+    })
+    await service.init()
+    expect(service.state).toBe('ready')
+    expect(service.dimension).toBe(384)
+    const v = await service.embed('测试')
+    expect(v).toHaveLength(384)
+  })
+
+  it('远程验证失败且本地无模型 → disabled（关闭，记录原因不抛错）', async () => {
+    const service = new EmbeddingService({
+      modelDir: '/nonexistent',
+      remote: remoteConfig,
+      hasLocalModel: async () => false,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: async () => {
+        throw new Error('401 Unauthorized')
+      },
+    })
+    await service.init()
+    expect(service.state).toBe('disabled')
+  })
+
+  it('本地模型存在但加载失败 → error（模型损坏是异常，区别于无模型）', async () => {
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      hasLocalModel: async () => true,
+      loadLocalBackend: async () => {
+        throw new Error('onnx 文件损坏')
+      },
+      fetchRemoteEmbeddings: fakeRemote,
+    })
     await expect(service.init()).rejects.toThrow('语义嵌入初始化失败')
     expect(service.state).toBe('error')
   })
 
-  it('就绪后可嵌入（注入假 pipeline 验证调用形态）', async () => {
-    // 通过子类注入假 pipeline（load 是私有方法——用原型替换）
-    const service = new EmbeddingService({ enabled: true, modelDir: '/tmp/models' })
-    const original = EmbeddingService.prototype
-    // 直接验证状态门控：未 init 前 embed 抛错
-    await expect(service.embed('x')).rejects.toThrow('语义嵌入不可用')
-    void original
-    void fakePipeline
+  it('运行期远程 embed 失败 → 回退本地后端重试成功', async () => {
+    let remoteCalls = 0
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      remote: remoteConfig,
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: async (input, config) => {
+        remoteCalls++
+        if (remoteCalls === 1) return fakeRemote(input, config) // 初始化验证成功
+        throw new Error('网络抖动')
+      },
+    })
+    await service.init()
+    expect(service.state).toBe('ready')
+    expect(service.dimension).toBe(512)
+    // 首次 embed 远程失败 → 回退本地成功（维度切换为 384）
+    const v = await service.embed('测试')
+    expect(v).toHaveLength(384)
+    expect(service.dimension).toBe(384)
   })
 })
 
@@ -156,6 +254,7 @@ describe('EmbeddingIndex', () => {
     const warns: string[] = []
     const service = {
       state: 'ready',
+      dimension: 384,
       // 384 维假向量：首位 = 文本长度（通过维度校验）
       embed: async (text: string) => {
         const v = new Float32Array(384)
@@ -196,7 +295,7 @@ describe('EmbeddingIndex', () => {
     }
     const reloaded = new EmbeddingIndex({
       file,
-      service: { state: 'ready', embed: async () => new Float32Array(384) },
+      service: { state: 'ready', dimension: 384, embed: async () => new Float32Array(384) },
       listAll: () => [],
       logWarn: () => {},
     })
@@ -234,6 +333,7 @@ describe('EmbeddingIndex', () => {
       file,
       service: {
         state: 'ready',
+        dimension: 384,
         embed: async (text: string) => {
           await new Promise((resolve) => setTimeout(resolve, 20))
           const v = new Float32Array(384)

@@ -39,10 +39,16 @@ export const DEFAULTS = {
   snapshotBudgetChars: 8192,
   /** 稳定快照 Top-K 候选上限（预算之外的保险，防止单 workspace 记忆过多时全表扫描） */
   snapshotTopK: 30,
-  /** 语义嵌入检索总开关（P4；默认关闭——模型文件与依赖体积是有意取舍，显式启用） */
-  embeddingEnabled: false,
-  /** 嵌入模型目录（含 ONNX 模型与 tokenizer 文件；空串 → 默认 ~/.dsh/storages/embedding-model） */
+  /** 本地嵌入模型目录（含 ONNX 模型与 tokenizer 文件；空串 → 默认 ~/.dsh/storages/embedding-model） */
   embeddingModelDir: '',
+  /** 远程嵌入 API base URL（OpenAI 兼容 /embeddings 端点；空串 = 未配置远程） */
+  embeddingApiBaseUrl: '',
+  /** 远程嵌入 API key（与 DSH/DeepSeek key 无关——DeepSeek 官方无 embeddings API，需另配供应商） */
+  embeddingApiKey: '',
+  /** 远程嵌入模型名（如 BAAI/bge-m3、Qwen/Qwen3-Embedding-0.6B） */
+  embeddingModel: '',
+  /** 远程嵌入维度（OpenAI 兼容生态无 384 维——bge-m3 固定 1024、Qwen3-0.6B 可 512/256/64；按供应商文档配置） */
+  embeddingDimension: 1024,
   /** 提取器总开关 */
   enableExtractor: true,
   /** 后台记忆整理任务开关（O8-M） */
@@ -75,10 +81,16 @@ export interface Config {
   snapshotBudgetChars?: number
   /** 稳定快照 Top-K 候选上限 */
   snapshotTopK?: number
-  /** 语义嵌入检索总开关（默认 false，显式启用） */
-  embeddingEnabled?: boolean
-  /** 嵌入模型目录（空串 → 默认 ~/.dsh/storages/embedding-model） */
+  /** 语义嵌入（默认自动启用：远程配置齐 → 远程；否则本地模型检测 → 本地；都无 → 禁用） */
   embeddingModelDir?: string
+  /** 远程嵌入 API base URL（OpenAI 兼容 /embeddings；空串 = 未配置远程） */
+  embeddingApiBaseUrl?: string
+  /** 远程嵌入 API key（需另配供应商，DeepSeek key 不可用于嵌入） */
+  embeddingApiKey?: string
+  /** 远程嵌入模型名 */
+  embeddingModel?: string
+  /** 远程嵌入维度（默认 1024=bge-m3；本地固定 384 不随此配置） */
+  embeddingDimension?: number
   /** 提取器总开关 */
   enableExtractor?: boolean
   /** 后台记忆整理任务开关 */
@@ -119,8 +131,15 @@ export const Config = z.transform(
     snapshotTtlMs: z.number().min(1000).default(DEFAULTS.snapshotTtlMs),
     snapshotBudgetChars: z.number().min(1).default(DEFAULTS.snapshotBudgetChars),
     snapshotTopK: z.number().min(1).default(DEFAULTS.snapshotTopK),
-    embeddingEnabled: z.boolean().default(DEFAULTS.embeddingEnabled),
     embeddingModelDir: z.string().default(DEFAULTS.embeddingModelDir),
+    /** 远程嵌入 base URL（OpenAI 兼容端点） */
+    embeddingApiBaseUrl: z.string().default(DEFAULTS.embeddingApiBaseUrl),
+    /** 远程嵌入 API key */
+    embeddingApiKey: z.string().default(DEFAULTS.embeddingApiKey),
+    /** 远程嵌入模型名 */
+    embeddingModel: z.string().default(DEFAULTS.embeddingModel),
+    /** 远程嵌入维度（正数；本地 384 不随此配置） */
+    embeddingDimension: z.number().min(1).default(DEFAULTS.embeddingDimension),
     enableExtractor: z.boolean().default(DEFAULTS.enableExtractor),
     enableMaintenance: z.boolean().default(DEFAULTS.enableMaintenance),
     /** 后台整理任务间隔（小时；R2-10/M2：最小 1，非法值由 schema 校验拒绝而非运行时夹逼） */
