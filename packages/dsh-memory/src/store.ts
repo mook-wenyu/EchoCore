@@ -15,7 +15,7 @@
 
 import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 
-import { scoreEntry } from './scoring.js'
+import { scoreEntry, tokenize } from './scoring.js'
 import {
   dedupKeyOf,
   newMemoryId,
@@ -45,7 +45,21 @@ export interface SearchOptions {
   minScore?: number
   /** 是否包含归档条目（默认否；与 status 互斥时以 status 为准） */
   includeArchived?: boolean
+  /** 是否包含被覆盖条目（D-A；默认否——被 superseded 的条目对检索隐藏，置真时可见用于审计） */
+  includeSuperseded?: boolean
 }
+
+/**
+ * D-A 后向引用判定阈值：新记忆与候选旧记忆的 token 集合 Jaccard 重合度 ≥ 该值且创建于其后，
+ * 则视为「新表述覆盖旧表述」，将旧条目标记 supersededBy。
+ */
+const JACCARD_SIMILARITY_THRESHOLD = 0.7
+
+/**
+ * 访问追踪节流窗口（毫秒）：同一「会话 + 记忆」在该窗口内最多落盘一次，
+ * 避免高频检索反复回写 lastAccessAt/accessCount（O6 性能）。
+ */
+const ACCESS_TRACK_WINDOW_MS = 60_000
 
 /** 创建时去重合并的合并结果描述（供审计 detail 使用） */
 export interface MergeOutcome {
@@ -65,14 +79,23 @@ export type NowFn = () => number
 export class MemoryStore {
   private readonly table: KvTable<string, MemoryEntry>
   private readonly now: NowFn
-  /** dedupKey → id 进程内索引（构造时从表重建） */
+  /**
+   * 去重索引：`workspace::kind::dedupKey` → id（进程内，构造时从表重建）。
+   * 键含 kind（O3）：同内容不同分类不再合并；键含 workspace：跨项目同内容不合并。
+   */
   private readonly byDedupKey = new Map<string, string>()
+  /**
+   * 访问追踪节流表：`sessionId::memoryId` → 上次落盘时刻（ms）。
+   * 内存 Map，键随条目数变化、量级可控（数百条 × 数十会话），KISS 不做上限重建；
+   * 记忆被归档后其键不再新增，空间可复用给新键。
+   */
+  private readonly lastTrackedAt = new Map<string, number>()
 
   constructor(table: KvTable<string, MemoryEntry>, now: NowFn = () => Date.now()) {
     this.table = table
     this.now = now
     for (const [, entry] of table.entries()) {
-      this.byDedupKey.set(entry.dedupKey, entry.id)
+      this.byDedupKey.set(dedupIndexKey(entry.workspace, entry.kind, entry.dedupKey), entry.id)
     }
   }
 
@@ -83,16 +106,20 @@ export class MemoryStore {
 
   /**
    * 新建或去重合并一条记忆。
-   * 同 workspace 且 dedupKey 相同时：合并来源事件序号、importance 取更大者、
-   * 追加 merge 审计，保留既有内容与 id。
+   * 合并（同 workspace 同 kind 同 dedupKey）：并集来源事件序号、importance 取更大者、
+   * excerpt 取【新来源】摘录（信息更新而非保留旧摘录）、追加 merge 审计，保留既有内容与 id。
+   * 新建（非合并，O3/D-A）：扫描同 workspace 同 kind 的 active 条目，Jaccard 重合度 ≥ 0.7
+   * 且创建不晚于新条目的，全部标记 supersededBy=新id、新条目 supersedes=其中最早创建者。
    */
   async create(input: NewMemoryInput): Promise<{ entry: MemoryEntry; outcome: MergeOutcome }> {
     const dedupKey = dedupKeyOf(input.content)
-    const existingId = this.byDedupKey.get(dedupKey)
+    // 归并索引粒度含 kind：跨分类的同内容不合并（O3）
+    const indexKey = dedupIndexKey(input.workspace, input.kind, dedupKey)
+    const existingId = this.byDedupKey.get(indexKey)
     if (existingId !== undefined) {
       const existing = this.table.get(existingId)
       // 归档守卫（O3/H6）：不与被归档条目合并——否则新信息被吞进不可见条目；
-      // 归档条目不占索引（此处相当于放行新建）。
+      // 归档条目不占索引（此处相当于放行新建）。被覆盖条目仍为 active，可正常合并。
       if (existing !== undefined && existing.workspace === input.workspace && existing.status === 'active') {
         const merged = await this.table.update(existingId, (current) => ({
           ...current,
@@ -100,6 +127,8 @@ export class MemoryStore {
           source: {
             ...current.source,
             eventSeqs: unionSeqs(current.source.eventSeqs, input.source.eventSeqs),
+            // 摘录取新来源：反映最新一次表述所在的原文上下文
+            excerpt: input.source.excerpt,
           },
           updatedAt: this.iso(),
           audit: [
@@ -117,8 +146,11 @@ export class MemoryStore {
     }
 
     const nowIso = this.iso()
+    const newId = newMemoryId()
+    // 候选扫描（新建路径）：标记被本次新表述覆盖的旧条目（可多条，一条新事实推翻多条旧表述）
+    const supersededTargets = this.findSupersededTargets(input, nowIso)
     const entry: MemoryEntry = {
-      id: newMemoryId(),
+      id: newId,
       workspace: input.workspace,
       sessionId: input.sessionId,
       kind: input.kind,
@@ -132,11 +164,48 @@ export class MemoryStore {
       lastAccessAt: nowIso,
       accessCount: 0,
       status: 'active',
+      // 覆盖了多条时取最早创建者作为直接覆盖引用（单字段，只指向最根基的一条）
+      supersedes: supersededTargets.length > 0 ? supersededTargets[0]!.id : undefined,
       audit: [{ action: 'create', at: nowIso, by: input.by }],
     }
     await this.table.put(entry.id, entry)
-    this.byDedupKey.set(dedupKey, entry.id)
+    this.byDedupKey.set(indexKey, entry.id)
+    // 已落库后再回写旧条目（避免未持久化的新条目被误判为候选）
+    for (const target of supersededTargets) {
+      await this.markSuperseded(target.id, entry.id, input.by)
+    }
     return { entry, outcome: { merged: false } }
+  }
+
+  /**
+   * 扫描被本次新建表述覆盖的旧条目（D-A 后向引用候选）。
+   * 条件：同 workspace 同 kind、active、tokenize 集合 Jaccard 重合度 ≥ 0.7、创建不晚于新条目。
+   * 返回按创建时间升序（同刻按 id 升序）排列的命中列表，供 supersedes 引用与逐条标记。
+   */
+  private findSupersededTargets(input: NewMemoryInput, nowIso: string): MemoryEntry[] {
+    const matched: MemoryEntry[] = []
+    for (const [, entry] of this.table.entries()) {
+      if (entry.workspace !== input.workspace) continue
+      if (entry.kind !== input.kind) continue
+      if (entry.status !== 'active') continue
+      // “创建不晚于新条目”：新建条目的 createdAt=now，所有既有条目皆早于或同时，恒真；
+      // 保留该判断以显式表达「只覆盖先于/同时存在的事实」语义（并发同刻创建时亦覆盖更早落库者）。
+      if (entry.createdAt > nowIso) continue
+      if (jaccardTokenSimilarity(entry.content, input.content) < JACCARD_SIMILARITY_THRESHOLD) continue
+      matched.push(entry)
+    }
+    matched.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+    return matched
+  }
+
+  /** 标记某旧条目被新条目覆盖：追加 supersede 审计（status 不变，仍 active，仅检索隐藏） */
+  private async markSuperseded(targetId: string, newId: string, by: AuditActor): Promise<void> {
+    await this.table.update(targetId, (current) => ({
+      ...current,
+      supersededBy: newId,
+      updatedAt: this.iso(),
+      audit: [...current.audit, { action: 'supersede' as const, at: this.iso(), by, detail: `被记忆 #${newId} 覆盖` }],
+    }))
   }
 
   /** 读一条（同步，内存权威态） */
@@ -144,8 +213,12 @@ export class MemoryStore {
     return this.table.get(id)
   }
 
-  /** 更新条目部分字段（追加 update 审计，更新时间戳） */
-  async update(id: string, patch: Partial<Pick<MemoryEntry, 'content' | 'kind' | 'importance' | 'tags'>>, by: AuditActor): Promise<MemoryEntry | undefined> {
+  /**
+   * 更新条目部分字段（追加 update 审计，更新时间戳）。
+   * 白名单【不含 content】（O3）：改正文必须走 create 新建条目——content 关联 dedupKey，
+   * 直接改 content 会使 dedupKey 索引与正文漂移、破坏去重。
+   */
+  async update(id: string, patch: Partial<Pick<MemoryEntry, 'kind' | 'importance' | 'tags'>>, by: AuditActor): Promise<MemoryEntry | undefined> {
     try {
       return await this.table.update(id, (current) => ({
         ...current,
@@ -178,7 +251,8 @@ export class MemoryStore {
    * - 有查询文本：综合评分降序（最低分过滤）；
    * - 无查询文本但有过滤条件：按创建时间倒序（工具浏览场景）；
    * - 两者皆无：空结果。
-   * 命中条目异步回写 lastAccessAt/accessCount（尽力而为，失败仅告警）。
+   * 默认排除被覆盖条目（D-A）；includeSuperseded 置真时可见。
+   * 命中条目节流回写 lastAccessAt/accessCount（O6，60s 窗口内同会话+记忆至多落盘一次）。
    */
   search(options: SearchOptions): MemoryEntry[] {
     const query = options.query.trim()
@@ -193,6 +267,8 @@ export class MemoryStore {
       } else if (entry.status !== 'active' && !(options.includeArchived && entry.status === 'archived')) {
         continue
       }
+      // D-A：默认隐藏被覆盖条目，仅审计（includeSuperseded）时放行
+      if (entry.supersededBy !== undefined && !(options.includeSuperseded ?? false)) continue
       if (options.kind !== undefined && entry.kind !== options.kind) continue
       if (options.tag !== undefined && !entry.tags.includes(options.tag)) continue
       if (options.workspace !== undefined && entry.workspace !== options.workspace) continue
@@ -204,7 +280,8 @@ export class MemoryStore {
       if (options.kind === undefined && options.tag === undefined && options.status === undefined && options.workspace === undefined) {
         return [] // 无查询也无过滤：不返回无差别结果
       }
-      matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      // 相同 createdAt 按 id 稳定排序（O3 tie-breaker），整体降序
+      matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
       top = matches.slice(0, limit)
     } else {
       const scored: Array<{ entry: MemoryEntry; score: number }> = []
@@ -216,8 +293,13 @@ export class MemoryStore {
       top = scored.slice(0, limit).map((item) => item.entry)
     }
 
-    // 访问追踪：异步回写，不阻塞检索调用方（注入/工具热路径）
+    // 访问追踪：节流 + 异步回写，不阻塞检索调用方（注入/工具热路径）
     for (const entry of top) {
+      // 每会话+每记忆 60s 窗口内仅落盘一次（O6），避免高频检索反复写盘
+      const key = `${entry.sessionId}::${entry.id}`
+      const last = this.lastTrackedAt.get(key)
+      if (last !== undefined && now - last < ACCESS_TRACK_WINDOW_MS) continue
+      this.lastTrackedAt.set(key, now)
       void this.table
         .update(entry.id, (current) => ({
           ...current,
@@ -231,24 +313,28 @@ export class MemoryStore {
     return top
   }
 
-  /** 某会话产出的全部条目（含归档；按创建时间升序） */
+  /** 某会话产出的全部条目（含归档与被覆盖；按创建时间升序，同刻按 id 稳定） */
   listBySession(sessionId: string): MemoryEntry[] {
     const result: MemoryEntry[] = []
     for (const [, entry] of this.table.entries()) {
       if (entry.sessionId === sessionId) result.push(entry)
     }
-    result.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    result.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
     return result
   }
 
-  /** 最近条目浏览（面板场景）：按创建时间倒序，可选状态过滤 */
-  listRecent(limit: number, status?: MemoryStatus): MemoryEntry[] {
+  /**
+   * 最近条目浏览（面板场景）：按创建时间倒序（同刻按 id 稳定），可选状态过滤。
+   * 默认排除被覆盖条目（D-A），includeSuperseded 置真时可见。
+   */
+  listRecent(limit: number, status?: MemoryStatus, includeSuperseded = false): MemoryEntry[] {
     const result: MemoryEntry[] = []
     for (const [, entry] of this.table.entries()) {
       if (status !== undefined && entry.status !== status) continue
+      if (entry.supersededBy !== undefined && !includeSuperseded) continue
       result.push(entry)
     }
-    result.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    result.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
     return result.slice(0, limit)
   }
 
@@ -272,4 +358,25 @@ export class MemoryStore {
 function unionSeqs(a: number[], b: number[]): number[] {
   const set = new Set<number>([...a, ...b])
   return [...set].sort((x, y) => x - y)
+}
+
+/** 去重索引键：`workspace::kind::dedupKey`，将合并粒度提升到「workspace + kind + 内容」（O3） */
+function dedupIndexKey(workspace: string, kind: MemoryKind, dedupKey: string): string {
+  return `${workspace}::${kind}::${dedupKey}`
+}
+
+/**
+ * 两段文本的 token 集合 Jaccard 重合度（交集大小 / 并集大小，范围 0..1）。
+ * 用于 D-A 后向引用：重合度越高越可能是同一表述的不同版本。
+ */
+function jaccardTokenSimilarity(a: string, b: string): number {
+  const setA = new Set(tokenize(a))
+  const setB = new Set(tokenize(b))
+  if (setA.size === 0 || setB.size === 0) return 0
+  let intersection = 0
+  for (const token of setA) {
+    if (setB.has(token)) intersection++
+  }
+  const union = setA.size + setB.size - intersection
+  return union === 0 ? 0 : intersection / union
 }
