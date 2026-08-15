@@ -12,10 +12,11 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 
-import { Config, type Config as ConfigType } from './config.js'
+import { Config, DEFAULTS, type Config as ConfigType } from './config.js'
 import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
 import { registerMemoryRpc } from './host-rpc.js'
 import { MemoryInjector, type InjectorConfig } from './injector.js'
+import { MemoryMaintenance, type MaintenanceConfig } from './maintenance.js'
 import { MEMORY_TABLE, memoryDomainSpec } from './memory-domain.js'
 import { registerSnapshot } from './snapshot.js'
 import { MemoryStore } from './store.js'
@@ -31,7 +32,10 @@ export const inject = ['storageDomain', 'llm', 'tools', 'connection']
 
 export function apply(ctx: Context, config: ConfigType): void {
   const logger = ctx.logger('memory')
-  void mountMemory(ctx, config, logger)
+  // O2-2：装配失败不再静默——resolved 拒绝必须上抛给宿主可见，方便定位领域打开/存储初始化问题
+  void mountMemory(ctx, config, logger).catch((error: unknown) => {
+    logger.error('[dsh-memory] 装配失败：', error)
+  })
 }
 
 /** 装配各模块：解析配置默认值 → 打开领域 → 构造存储与提取器 → 挂接生命周期 */
@@ -45,19 +49,21 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
   const store = new MemoryStore(domain.table(MEMORY_TABLE))
 
   // 提取器：双通道（压缩遮蔽 + 轮次增量），纯观察不阻塞主循环
+  // 默认值引用 DEFAULTS 单源（schemastery 加载即填充，?? 是死分支，仅作可读性保障）
   const extractorConfig: ExtractorConfig = {
-    enableExtractor: config.enableExtractor ?? true,
-    minExtractChars: config.minExtractChars ?? 2000,
-    extractMaxTokens: config.extractMaxTokens ?? 2048,
+    enableExtractor: config.enableExtractor ?? DEFAULTS.enableExtractor,
+    minExtractChars: config.minExtractChars ?? DEFAULTS.minExtractChars,
+    maxExtractChars: config.maxExtractChars ?? DEFAULTS.maxExtractChars,
+    extractMaxTokens: config.extractMaxTokens ?? DEFAULTS.extractMaxTokens,
   }
   new MemoryExtractor({ store, llm: ctx.llm, logger, config: extractorConfig }).install(ctx)
 
   // 注入器：pre-step 自动注入相关记忆（带预算、去重与溯源标记）
   const injectorConfig: InjectorConfig = {
-    enableAutoInject: config.enableAutoInject ?? true,
-    topK: config.topK ?? 8,
-    minScore: config.minScore ?? 0.15,
-    injectBudgetChars: config.injectBudgetChars ?? 16384,
+    enableAutoInject: config.enableAutoInject ?? DEFAULTS.enableAutoInject,
+    topK: config.topK ?? DEFAULTS.topK,
+    minScore: config.minScore ?? DEFAULTS.minScore,
+    injectBudgetChars: config.injectBudgetChars ?? DEFAULTS.injectBudgetChars,
   }
   new MemoryInjector({ store, logger, config: injectorConfig }).install(ctx)
 
@@ -69,6 +75,13 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
 
   // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面
   registerMemoryRpc(ctx, store, logger)
+
+  // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理；开关与间隔经配置
+  const maintenanceConfig: MaintenanceConfig = {
+    enableMaintenance: config.enableMaintenance ?? DEFAULTS.enableMaintenance,
+    maintenanceIntervalHours: config.maintenanceIntervalHours ?? DEFAULTS.maintenanceIntervalHours,
+  }
+  new MemoryMaintenance({ store, logger, config: maintenanceConfig, now: () => Date.now() }).install(ctx)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }
