@@ -186,14 +186,41 @@
 
 **验收**：新增测试全部通过；原 87 测试改造后全绿；覆盖率显著提升（目标：src 函数级 ≥85% 关键路径）。
 
-### O8 演进决策点（论文驱动，需用户裁决，本阶段只出方案不实现）
+### O8 演进决策点（已裁决 2026-08-15，含具体实现细节）
 
-| 决策点 | 选项 | 依据 |
-|--------|------|------|
-| D-A 矛盾裁决 | ① 读时排名（新内容自然高分，零成本，STALE 场景仍会并存注入）；② 写入时后向引用（新事实标记旧事实 superseded，检索时排除；实现 ~100 行）；③ 写时 LLM 裁决（最高质量，成本最高，写路径 LLM 调用） | Memory Write Policies 2026 收敛：②（写新+后向引用+读时重排） |
-| D-B 选择性遗忘 | ① 不做（现状：手动 archive）；② 自动降级（低访问+低重要+超龄 → 自动 archive，可配置阈值）；③ 后台整理任务（mc dreamer 式，成本高） | 经验跟随研究：选择性删除 +10%；智能衰减复合分 |
-| D-C 提取质量门 | ① 不做；② 规则门（长度/标识符保留率）；③ ROUGE 门（opencode-acp 式，重） | Faulty Memories：抽象节制优先于事后门 |
-| D-D restore 入口 | ① 删除 restore/hardDelete/deleted（YAGNI）；② 补 RPC restore + 面板按钮 | 无调用点现状 |
+| 决策点 | 裁决 | 实现落点 |
+|--------|------|---------|
+| D-A 矛盾裁决 | **后向引用标记**：新事实写入时给同类旧事实打 `superseded` 后向引用，检索时排除被覆盖条目 | 并入 **O3**（存储域） |
+| D-B 记忆整理 | **后台整理任务**（用户选择，非自动降级） | 新增 **O8-M 阶段**（独立实现，依赖 D-A 标记数据） |
+| D-C 提取质量 | **规则门**：prompt 强化 + 轻量规则校验（标识符保留率/长度下限） | 并入 **O1**（腐化防线） |
+| D-D restore 入口 | **删除** `restore`/`hardDelete`/`deleted` 状态（YAGNI；归档后需恢复时重建记忆，审计可溯源） | 并入 **O4**（接口收敛） |
+
+#### D-A 后向引用标记（并入 O3 的实现细节）
+
+- `MemoryEntry` 新增可选字段 `supersededBy?: string`（被哪条记忆覆盖）与 `supersedes?: string`（覆盖了谁，双向可查）；
+- 写入裁决（`store.create`，纯规则零 LLM）：
+  1. 命中同 workspace 同 kind 且 dedupKey 相同的 → 既有合并逻辑（保留）；
+  2. 新增 `supersedeCandidates(workspace, kind, content)`：同 workspace 同 kind 的 active 条目中，与 content **关键词重合度 ≥ 0.7**（复用 scoring.tokenize 的 Jaccard）且**创建时间早于新条目** → 标记 `supersededBy = newId`；
+  3. 被标记条目的 `status` 不变（仍 active，可被 audit 追问），仅检索/注入时**默认排除** `supersededBy !== undefined` 的条目；
+- 检索侧：`search`/`listRecent`/注入路径默认过滤 `supersededBy` 非空条目；`memory_search` 提供 `includeSuperseded: true` 选项供审计；
+- 追溯：被覆盖条目的 audit 追加 `{ action: 'supersede', detail: '被记忆 #xxx 覆盖' }`；`memory_audit` 展示 superseded 链；
+- 手动覆盖：`memory_note` 写"改用 X"类内容时同一规则生效（模型显式记录的新决策自然覆盖旧决策）；
+- 测试：`新决策覆盖旧决策（关键词重合≥0.7）`、`重合度不足不覆盖`、`检索默认排除被覆盖条目`、`includeSuperseded 可见`、`supersede 链审计`。
+
+#### D-B 后台整理任务（O8-M 阶段实现细节）
+
+- **目标**：定期回顾记忆库，合并重复、复核 supersede 标记、整理标签——对抗记忆膨胀与陈旧（论文：经验跟随/选择性删除 +10%；mc dreamer 同构）。
+- **触发**：进程内定时器，`maintenanceIntervalHours` 配置（默认 6 小时）+ 仅在**本进程有活跃会话事件后**才启动计时（无活动不跑，省成本）；运行窗口内按批次推进，可被会话事件打断（让出主循环）。
+- **执行者**：复用当前模型路由（与提取器一致，`resolveRoute` 从最近会话取；无路由则跳过本批）。
+- **每批任务集**（最小完备集，KISS）：
+  1. **合并重复**：同 workspace 同 kind 内，tokenize Jaccard ≥ 0.85 且重要度差距 ≤ 2 的条目对 → 保留新者（内容+高重要度+并集 eventSeqs），旧者 archive + 审计 `merge`；
+  2. **复核 supersede**：被 D-A 标记的条目中，若 supersededBy 条目已 archived → 解除标记（恢复可见，防误杀）；
+  3. **过期降级**：`updatedAt` 超 90 天 + `accessCount` 为 0 + 重要度 ≤ 3 的条目 → 自动 archive + 审计 `archive`（reason: stale）；
+  4. **标签整理**：同 workspace 内标签同义合并（精确匹配小写化后相同才合并，不做语义推断——防误合并）。
+- **批次预算**：每批最多 20 条候选 / 一次 LLM 调用（合并裁决经 LLM 输出严格 JSON，与提取同解析模式）；超时 60s 中断。
+- **并发与失败**：与提取器串行链**独立**（互不依赖）；store 写链天然串行；失败 warn + 下批重试（水位式推进，不无限重试同一候选）。
+- **开关**：`enableMaintenance: true` 默认开（低频低成本）；`maintenanceIntervalHours: 6`。
+- **测试**：`定时触发与活动门`、`合并重复对（≥0.85）`、`supersede 复核解除`、`过期降级条件`、`标签精确合并`、`LLM 解析失败收容`、`批预算截断`。
 
 ## 4. 待验证项（实施前必须查证，禁止猜测）
 
@@ -205,8 +232,9 @@
 ## 5. 执行顺序与依赖
 
 ```
-O1（腐化）→ O2（生命周期）→ O3（存储）→ O4（接口）→ O5（客户端）→ O6（性能）→ O7（测试加固）
-O8 决策点裁决后插入：D-A/D-B 影响 O1 与 O3 的实现细节，建议在 O3 前裁决
+O1（腐化防线，含 D-C 规则门）→ O2（生命周期）→ O3（存储，含 D-A 后向引用）
+→ O4（接口收敛，含 D-D 删除）→ O5（客户端）→ O6（性能）→ O7（测试加固）
+→ O8-M（后台整理任务，依赖 D-A 标记数据，最后实现）
 每阶段：先写失败测试 → 实现 → 全量测试 → git 提交（feat/fix/test 语义）
 ```
 
