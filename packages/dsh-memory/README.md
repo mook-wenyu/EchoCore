@@ -61,7 +61,7 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 | `maintenanceIntervalHours` | 6 | 后台整理间隔（小时；有会话活动后计时） |
 | `embeddingModelDir` | `~/.dsh/storages/embedding-model` | 本地嵌入模型目录（含 ONNX 与 tokenizer 文件） |
 | `embeddingApiBaseUrl` | `''` | 远程嵌入 API base URL（OpenAI 兼容 `/embeddings`；空串 = 未配置远程） |
-| `embeddingApiKey` | `''` | 远程嵌入 API key（供应商独立 key；DeepSeek 官方无 embeddings API） |
+| `embeddingApiKey` | `''` | 远程嵌入 API key——**字面 key 或 `env:NAME` 环境变量引用**（如 `env:SILICONFLOW_KEY`；DeepSeek 官方无 embeddings API，需另配供应商） |
 | `embeddingModel` | `''` | 远程嵌入模型名（如 `BAAI/bge-m3`、`Qwen/Qwen3-Embedding-0.6B`） |
 | `embeddingDimension` | 1024 | 远程嵌入维度（本地 384 不随此配置；按供应商文档声明） |
 
@@ -84,8 +84,16 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 node packages/dsh-memory/scripts/download-embedding-model.mjs
 # 远程（示例：硅基流动，国内直连；DeepSeek key 不可用于嵌入）
 # 组合行配置 embeddingApiBaseUrl: https://api.siliconflow.cn/v1
-#   embeddingApiKey: <硅基流动 key>  embeddingModel: BAAI/bge-m3  embeddingDimension: 1024
+#   embeddingApiKey: env:SILICONFLOW_KEY（或直接写字面 key）
+#   embeddingModel: BAAI/bge-m3  embeddingDimension: 1024
 ```
+
+### 记忆面板（设置页「记忆」）
+
+面板除搜索/列表/详情/归档外，底部提供**配置区块**（字段驱动表单，全部配置项
+可编辑）：修改后点「保存」——宿主经 `ctx.fiber.update` 整体校验（类型/边界/
+跨字段互斥）→ **写回 cordis.patch.yml 并重启插件**（毫秒级，记忆数据不丢）→
+新配置立即生效。apiKey 行展示解析状态（字面 key 或 `env:NAME` 引用是否可用）。
 
 - 嵌入索引按**后端维度隔离**持久化（`~/.dsh/storages/memory-embeddings-<dim>.json`，
   本地 384 / 远程配置值）——不同维度不得混用（余弦失真），切换后端自动换索引文件；

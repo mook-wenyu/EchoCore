@@ -20,7 +20,9 @@
 - **B2 频率调制**（cca7d8d）：半衰期 ×(1+log2(1+accessCount))，高频访问召回抬回（Elastic/FadeMem 模式）
 - **B3 评测基线**（2bcd2a5）：contradiction 显式测试（PersonaMem 风格：偏好变化/事实推翻/无关性）
 - **E1 嵌入默认启用**（24543bf）：删除 `embeddingEnabled` 开关——**远程优先 → 自动回退本地 → 都无则关闭**；新增远程 4 项配置（embeddingApiBaseUrl/ApiKey/Model/Dimension，OpenAI 兼容 /embeddings）；EmbeddingService 多后端（远程验证失败回退本地、运行期故障切本地重试）；EmbeddingIndex 动态维度 + 索引文件按维度隔离（memory-embeddings-<dim>.json，本地 384/远程配置值）；远程返回维度 ≠ 配置 → 显式报错防混维；index.test 嵌入 mock 化（533ms→15ms 确定性）
-- **接口契约变更**（累计）：`embeddingEnabled` 移除；`embeddingApiBaseUrl/ApiKey/Model/Dimension` 新增；EmbeddingIndexDeps.service 加 `dimension`；EmbeddingServiceDeps 改 `{modelDir, remote?, hasLocalModel?, loadLocalBackend?, fetchRemoteEmbeddings?}`
+- **E2 apiKey 双形态**（c1b4885）：embeddingApiKey 支持字面 key 与 `env:NAME` 环境变量引用（env: 前缀显式标记，resolveApiKey 纯函数，字面 key 不被环境变量劫持）
+- **E3 面板配置**（7d34588 + d759bb7）：RPC 端点 getConfig/setConfig（严格载荷校验：未知键/类型/越界/跨字段互斥拒绝；setConfig 经 `ctx.fiber.update` 整体校验 → 写回 cordis.patch.yml → 重启插件生效——Cordis 原生链路，数据不丢）；记忆面板底部配置区块（字段驱动 DRY 表单，19 项全可编辑，apiKey 解析状态展示，保存即生效）
+- **接口契约变更**（累计）：`embeddingEnabled` 移除；`embeddingApiKey` 恢复（字面/env:NAME）；EmbeddingIndexDeps.service 加 `dimension`；EmbeddingServiceDeps 改 `{modelDir, remote?, hasLocalModel?, loadLocalBackend?, fetchRemoteEmbeddings?}`；`createMemoryRpcHandler(store, rpc)`/`registerMemoryRpc(ctx, store, config)` 签名变更；MemoryPanelApi 加 getConfig/setConfig
 - **提交**：92a2725（PLAN4）→ d5a9eda（A1）→ 16a6677（A2）→ 2e20f1f（A3）→ 35911f6（A4）→ 8d4a36f（B1）→ cca7d8d（B2）→ 2bcd2a5（B3）→ 本轮文档
 
 ## 三、已知风险点（诚实自曝）
@@ -33,8 +35,8 @@
 
 ## 四、下次最该做的事
 
-1. **部署同步 + 重启验证**：build + 手动拷贝 profile 副本（pnpm install 判定无变化跳过），重启实例验证嵌入自动启用（有本地模型 → ready(local) 384 索引；无模型 → disabled 正常态）。
-2. **远程嵌入真机验证**（若配置）：硅基流动 key 配置后验证远程优先、维度校验、远程失败回退本地。
+1. **部署同步 + 重启验证**：build + 手动拷贝 profile 副本（pnpm install 判定无变化跳过），重启实例验证嵌入自动启用与**面板配置区块**（改 topK → 保存 → 插件重启 → 新值生效 → cordis.patch.yml 已写回）。
+2. **远程嵌入真机验证**（若配置）：硅基流动 key（`env:NAME` 或字面）配置后验证远程优先、维度校验、远程失败回退本地。
 3. **缓存命中率基线实测**（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益；若 <40% 回落查字节级前缀抖动。
 4. 观察 memory.json：maintenance 首周期（6h 后）执行效果（重复合并/标签归一化）；A4 修复（同刻 tie-breaker + supersede 优先）真机表现。
-5. MemoryPanel 组件测试：若引入 jsdom/testing-library 则补组件渲染测试。
+5. MemoryPanel 组件渲染测试：若引入 jsdom/testing-library 则补组件测试（当前 client.test 只覆盖 createMemoryApi 纯逻辑）。
