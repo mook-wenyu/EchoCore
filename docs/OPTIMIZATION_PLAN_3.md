@@ -73,11 +73,51 @@
 - 真机验证（3090 + playwright）：system 快照段出现且稳定；注入排除生效；`cacheReadTokens`（usage 可观测）快照前后对比
 - STATUS.md 更新；git 提交
 
+## 第二轮评估决策记录（2026-08-15，用户拍板）
+
+> 背景：第二轮双仓库对比报告（magic-context v0.36.1 / opencode-acp master）+ 网络综述
+> （Anthropic 官方缓存铁律、claude-mem #2872 事故、BEAM/LIGHT、Less Context Better Agents）
+> 交付后，用户提出三个方向性问题，经两轮并行子代理源码/网络查证后拍板如下。
+
+### D1：模型主动驱动压缩工具 → 不实施
+- 用户问：是否让模型主动调压缩工具（opencode-acp 模式）管理上下文取舍？
+- 查证（子代理 A，本地源码）：**结构性不可行**——工具执行时 agent 必定 `running`
+  （`dsh-agent-loop/lib/index.js:606-608` step 硬检查），而宿主 `compactNow` 强制要求
+  `idle`（`dsh-agent-loop/lib/index.js:412-435` runMaintenance 首行同步拒绝），直接调用
+  必然抛 `ManualCompactionError("busy")`。唯一变体"工具登记请求 + 宿主 idle 执行"需改
+  宿主机制 + 插件 inject 增加 compaction 依赖（破坏装配契约）。
+- 冗余性：宿主自动压缩已覆盖 pressure（400K 阈值）+ context-overflow 双触发
+  （`dsh-compaction-basic/lib/index.js:776-829`）；`/compact` 命令提供 idle 手动入口。
+- 拍板：**不实施**。DSH 无 primary_tools 概念，模型侧压缩与宿主机制互斥且冗余。
+
+### D2：模型主动记忆管理增强 → 维持现状
+- 用户问：是否增强"模型主动管理记忆取舍"？
+- 现状：六件工具已覆盖全链路——memory_recall / memory_search（读）、memory_note（写）、
+  memory_forget（归档）、memory_audit（溯源）、memory_status（概览）。
+- 候选增强（重要度调整 / 记忆合并工具）风险：模型误调 importance 污染评分体系与快照
+  优先级；合并工具与既有写入去重/supersede 链机制重叠。
+- 拍板：**维持现状**（YAGNI；六件工具已覆盖"模型主动取舍"）。
+
+### D3：缓存命中率优化 → 暂不处理（观测能力已就绪）
+- 用户问：是否优化缓存命中率？
+- 查证（子代理 B，本地源码）：**DSH 已原生内置观测**——DeepSeek `prompt_cache_hit_tokens`
+  透传为 `cacheReadTokens`（`dsh-llm-deepseek/lib/index.js:190-199`），会话级累计投影
+  （`dsh-token-meter/lib/index.js:197-228`），UI 现成"缓存命中 %"统计行
+  （`dsh-client-ui-conversation/lib/client.js:2777-2780`）。实测零代码成本。
+- P1-P4 快照注入已通过 volatile 审计（快照文本无时间戳，TTL 内字节稳定；`now` 仅用于
+  失效判定 `stable-snapshot.ts:105`）。
+- 业界基线（permafrost）：工具稳定的单代理会话命中率自然 ~90%；<40% 才值得激进优化。
+- 拍板：**暂不处理**。P1-P4 缓存感知布局已落地；观测通道现成，未来需要时 3 轮会话
+  on/off 对照即可量化（见风险 5）。
+
 ## 风险与未决
 1. **P4 依赖体积 +374.9MB**（onnxruntime-node 全平台打包）——与"轻量插件"定位的冲突，已在拍板时告知，配置默认关闭可回避运行时成本
 2. **system context 物化位置/缓存行为**需真机验证（usage cacheReadTokens 观测）——P5 验证项
 3. **快照预算与实时预算的分配**（8K + 16K chars）为初始值，真机观察后调整
 4. 嵌入索引存储域实现细节（storageDomain 多表支持）——P4 实施时查证，若受限改用独立文件
+5. **缓存命中率未实测（D3 暂缓）**：观测通道现成（UI"缓存命中 %"行），未来评估 P1 收益
+   的最短路径 = 3 轮同任务会话 on/off 对照；业界基线提示工具稳定会话自然 ~90%
+   （permafrost），若实测 <50% 再评估激进缓存布局优化
 
 ## 参考来源
 - DeepSeek Context Caching：https://api-docs.deepseek.com/guides/kv_cache/
