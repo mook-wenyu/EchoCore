@@ -189,7 +189,7 @@ pnpm --filter @echocore/dsh-memory build     # tsc + esbuild 客户端打包
 ```
 
 - 源码：`src/`（宿主）+ `src/client.ts`（浏览器面板）+ `scripts/build-client.mjs`（`__ModuleLoader__` 懒 CJS 打包）
-- 测试：`test/`（19 文件 255 个，含装配/渲染单源/领域 schema/统一 FakeCtx 基建/评测基线）
+- 测试：`test/`（21 文件 311 个，含装配/渲染单源/领域 schema/统一 FakeCtx 基建/O3 性能基准/评测基线）
 
 ## 检索与衰减（B1/B2，2026 记忆最佳实践）
 
