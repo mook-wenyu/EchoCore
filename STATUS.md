@@ -4,32 +4,30 @@
 
 ## 一、架构健康度
 
-- 模块总数：12（types / constants / config / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / host-rpc + client.ts 浏览器半 + scripts/build-client.mjs）
-- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types 被复用，无环
-- 违规跨模块调用：无（工具与注入共用 `formatMemoryLine` 属有意复用）
-- 单元测试 87 个全绿；类型检查与构建通过
+- 模块总数：14（types / constants / config / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / host-rpc / maintenance + client.ts 浏览器半 + scripts/build-client.mjs）
+- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants 被复用，无环
+- 违规跨模块调用：无（工具与注入共用 `formatMemoryLine` 属有意复用；`shortSessionId` 三处渲染共用）
+- 单元测试 **162 个全绿**；类型检查与构建通过
 
 ## 二、本次变更影响范围
 
-- **功能**：记忆插件全局化——从"EchoCore 记忆"自定义预设改为**宿主组合行**（所有 Agent 可用，含子代理）；注入预算默认 4096 → 16384 字符（≈4K token，对齐 magic-context 官方默认）；400K 压缩改由宿主 compaction-basic 承载（patch 解禁 + thresholdRatio 0.4）
-- **文件**：`packages/dsh-memory/src/{config,index,client}.ts`、`README.md`、`docs/IMPLEMENTATION_PLAN.md`、`STATUS.md`（仓库）；`~/.dsh/profiles/web/{cordis.patch.yml,package.json}`、预设删除（部署）
-- **接口契约变更**：宿主 `inject` 补 `connection`；客户端 `inject = ['slots','connection']`；`config.compactThresholdTokens` 字段删除（阈值归宿主 compaction-basic 配置）；删除 `echocore-memory` 预设
-- **实机验证**（headless + playwright）：boot 无致命；客户端 bundle 路由 200；boot 条目图含本插件；设置页"记忆"面板渲染且 RPC 返回真实会话摘要（跨进程持久化实证）；插件列表 `memory 已挂载已启用`、`compaction-basic` 双实例（宿主解禁 + 预设安全网）
+- **功能**：优化计划全部阶段落地——腐化防线（O1：prompt 三规则、回述双层过滤、摘录上限、批次 flush）、生命周期（O2：disposed 清理五 Map、装配失败可见）、存储正确性（O3：update 白名单、合并粒度加 kind、归档守卫、排序 tie-breaker）、D-A 后向引用（supersededBy 标记 + 检索排除 + 审计链）、O4 接口收敛（D-D 删除 restore/hardDelete/deleted、RPC status 消费、死代码清理）、O5 客户端（inject 对齐、竞态守卫）、O6 访问追踪节流、O8-M 后台整理（重复合并/过期降级/标签整理）
+- **bug 修复**：会话短 id 截断（`session-` 前缀被 slice 吃掉）——injector/tools/client 三处渲染统一走 `shortSessionId`
+- **文件**：`packages/dsh-memory/src/`（constants/extract/extractor/injector/index/store/tools/client/maintenance 新）+ `test/`（10 文件，含 types/config/client/maintenance 新）+ README + docs/OPTIMIZATION_PLAN.md
+- **接口契约变更**：`store.update` 白名单剔除 content；`SearchOptions.includeSuperseded` 新增；`MemoryStats` 无 deleted；`MemoryEntry` 增 supersededBy/supersedes；`Config` 增 maxExtractChars/enableMaintenance/maintenanceIntervalHours（DEFAULTS 单源）；客户端 `dsh.client.inject: ['slots','connection']`
+- **提交**：79564d9（地基）→ 96492bb（O1+O2）→ 15da3b7（O8-M）→ 0b7a94e（O3+D-A+O6）→ 18ab29a（O4+O5）→ d5ac162（O7）
 
 ## 三、已知风险点（诚实自曝）
 
-1. **三次生产事故**（详见 `~/.dsh/notes/INCIDENT-2026-08-15-tool-prepare-双包.md` 附章）：
-   ① hoisted 双包 Symbol 分裂（已修复，环境切 isolated，复发检查通过）；
-   ② 宿主插件未声明 `tools` 注入导致启动致命（已修复并 headless 验证）；
-   ③ 客户端插件未声明 `slots`/`connection` 注入导致面板静默不出现（已修复并经浏览器实测）。
-2. **standingKeyFor 校验盲区**：只校验组合激活，不校验 apply 运行期守卫——挂载通过 ≠ 运行无误，插件改动必须 headless 启动 + 浏览器实测。
-3. 宿主 compaction-basic 解禁后**所有会话**的压缩阈值变为 400K（含原本无压缩能力的 minimal 预设会话）——若某预设希望差异化需另行配置。
-4. `file:` 依赖为拷贝语义：源码改动后必须重跑 profile `pnpm install`，否则线上跑旧副本。
-5. 全局启用 = 所有会话产生提取/注入 LLM 成本；默认 4K token 注入预算的注意力影响待长会话实测调参。
+1. **O8-M 范围裁剪**：supersede 复核任务未实现（store.update 白名单不支持 supersededBy 变更，域隔离限制）；LLM 合并裁决未做（纯规则 KISS）——均已写入 maintenance.ts 注释。
+2. **部署副本待刷新**：源码变更后 `~/.dsh/profiles/web` 的 file: 拷贝是旧版本——**需重跑 profile `pnpm install`**（集成阶段已做源码侧全部验证，部署侧刷新待执行）。
+3. 上下文腐化**残余向量**：近义去重（语义相同表达不同）仍不支持（已知限制）；assistant 回述依赖 prompt 规则 + 段落标记双防线（source 级过滤无法覆盖 assistant 消息）。
+4. `client.test.ts` 的 react 解析依赖（vitest 环境需 react 模块）——已通过，但构建产物变化时可能再现。
+5. 记忆条目语义合并仍无 LLM 裁决（D-A 是纯规则 Jaccard；STALE 论文显示规则覆盖不全）。
 
 ## 四、下次最该做的事
 
-1. 用户重启 web 应用后：新会话确认 6 个 memory_* 工具自动可见；设置页"记忆"面板可用。
-2. 长会话压测：400K 自动压缩触发 → 记忆被提取（`memory_status`/`memory_search`）；新会话 `memory_recall` 命中历史。
-3. 观察 `~/.dsh/storages/memory.json` 物化与条目质量，按需调整 `minExtractChars` / `injectBudgetChars` / `minScore`。
-4. 后续演进候选（计划文档 §0.3 范围外）：记忆写入审批闸门、向量检索后端、跨进程一致性。
+1. 重跑 profile `pnpm install` 刷新部署副本；用户重启 web 后验证：注入记忆显示"来自会话 63bbf845"（短 id 修复）、后台整理任务 6h 后运行（memory_status 可见统计变化）。
+2. 长会话压测：400K 自动压缩 → 记忆提取 → 新会话召回；构造"新决策覆盖旧决策"场景验证 supersede 标记与检索排除。
+3. 观察 `~/.dsh/storages/memory.json`：supersededBy 字段、maintenance 归档（stale）、重复合并效果。
+4. 后续演进候选：supersede 复核的 store 专用方法、LLM 合并裁决、近义去重。

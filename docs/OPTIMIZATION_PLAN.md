@@ -238,6 +238,19 @@ O1（腐化防线，含 D-C 规则门）→ O2（生命周期）→ O3（存储�
 每阶段：先写失败测试 → 实现 → 全量测试 → git 提交（feat/fix/test 语义）
 ```
 
+## 5.1 实施记录（2026-08-15 全部完成，162 测试全绿）
+
+| 阶段 | 提交 | 要点 |
+|------|------|------|
+| 地基 | 79564d9 | 枚举单源、DEFAULTS 常量、D-D 删除、归档守卫；V1-V4 查证完成 |
+| O1+O2 | 96492bb | prompt 三规则、回述双层过滤、摘录上限、批次 flush、Map 清理、装配可见、M8 查询清洗 |
+| O8-M | 15da3b7 | maintenance.ts：活动门、批预算 20、三任务纯规则；supersede 复核裁剪（store 域限制） |
+| O3+D-A+O6 | 0b7a94e | update 白名单、合并粒度加 kind、supersededBy 后向引用、tie-breaker、访问节流 |
+| O4+O5 | 18ab29a | status 消费、inject 对齐、竞态守卫、短 id 使用点 |
+| O7 | d5ac162 | FakeTable 快照保真、条件断言去守卫、串行链竞态测试 |
+
+未决项（记录在 STATUS.md 风险节）：supersede 复核需 store 专用方法；LLM 合并裁决留待未来；部署副本需 `pnpm install` 刷新。
+
 ## 6. 风险与缓解
 
 | 风险 | 缓解 |

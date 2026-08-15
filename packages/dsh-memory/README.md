@@ -10,10 +10,17 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 
 | 能力 | 说明 |
 |------|------|
-| 双通道提取 | 压缩遮蔽跨度（`compaction/summary` 的 `shadowedSeqs`）即时提取 + 轮次结束增量提取（累计超阈值才调 LLM），共享事件序号水位防重 |
+| 双通道提取 | 压缩遮蔽跨度（`compaction/summary` 的 `shadowedSeqs`）即时提取 + 轮次结束增量提取（累计超阈值才调 LLM，摘录上限 12K 字符截尾保最新），共享事件序号水位防重 |
 | 跨会话记忆 | 记忆按 workspace（规范化 cwd）持久化于 `~/.dsh/storages/memory.json`，新会话可检索历史会话记忆；项目间隔离 |
-| 自动注入 | 每个 `agent/pre-step` 检索 Top-K 相关记忆，预算内（默认 16384 字符 ≈ 4K token，与 magic-context `injection_budget_tokens: 4000` 对齐）注入为带来源标记的 `user/message`（source: plugin + form: recall）；已注入且仍可见的记忆不重复注入，被压缩遮蔽后允许重注入 |
+| 自动注入 | 每个 `agent/pre-step` 检索 Top-K 相关记忆（查询文本仅取真实用户消息，排除插件注入与工具噪声），预算内（默认 16384 字符 ≈ 4K token）注入为带来源标记的 `user/message`（source: plugin + form: recall）；已注入且仍可见的记忆不重复注入，被压缩遮蔽后允许重注入 |
+| 矛盾裁决（D-A） | 新事实写入时与同 workspace 同分类旧记忆做 token 重合度比对（Jaccard ≥ 0.7），命中即标记旧条目 `supersededBy`——检索/注入默认排除被覆盖条目（`memory_search` 可 `includeSuperseded` 审计），审计记录 supersede 链 |
+| 后台整理（O8-M） | 有会话活动后每 6 小时运行：重复合并（Jaccard ≥ 0.85）、过期降级（90 天无访问且重要度 ≤3）、标签小写化整理；全部纯规则、批预算 20 |
+| 腐化防线 | 提取 prompt 三规则（忽略元内容/保持具体/状态变化）+ `[参考记忆]` 段落级回述过滤 + `source.plugin` 过滤双层防线；会话销毁时 flush 未达阈值批次并清理全部会话态 |
 | 400K 无感压缩 | 宿主 `compaction-basic` 经 patch 解禁并配置 `thresholdRatio: 0.4`（实测模型窗口 1M token → 触发点 400K），对全部 Agent 会话生效，无需手动 `/compact` |
+| 溯源审计 | 每条记忆携带 `source { sessionId, eventSeqs, excerpt }`；`memory_audit` 工具还原依据原文摘录与审计日志（含 supersede 链） |
+| 模型工具 | `memory_recall` / `memory_search` / `memory_note` / `memory_forget` / `memory_audit` / `memory_status` |
+| 会话快照 | 压缩摘要自动登记为会话摘要记忆；会话结束时写快照记录（起止时间、记忆规模），支撑跨会话连续性 |
+| 记忆面板 | 设置页新增"记忆"页面（搜索/分类过滤/列表/详情溯源/归档/统计行），数据经 `ctx.connection.rpc` `/memory` 通道 |
 | 溯源审计 | 每条记忆携带 `source { sessionId, eventSeqs, excerpt }`；`memory_audit` 工具还原依据原文摘录与审计日志 |
 | 模型工具 | `memory_recall` / `memory_search` / `memory_note` / `memory_forget` / `memory_audit` / `memory_status` |
 | 会话快照 | 压缩摘要自动登记为会话摘要记忆；会话结束时写快照记录（起止时间、记忆规模），支撑跨会话连续性 |
@@ -37,7 +44,7 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 不发布服务（工具/监听/RPC 均为消费方形态），组合行可松散挂载（宿主组合行即全局生效）。
 持久化经宿主 `ctx.storageDomain`（`~/.dsh/storages/memory.json` 领域单位文件）。
 
-## 配置（组合行 `config:`）
+## 配置（组合行 `config:`；默认值单源于 `src/config.ts` 的 `DEFAULTS`）
 
 | 键 | 默认 | 含义 |
 |----|------|------|
@@ -45,9 +52,12 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 | `topK` | 8 | 注入 Top-K |
 | `minScore` | 0.15 | 注入最低综合分 |
 | `minExtractChars` | 2000 | 增量提取触发阈值（字符） |
+| `maxExtractChars` | 12000 | 增量提取摘录长度上限（超限截尾保最新） |
 | `extractMaxTokens` | 2048 | 提取调用输出上限 |
 | `enableAutoInject` | true | 自动注入总开关 |
 | `enableExtractor` | true | 提取器总开关 |
+| `enableMaintenance` | true | 后台记忆整理任务开关（O8-M） |
+| `maintenanceIntervalHours` | 6 | 后台整理间隔（小时；有会话活动后计时） |
 
 ## 集成（已执行，全局启用：所有 Agent 可用）
 
