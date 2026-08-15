@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
-import { registerMemoryTools, sessionIdOf, toDetail, workspaceOf } from '../src/tools.js'
+import { registerMemoryTools, sessionIdOf, toDetail, toSummary, workspaceOf } from '../src/tools.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
@@ -267,5 +267,62 @@ describe('workspaceOf（回退语义）', () => {
 
   it('agent 缺失时回退默认工作区（全局池语义）', () => {
     expect(workspaceOf({ agent: undefined })).toBe('default')
+  })
+})
+
+// 压测回归（2026-08-15）：memory_audit 对真实条目报
+// "value.entry.sessionId 未声明"——output.schema 的 additionalProperties:false
+// 与返回形状（toSummary/toDetail 含 sessionId/createdAt/updatedAt）不一致，
+// 导致工具对任何存在的记忆 100% 校验失败。本组测试钉住：
+// 输出 schema 声明的字段必须覆盖实际返回形状的全部字段。
+describe('工具输出 schema 覆盖返回形状（防 additionalProperties 拒绝回归）', () => {
+  /** 构造一个最小合法条目（含全部必填字段） */
+  function fullEntry(): MemoryEntry {
+    return {
+      id: 'm-1',
+      workspace: 'D:/workspace',
+      sessionId: 's-1',
+      kind: 'decision',
+      content: '测试决策内容',
+      importance: 5,
+      tags: ['测试'],
+      source: { sessionId: 's-1', eventSeqs: [1], excerpt: '摘录' },
+      status: 'active',
+      createdAt: '2026-08-15T00:00:00.000Z',
+      updatedAt: '2026-08-15T00:00:00.000Z',
+      lastAccessAt: '2026-08-15T00:00:00.000Z',
+      accessCount: 0,
+      audit: [{ action: 'create', at: '2026-08-15T00:00:00.000Z', by: 'extractor' }],
+      dedupKey: 'k',
+    }
+  }
+
+  /** 取工具 output.schema 中 items/entry 的 properties 声明 */
+  function declaredProps(def: ToolDefinition, path: 'items' | 'entry'): string[] {
+    const schema = def.output.schema as {
+      properties: { memories?: { items: { properties: Record<string, unknown> } }; entry?: { properties: Record<string, unknown> } }
+    }
+    const props =
+      path === 'items' ? schema.properties.memories?.items.properties : schema.properties.entry?.properties
+    if (props === undefined) throw new Error(`schema 缺 ${path} 声明`)
+    return Object.keys(props)
+  }
+
+  it('memory_search：items schema 覆盖 toSummary 返回的全部字段', () => {
+    const { tools } = setup()
+    const def = toolOf(tools, 'memory_search')
+    const declared = declaredProps(def, 'items')
+    for (const field of Object.keys(toSummary(fullEntry()))) {
+      expect(declared, `memory_search schema 漏字段 ${field}`).toContain(field)
+    }
+  })
+
+  it('memory_audit：entry schema 覆盖 toDetail 返回的全部字段', () => {
+    const { tools } = setup()
+    const def = toolOf(tools, 'memory_audit')
+    const declared = declaredProps(def, 'entry')
+    for (const field of Object.keys(toDetail(fullEntry()))) {
+      expect(declared, `memory_audit schema 漏字段 ${field}`).toContain(field)
+    }
   })
 })

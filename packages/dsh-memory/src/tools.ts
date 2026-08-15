@@ -208,6 +208,7 @@ function registerSearch(ctx: Context, deps: MemoryToolsDeps): void {
                   sessionId: { type: 'string', required: true },
                   status: { type: 'string', required: true },
                   createdAt: { type: 'string', required: true },
+                  updatedAt: { type: 'string', required: true },
                 },
                 additionalProperties: false,
               },
@@ -363,6 +364,9 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
                 importance: { type: 'number', required: true },
                 tags: { type: 'array', required: true, items: { type: 'string' } },
                 workspace: { type: 'string', required: true },
+                sessionId: { type: 'string', required: true },
+                createdAt: { type: 'string', required: true },
+                updatedAt: { type: 'string', required: true },
                 source: {
                   type: 'object',
                   required: true,
