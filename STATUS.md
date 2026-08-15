@@ -21,8 +21,9 @@
 - **B3 评测基线**（2bcd2a5）：contradiction 显式测试（PersonaMem 风格：偏好变化/事实推翻/无关性）
 - **E1 嵌入默认启用**（24543bf）：删除 `embeddingEnabled` 开关——**远程优先 → 自动回退本地 → 都无则关闭**；新增远程 4 项配置（embeddingApiBaseUrl/ApiKey/Model/Dimension，OpenAI 兼容 /embeddings）；EmbeddingService 多后端（远程验证失败回退本地、运行期故障切本地重试）；EmbeddingIndex 动态维度 + 索引文件按维度隔离（memory-embeddings-<dim>.json，本地 384/远程配置值）；远程返回维度 ≠ 配置 → 显式报错防混维；index.test 嵌入 mock 化（533ms→15ms 确定性）
 - **E2 apiKey 双形态**（c1b4885）：embeddingApiKey 支持字面 key 与 `env:NAME` 环境变量引用（env: 前缀显式标记，resolveApiKey 纯函数，字面 key 不被环境变量劫持）
-- **E3 面板配置**（7d34588 + d759bb7）：RPC 端点 getConfig/setConfig（严格载荷校验：未知键/类型/越界/跨字段互斥拒绝；setConfig 经 `ctx.fiber.update` 整体校验 → 写回 cordis.patch.yml → 重启插件生效——Cordis 原生链路，数据不丢）；记忆面板底部配置区块（字段驱动 DRY 表单，19 项全可编辑，apiKey 解析状态展示，保存即生效）
-- **接口契约变更**（累计）：`embeddingEnabled` 移除；`embeddingApiKey` 恢复（字面/env:NAME）；EmbeddingIndexDeps.service 加 `dimension`；EmbeddingServiceDeps 改 `{modelDir, remote?, hasLocalModel?, loadLocalBackend?, fetchRemoteEmbeddings?}`；`createMemoryRpcHandler(store, rpc)`/`registerMemoryRpc(ctx, store, config)` 签名变更；MemoryPanelApi 加 getConfig/setConfig
+- **E3 面板配置**（7d34588 + d759bb7）：RPC 端点 getConfig/setConfig（严格载荷校验：未知键/类型/越界/跨字段互斥拒绝；setConfig 经 `ctx.fiber.update` 整体校验 → 写回 cordis.patch.yml → 重启插件生效——Cordis 原生链路，数据不丢）；记忆面板底部配置区块（字段驱动 DRY 表单，apiKey 解析状态展示，保存即生效）
+- **E4 配置面最小化**（707f014）：19 项 → **4 项**（仅远程嵌入 baseUrl/apiKey/model/dimension）；其余 15 项固化为模块内常量——注入（INJECT_BUDGET_CHARS/TOP_K/MIN_SCORE）、提取（MIN/MAX_EXTRACT_CHARS/EXTRACT_MAX_TOKENS）、快照（SNAPSHOT_TTL_MS/BUDGET_CHARS/TOP_K）、维护（MAINTENANCE_INTERVAL_MS）、四个 enable 开关全删（行为恒启用）、本地模型目录固定全局（模型是共享资产，用户修正方向）；依据 12-Factor + FSE'15 Too Many Knobs；净减 216 行；P2 注入测试适配快照恒启用（长尾种子验证"快照管稳定 Top、实时注入补长尾"）
+- **接口契约变更**（累计）：配置项 19→4；`InjectorConfig/ExtractorConfig/SnapshotConfig/MaintenanceConfig` 接口删除；`MemoryStableSnapshot.EMPTY_IDS` 删除；CONFIG_DICT 改读 `Config.dict`（transform 包装移除后）；EmbeddingIndexDeps.service 加 `dimension`；`createMemoryRpcHandler(store, rpc)`/`registerMemoryRpc(ctx, store, config)`；MemoryPanelApi 加 getConfig/setConfig；MemoryPanelConfigView 仅 5 字段
 - **提交**：92a2725（PLAN4）→ d5a9eda（A1）→ 16a6677（A2）→ 2e20f1f（A3）→ 35911f6（A4）→ 8d4a36f（B1）→ cca7d8d（B2）→ 2bcd2a5（B3）→ 本轮文档
 
 ## 三、已知风险点（诚实自曝）

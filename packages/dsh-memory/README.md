@@ -43,23 +43,15 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 
 ## 配置（组合行 `config:`；默认值单源于 `src/config.ts` 的 `DEFAULTS`）
 
+**配置面最小化**（用户拍板 2026-08-15）：仅保留远程嵌入 4 项环境绑定配置；
+其余行为参数（注入预算/TopK/最低分、提取三参、快照三参、维护间隔、四个
+enable 开关）已固化为各模块内代码常量——依据 12-Factor（仅"随部署变化"的
+才是配置）与 FSE'15 "Too Many Knobs"（多数参数无人设置）；本地模型目录固定
+`~/.dsh/storages/embedding-model`（模型是全局共享资产）。想调整常量值需改
+`src/` 下对应模块顶部常量。
+
 | 键 | 默认 | 含义 |
 |----|------|------|
-| `injectBudgetChars` | 16384 | 自动注入预算（字符，≈4K token，对齐 magic-context 默认） |
-| `topK` | 8 | 注入 Top-K |
-| `minScore` | 0.15 | 注入最低综合分 |
-| `minExtractChars` | 2000 | 增量提取触发阈值（字符） |
-| `maxExtractChars` | 12000 | 增量提取摘录长度上限（超限截尾保最新） |
-| `extractMaxTokens` | 2048 | 提取调用输出上限 |
-| `enableAutoInject` | true | 自动注入总开关 |
-| `enableSnapshot` | true | 稳定快照开关（system 前缀缓存感知注入；窗口内字节不变） |
-| `snapshotTtlMs` | 300000 | 快照缓存窗口（ms；过期或记忆变更后重建） |
-| `snapshotBudgetChars` | 8192 | 快照预算（字符；重要性优先取数，预算内截断） |
-| `snapshotTopK` | 30 | 快照 Top-K 候选上限 |
-| `enableExtractor` | true | 提取器总开关 |
-| `enableMaintenance` | true | 后台记忆整理任务开关（O8-M） |
-| `maintenanceIntervalHours` | 6 | 后台整理间隔（小时；有会话活动后计时） |
-| `embeddingModelDir` | `~/.dsh/storages/embedding-model` | 本地嵌入模型目录（含 ONNX 与 tokenizer 文件） |
 | `embeddingApiBaseUrl` | `''` | 远程嵌入 API base URL（OpenAI 兼容 `/embeddings`；空串 = 未配置远程） |
 | `embeddingApiKey` | `''` | 远程嵌入 API key——**字面 key 或 `env:NAME` 环境变量引用**（如 `env:SILICONFLOW_KEY`；DeepSeek 官方无 embeddings API，需另配供应商） |
 | `embeddingModel` | `''` | 远程嵌入模型名（如 `BAAI/bge-m3`、`Qwen/Qwen3-Embedding-0.6B`） |
