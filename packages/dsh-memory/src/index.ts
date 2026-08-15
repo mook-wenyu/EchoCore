@@ -12,6 +12,8 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { rename } from 'node:fs/promises'
+import { DatabaseSync } from 'node:sqlite'
 
 import type { Context } from '@deepseek-ai/cordis'
 
@@ -22,20 +24,23 @@ import { MemoryExtractor } from './extractor.js'
 import { registerMemoryRpc } from './host-rpc.js'
 import { MemoryInjector } from './injector.js'
 import { MemoryMaintenance } from './maintenance.js'
-import { MEMORY_TABLE, memoryDomainSpec } from './memory-domain.js'
+import { MEMORY_TABLE, memoryEntrySchema } from './memory-domain.js'
 import { registerSnapshot } from './snapshot.js'
+import { migrateMemoryJson, SqliteKvTable } from './sqlite-kv.js'
 import { MemoryStableSnapshot } from './stable-snapshot.js'
 import { MemoryStore } from './store.js'
 import { registerMemoryTools } from './tools.js'
+import type { MemoryEntry } from './types.js'
 
 export const name = 'memory'
 // 直接访问的服务必须全部声明注入（Cordis 守卫：未声明即拒绝）：
-// - storageDomain：记忆领域持久化
 // - llm：提取/摘要调用（透传给提取器）
 // - tools：注册六个模型工具（registerMemoryTools 内 ctx.tools.register）
 // - connection：面板 RPC 通道（registerMemoryRpc 内 ctx.connection.rpc.handle）
 // - systemPrompt：稳定快照段注册（MemoryStableSnapshot 内 ctx.systemPrompt.context）
-export const inject = ['storageDomain', 'llm', 'tools', 'connection', 'systemPrompt']
+// 注：存储自建 SQLite（SqliteKvTable，node:sqlite）——不依赖宿主 storageDomain
+// （2026-08-15 结构性改造：整文件原子写 → WAL O(1) 写，见 sqlite-kv.ts）。
+export const inject = ['llm', 'tools', 'connection', 'systemPrompt']
 
 export function apply(ctx: Context, config: ConfigType): Promise<void> {
   const logger = ctx.logger('memory')
@@ -58,19 +63,60 @@ function defaultEmbeddingModelDir(): string {
   return join(homedir(), '.dsh', 'storages', 'embedding-model')
 }
 
-/** 装配各模块：打开领域 → 构造存储与提取器 → 挂接生命周期 */
-async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnType<Context['logger']>): Promise<void> {
-  const domain = await ctx.storageDomain.open(memoryDomainSpec)
-  // 句柄生命周期归本插件所有：卸载时释放领域（幂等；设施卸载兜底关闭）
+/** 记忆库 SQLite 文件路径（替代旧 memory.json；WAL O(1) 写，见 sqlite-kv.ts） */
+function defaultMemoryDbFile(): string {
+  return join(homedir(), '.dsh', 'storages', 'memory.sqlite')
+}
+
+/** 旧 storage-json 记忆库文件路径（首启迁移源；迁移后改名为 .bak 保留） */
+function legacyMemoryJsonFile(): string {
+  return join(homedir(), '.dsh', 'storages', 'memory.json')
+}
+
+/** 装配覆盖项（测试注入：隔离真实用户目录的存储文件） */
+export interface MountOverrides {
+  /** 记忆库 SQLite 文件路径（默认 ~/.dsh/storages/memory.sqlite） */
+  dbFile?: string
+  /** 旧 memory.json 路径（默认 ~/.dsh/storages/memory.json；迁移源） */
+  legacyJsonFile?: string
+}
+
+/** 装配各模块：打开 SQLite 存储（含首启迁移）→ 构造存储与提取器 → 挂接生命周期 */
+export async function mountMemory(
+  ctx: Context,
+  config: ResolvedConfig,
+  logger: ReturnType<Context['logger']>,
+  overrides: MountOverrides = {},
+): Promise<void> {
+  // 结构性存储改造（用户拍板）：自建 SQLite（node:sqlite，WAL 追加写 O(1)），
+  // 替代宿主 storage-domain + storage-json 的整文件原子写（O(n) 写放大）。
+  // 首启迁移：memory.json 存在且 SQLite 为空 → 逐条校验导入 → 原文件改名为
+  // memory.json.bak 保留（不删除——迁移可追溯；幂等：SQLite 非空即跳过）。
+  const db = new DatabaseSync(overrides.dbFile ?? defaultMemoryDbFile())
+  // 句柄生命周期归本插件所有：卸载时关闭数据库（幂等）
   ctx.effect(() => () => {
-    void domain.close()
+    if (db.isOpen) db.close()
   })
+  const table = new SqliteKvTable<MemoryEntry>(db, MEMORY_TABLE)
+  if (table.size === 0) {
+    const legacyFile = overrides.legacyJsonFile ?? legacyMemoryJsonFile()
+    const { migrated, skipped } = await migrateMemoryJson(legacyFile, table, (raw) =>
+      memoryEntrySchema.safeParse(raw).success,
+    )
+    if (migrated > 0 || skipped > 0) {
+      logger.info(`[dsh-memory] 记忆库已迁移至 SQLite：${migrated} 条导入，${skipped} 条跳过（原 memory.json 已改名 .bak 保留）`)
+      // 原文件改名保留（迁移完成后旧文件不再作为数据源——防重复迁移）
+      await rename(legacyFile, `${legacyFile}.bak`).catch(() => {
+        logger.warn('[dsh-memory] memory.json 改名 .bak 失败（迁移已完成，旧文件保留原位置）')
+      })
+    }
+  }
 
   // R4-1：畸形 source（手工篡改 memory.json）被检索过滤时告警一次，可观测性由装配层提供
   // P4 hooks：onCreate/onArchive 闭包引用后赋值的 embedIndex（let，延迟求值——
   // 嵌入启用时索引在下方初始化；未启用时恒 undefined，hook 空操作）
   const store = new MemoryStore(
-    domain.table(MEMORY_TABLE),
+    table,
     undefined,
     (id) => {
       logger.warn(`[dsh-memory] 发现 source 结构畸形的记忆条目（已从检索/浏览过滤，可用 memory_audit ${id} 查看）：${id}`)

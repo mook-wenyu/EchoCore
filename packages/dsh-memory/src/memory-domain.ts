@@ -1,13 +1,18 @@
 /**
  * @module @echocore/dsh-memory/memory-domain
  *
- * 记忆持久化领域声明（storageDomain 数据形式）。
- * 领域名 = 后端单元名：宿主 storage-json root 为 ~/.dsh/storages 时，
- * 数据落盘为 ~/.dsh/storages/memory.json（单位文件，人类可读）。
+ * 记忆条目 schema（迁移校验与字段形态防线共用）。
+ *
+ * 存储形态（2026-08-15 结构性改造，用户拍板）：
+ * 自建 SQLite 存储（SqliteKvTable，node:sqlite）替代 storage-domain +
+ * storage-json 整文件原子写——写从 O(n) 重写降为 O(1) WAL 追加、检索可索引。
+ * 领域声明（defineDomain/memoryDomainSpec）不再用于装配，已删除；
+ * memoryEntrySchema 保留：① 首启迁移（memory.json → memory.sqlite）逐条校验；
+ * ② 字段形态防线（isSourceWellFormed 之外的写入接口防线）。
+ *
  * 记录 schema 使用 zod（领域层约定）；插件 Config 使用 schemastery（见 config.ts）。
  */
 
-import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 
 import { AUDIT_ACTIONS, AUDIT_ACTORS, MEMORY_KINDS, MEMORY_STATUSES, type MemoryEntry } from './types.js'
@@ -49,17 +54,5 @@ export const memoryEntrySchema = z.object({
   audit: z.array(auditRecordSchema),
 })
 
-/**
- * memory 领域：单表 entries（键 = 记忆 id）。
- * version 1：预发布阶段不承诺迁移；升级时整体重写文件（见 AGENTS.md 向后兼容立场）。
- */
-export const memoryDomainSpec = defineDomain({
-  name: 'memory',
-  version: 1,
-  tables: {
-    entries: domainTable<string, MemoryEntry>(memoryEntrySchema),
-  },
-})
-
-/** entries 表名（供 store 与装配处引用，避免魔法字符串） */
+/** entries 表名（SqliteKvTable 表名与旧领域表名一致，避免魔法字符串） */
 export const MEMORY_TABLE = 'entries'
