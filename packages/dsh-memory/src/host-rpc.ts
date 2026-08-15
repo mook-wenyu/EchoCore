@@ -33,6 +33,9 @@ interface SearchPayload {
   tag?: string
   status?: 'active' | 'archived'
   limit?: number
+  /** R3（2026-08-15）：可选 workspace 过滤——传则检索限定该工作区（面板未来按项目搜索）；
+   * 不传保持全库浏览（面板是跨项目管理工具，语义保留） */
+  workspace?: string
 }
 interface IdPayload {
   id: string
@@ -115,7 +118,7 @@ async function handleList(store: MemoryStore, payload: unknown): Promise<{ entri
   return { entries: entries.map(toSummary), total: entries.length }
 }
 
-/** search：关键词/分类/标签/状态检索 */
+/** search：关键词/分类/标签/状态检索（R3：可选 workspace 过滤） */
 async function handleSearch(store: MemoryStore, payload: unknown): Promise<{ entries: unknown[]; total: number }> {
   const parsed = parseSearchPayload(payload)
   const entries = store.search({
@@ -124,6 +127,7 @@ async function handleSearch(store: MemoryStore, payload: unknown): Promise<{ ent
     tag: parsed.tag,
     status: parsed.status,
     limit: parsed.limit,
+    workspace: parsed.workspace,
   })
   return { entries: entries.map(toSummary), total: entries.length }
 }
@@ -160,6 +164,7 @@ function parseSearchPayload(payload: unknown): SearchPayload {
     tag: optionalString(record.tag),
     status: optionalEnum(record.status, ['active', 'archived']),
     limit: optionalInt(record.limit, 50),
+    workspace: optionalString(record.workspace),
   }
 }
 

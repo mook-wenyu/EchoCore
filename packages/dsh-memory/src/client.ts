@@ -66,7 +66,8 @@ export interface MemoryPanelConfigView {
 /** 面板数据 API（apply 期从 ctx 装配，随组件 props 传递） */
 export interface MemoryPanelApi {
   list(status?: string, limit?: number): Promise<MemorySummaryView[]>
-  search(query: string, kind?: string, status?: string): Promise<MemorySummaryView[]>
+  /** R3：workspace 可选——传则限定该工作区搜索；面板默认不传（跨项目管理浏览） */
+  search(query: string, kind?: string, status?: string, workspace?: string): Promise<MemorySummaryView[]>
   get(id: string): Promise<MemoryDetailView | undefined>
   archive(id: string): Promise<boolean>
   status(): Promise<MemoryStatsView>
@@ -95,8 +96,8 @@ export function createMemoryApi(ctx: Context): MemoryPanelApi {
       const value = unwrap(result) as { entries: MemorySummaryView[] }
       return value.entries
     },
-    async search(query, kind, status) {
-      const result = await call('search', { query, kind, status, limit: 50 })
+    async search(query, kind, status, workspace) {
+      const result = await call('search', { query, kind, status, limit: 50, workspace })
       const value = unwrap(result) as { entries: MemorySummaryView[] }
       return value.entries
     },

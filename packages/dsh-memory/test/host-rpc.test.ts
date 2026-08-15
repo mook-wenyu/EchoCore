@@ -80,6 +80,27 @@ describe('memory RPC 端点', () => {
     expect((byQuery.value as { total: number }).total).toBe(1)
   })
 
+  it('R3 search：workspace 过滤（传则限定该工作区；不传保持全库）', async () => {
+    const { store, handler } = setup()
+    await seed(store)
+    await seed(store, { workspace: 'D:/other', content: '另一个项目的技术栈：rust 异步' })
+    // 带 workspace：只返回该工作区命中
+    const scoped = await handler('search', { query: 'rust', workspace: 'D:/other' })
+    expect(scoped.ok).toBe(true)
+    if (!scoped.ok) return
+    expect((scoped.value as { total: number }).total).toBe(1)
+    // 不带 workspace：全库命中（面板管理语义保留）
+    const global = await handler('search', { query: 'rust' })
+    expect(global.ok).toBe(true)
+    if (!global.ok) return
+    expect((global.value as { total: number }).total).toBe(1)
+    // 工作区隔离验证：另一工作区查不到本区内容
+    const miss = await handler('search', { query: 'pnpm', workspace: 'D:/other' })
+    expect(miss.ok).toBe(true)
+    if (!miss.ok) return
+    expect((miss.value as { total: number }).total).toBe(0)
+  })
+
   it('get：命中返回详情，未命中返回 found=false', async () => {
     const { store, handler } = setup()
     const id = await seed(store)

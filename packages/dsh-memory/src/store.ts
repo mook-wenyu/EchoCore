@@ -135,6 +135,26 @@ export class MemoryStore {
    * 为进程内，重启后一并清空。
    */
   private revisionValue = 0
+  /**
+   * R1（2026-08-15 检索优化）：条目 token 集合预计算缓存（content + tags）。
+   * 检索热路径每轮对全部候选重建 token Set（实测 1266-3488 个 Set、
+   * 24-58ms/次）是读路径主成本；缓存后重复检索零重建。
+   * 失效策略（精确，非整体清空）：
+   * - update（tags 白名单可变更 → tokenize 输入变化）→ 删该 id；
+   * - create 合并路径不改 content（tokenize 输入不变）→ 缓存保持有效；
+   * - archive/markSuperseded 不改 content → 缓存保持有效。
+   */
+  private readonly entryTokenCache = new Map<string, Set<string>>()
+
+  /** R1：取条目 token 集合（缓存命中返回；未命中计算并缓存） */
+  private cachedTokens(entry: MemoryEntry): Set<string> {
+    let tokens = this.entryTokenCache.get(entry.id)
+    if (tokens === undefined) {
+      tokens = new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
+      this.entryTokenCache.set(entry.id, tokens)
+    }
+    return tokens
+  }
 
   constructor(
     table: KvTable<string, MemoryEntry>,
@@ -310,6 +330,8 @@ export class MemoryStore {
         audit: [...current.audit, { action: 'update' as const, at: this.iso(), by }],
       }))
       this.revisionValue++
+      // R1：tags 白名单可变更 → tokenize 输入变化 → 失效该条目 token 缓存
+      this.entryTokenCache.delete(id)
       return updated
     } catch (error) {
       if (error instanceof DomainError && error.code === 'missing-key') return undefined
@@ -387,7 +409,8 @@ export class MemoryStore {
       const queryTokenList = tokenize(query)
       if (semantic) {
         // 关键词榜：relevance > 0 的条目降序（同分按 id 稳定；relevance=0 不上榜）
-        const withRel = matches.map((entry) => ({ entry, rel: relevanceScore(queryTokenList, entryTokensOf(entry)) }))
+        // R1：缓存 token 集合（entryTokenCache）替代每轮重建
+        const withRel = matches.map((entry) => ({ entry, rel: relevanceScore(queryTokenList, this.cachedTokens(entry)) }))
         const kwRanked = withRel
           .filter((item) => item.rel > 0)
           .sort((a, b) => b.rel - a.rel || a.entry.id.localeCompare(b.entry.id))
@@ -412,7 +435,9 @@ export class MemoryStore {
         }
       } else {
         for (const entry of matches) {
-          const score = scoreEntry(entry, query, now)
+          // R1：缓存 token 集合替代 memoryScore 内部重复 tokenize（计算等价：
+          // memoryScore = relevance × timeImportanceFactor，relevance=0 → 0 < minScore 不过）
+          const score = relevanceScore(queryTokenList, this.cachedTokens(entry)) * timeImportanceFactor(entry, now)
           if (score >= minScore) scored.push({ entry, score })
         }
       }
@@ -516,12 +541,8 @@ function unionSeqs(a: number[], b: number[]): number[] {
   return [...set].sort((x, y) => x - y)
 }
 
-/** 条目 token 集合（content + tags；语义融合路径的关键词相关性复用） */
-function entryTokensOf(entry: MemoryEntry): Set<string> {
-  return new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
-}
-
-/** 去重索引键：`workspace::kind::dedupKey`，将合并粒度提升到「workspace + kind + 内容」（O3） */
+/**
+ * 去重索引键：`workspace::kind::dedupKey`，将合并粒度提升到「workspace + kind + 内容」（O3） */
 function dedupIndexKey(workspace: string, kind: MemoryKind, dedupKey: string): string {
   return `${workspace}::${kind}::${dedupKey}`
 }

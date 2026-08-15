@@ -131,6 +131,19 @@ describe('MemoryStore 状态流转', () => {
     expect(store.getById(again.entry.id)?.status).toBe('active')
   })
 
+  it('R1 tokenize 缓存失效：update 变更 tags 后检索能命中新 tag（缓存不陈旧）', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    // content 不含 tag 词（防 content 2-gram 误命中干扰断言）
+    const { entry } = await store.create(input({ content: '项目使用 pnpm workspace 管理多包', tags: ['交流'] }))
+    // 首次检索「交流」：content 无、tag 有 → 命中（构建缓存）
+    expect(store.search({ query: '交流', workspace: 'D:/workspace' })).toHaveLength(1)
+    // tags 变更（白名单可更新）→ 缓存失效 → 新 tag「部署」可检索
+    await store.update(entry.id, { tags: ['部署'] }, 'tool')
+    expect(store.search({ query: '部署', workspace: 'D:/workspace' })).toHaveLength(1)
+    // 旧 tag 不再命中（若缓存未失效，旧 token 集仍含「交流」）
+    expect(store.search({ query: '交流', workspace: 'D:/workspace' })).toHaveLength(0)
+  })
+
   // R2-2/B2：只把 missing-key 转换为业务语义，真实异常（IO/校验/closed）原样上抛——
   // 禁止 catch 混吞掩盖存储故障（改动前：普通 Error 会被吞成 undefined，本测试失败）
   it('update 遇真实异常（非 missing-key）上抛，不吞成 undefined', async () => {

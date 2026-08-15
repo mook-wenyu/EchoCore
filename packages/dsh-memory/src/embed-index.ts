@@ -19,6 +19,9 @@ import { dirname } from 'node:path'
 
 import type { MemoryEntry } from './types.js'
 
+/** R2：持久化去抖窗口（ms）——高频 indexEntry/remove 合并为一次整写 */
+export const PERSIST_DEBOUNCE_MS = 10_000
+
 /** 嵌入索引依赖 */
 export interface EmbeddingIndexDeps {
   /** 索引文件绝对路径（JSON：{ [id]: number[] }；装配层按后端维度隔离命名） */
@@ -105,10 +108,10 @@ export class EmbeddingIndex {
 
   /** 归档条目移除向量（与持久层同步，防陈旧向量占检索分） */
   remove(id: string): void {
-    if (this.vectors.delete(id)) void this.persist()
+    if (this.vectors.delete(id)) this.persist()
   }
 
-  /** 逐条嵌入缺失条目并持久化 */
+  /** 逐条嵌入缺失条目并持久化（全量补齐后立即落盘——不等去抖窗口） */
   private async buildMissing(): Promise<void> {
     const missing = this.deps.listAll().filter((entry) => !this.vectors.has(entry.id))
     if (missing.length === 0) return
@@ -116,23 +119,49 @@ export class EmbeddingIndex {
       const vector = await this.deps.service.embed(entry.content)
       this.vectors.set(entry.id, Array.from(vector))
     }
-    await this.persist()
+    await this.flushPersist()
   }
 
-  /** 单条嵌入（供 indexEntry 调用） */
+  /** 单条嵌入（供 indexEntry 调用；持久化走 R2 去抖） */
   private async embedOne(entry: MemoryEntry): Promise<void> {
     const vector = await this.deps.service.embed(entry.content)
     this.vectors.set(entry.id, Array.from(vector))
-    await this.persist()
+    this.persist()
   }
 
-  /** 原子持久化：写临时文件后 rename（防半截文件） */
-  private persist(): Promise<void> {
-    // P0-1：promise 队列串行化——fire-and-forget 的 indexEntry/remove 可并发进入
-    // persist，并发写同一 `${file}.tmp` 会让 rename 落在写入中的局部（半截文件）。
-    // 队列保证任意时刻至多一个写事务；每次写的是调用时点的 vectors 快照，后写
-    // 覆盖先写，末次写即最终态。写失败沿 promise 上抛（indexEntry/remove 调用方
-    // 各自记录），链上失败不阻断后续写（双处理器接续队列）。
+  /**
+   * R2（2026-08-15）：去抖持久化——indexEntry/remove 高频调用合并为
+   * PERSIST_DEBOUNCE_MS 窗口一次整写（原实现每条新记忆全量写 7MB JSON，
+   * 与旧 memory.json 的 O(n) 整写同构病）。向量索引是可重建的派生层
+   * （启动 ensureAll 补齐）——进程退出丢最后窗口内的落盘可接受。
+   * 内存 Map 是权威态（检索读内存），持久化仅服务重启恢复。
+   */
+  private persistTimer: ReturnType<typeof setTimeout> | undefined
+  private dirty = false
+
+  private persist(): void {
+    this.dirty = true
+    if (this.persistTimer !== undefined) return
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined
+      void this.flushPersist()
+    }, PERSIST_DEBOUNCE_MS)
+  }
+
+  /**
+   * 立即持久化（去抖窗口内合并；buildMissing/卸载前调用保证落盘）。
+   * 公开供装配层卸载时 flush + 测试确定性断言。
+   */
+  flush(): Promise<void> {
+    return this.flushPersist()
+  }
+
+  /** 立即持久化（去抖窗口内合并；buildMissing/卸载前调用保证落盘） */
+  private flushPersist(): Promise<void> {
+    if (!this.dirty) return Promise.resolve()
+    this.dirty = false
+    // P0-1：promise 队列串行化——并发 flush 时写同一 tmp 文件会交错，
+    // 队列保证任意时刻至多一个写事务；写的是调用时点 vectors 快照。
     const next = this.persistChain === undefined ? this.persistNow() : this.persistChain.then(() => this.persistNow(), () => this.persistNow())
     this.persistChain = next
     return next

@@ -309,15 +309,19 @@ describe('EmbeddingIndex', () => {
       content: '测试内容',
     } as unknown as MemoryEntry
     index.indexEntry(entry)
-    // 等 fire-and-forget 落地（embed 是 async——轮询文件）
+    // R2 去抖持久化：轮询 flush（embedOne 完成置 dirty 后落盘；flush 幂等）
+    const { readFile } = await import('node:fs/promises')
+    let raw: string | undefined
     for (let i = 0; i < 20; i++) {
+      await index.flush()
       try {
-        await readFile(file, 'utf8')
+        raw = await readFile(file, 'utf8')
         break
       } catch {
         await new Promise((resolve) => setTimeout(resolve, 10))
       }
     }
+    expect(raw).toBeDefined()
     const reloaded = new EmbeddingIndex({
       file,
       service: { state: 'ready', dimension: 384, embed: async () => new Float32Array(384) },
@@ -374,12 +378,14 @@ describe('EmbeddingIndex', () => {
       content: `内容${i}`,
     })) as unknown as MemoryEntry[]
     for (const entry of entries) slow.indexEntry(entry)
-    // 等全部落地：轮询直到连续 3 次读到完整内容（连续稳定判定——防最后一次
-    // rename 未落盘时的残留竞态；全量并行时 CPU 竞争留足余量）
+    // R2 去抖持久化：轮询 flush + 读文件直到全量（flush 幂等；embedOne 完成
+    // 置 dirty 后落盘；连续 3 次读到完整内容判定稳定——防最后一次 rename
+    // 未落盘时的残留竞态）
     const { readFile } = await import('node:fs/promises')
     let parsed: Record<string, number[]> | undefined
     let stable = 0
     for (let i = 0; i < 300; i++) {
+      await slow.flush()
       await new Promise((resolve) => setTimeout(resolve, 25))
       try {
         parsed = JSON.parse(await readFile(file, 'utf8')) as Record<string, number[]>
