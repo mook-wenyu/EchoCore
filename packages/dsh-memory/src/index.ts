@@ -12,7 +12,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 
-import { Config, DEFAULTS, type Config as ConfigType } from './config.js'
+import { Config, DEFAULTS, type Config as ConfigType, type ResolvedConfig } from './config.js'
 import { MemoryExtractor, type ExtractorConfig } from './extractor.js'
 import { registerMemoryRpc } from './host-rpc.js'
 import { MemoryInjector, type InjectorConfig } from './injector.js'
@@ -30,16 +30,19 @@ export const name = 'memory'
 // - connection：面板 RPC 通道（registerMemoryRpc 内 ctx.connection.rpc.handle）
 export const inject = ['storageDomain', 'llm', 'tools', 'connection']
 
-export function apply(ctx: Context, config: ConfigType): void {
+export function apply(ctx: Context, config: ConfigType): Promise<void> {
   const logger = ctx.logger('memory')
-  // O2-2：装配失败不再静默——resolved 拒绝必须上抛给宿主可见，方便定位领域打开/存储初始化问题
-  void mountMemory(ctx, config, logger).catch((error: unknown) => {
-    logger.error('[dsh-memory] 装配失败：', error)
-  })
+  // R2-1（B1）：装配失败必须上抛——apply 返回 mountMemory 的 promise，
+  // Cordis fiber 在启动错误时拒绝（registry.d.ts：rejecting on startup errors），
+  // 插件加载失败对宿主可见。禁止 catch 后保持"已激活但功能全缺"的半死状态。
+  // R2-4（B4）：显式配置解析边界——schemastery 运行时已填默认值，此处仅做
+  // 类型收窄（Config 可选 → ResolvedConfig 必填），装配代码直接读字段。
+  const resolved: ResolvedConfig = { ...DEFAULTS, ...config }
+  return mountMemory(ctx, resolved, logger)
 }
 
-/** 装配各模块：解析配置默认值 → 打开领域 → 构造存储与提取器 → 挂接生命周期 */
-async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<Context['logger']>): Promise<void> {
+/** 装配各模块：打开领域 → 构造存储与提取器 → 挂接生命周期 */
+async function mountMemory(ctx: Context, config: ResolvedConfig, logger: ReturnType<Context['logger']>): Promise<void> {
   const domain = await ctx.storageDomain.open(memoryDomainSpec)
   // 句柄生命周期归本插件所有：卸载时释放领域（幂等；设施卸载兜底关闭）
   ctx.effect(() => () => {
@@ -49,21 +52,21 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
   const store = new MemoryStore(domain.table(MEMORY_TABLE))
 
   // 提取器：双通道（压缩遮蔽 + 轮次增量），纯观察不阻塞主循环
-  // 默认值引用 DEFAULTS 单源（schemastery 加载即填充，?? 是死分支，仅作可读性保障）
+  // R2-4（B4）：schemastery 加载即填充默认值，?? 是死分支——直接读 config 字段
   const extractorConfig: ExtractorConfig = {
-    enableExtractor: config.enableExtractor ?? DEFAULTS.enableExtractor,
-    minExtractChars: config.minExtractChars ?? DEFAULTS.minExtractChars,
-    maxExtractChars: config.maxExtractChars ?? DEFAULTS.maxExtractChars,
-    extractMaxTokens: config.extractMaxTokens ?? DEFAULTS.extractMaxTokens,
+    enableExtractor: config.enableExtractor,
+    minExtractChars: config.minExtractChars,
+    maxExtractChars: config.maxExtractChars,
+    extractMaxTokens: config.extractMaxTokens,
   }
   new MemoryExtractor({ store, llm: ctx.llm, logger, config: extractorConfig }).install(ctx)
 
   // 注入器：pre-step 自动注入相关记忆（带预算、去重与溯源标记）
   const injectorConfig: InjectorConfig = {
-    enableAutoInject: config.enableAutoInject ?? DEFAULTS.enableAutoInject,
-    topK: config.topK ?? DEFAULTS.topK,
-    minScore: config.minScore ?? DEFAULTS.minScore,
-    injectBudgetChars: config.injectBudgetChars ?? DEFAULTS.injectBudgetChars,
+    enableAutoInject: config.enableAutoInject,
+    topK: config.topK,
+    minScore: config.minScore,
+    injectBudgetChars: config.injectBudgetChars,
   }
   new MemoryInjector({ store, logger, config: injectorConfig }).install(ctx)
 
@@ -74,12 +77,12 @@ async function mountMemory(ctx: Context, config: ConfigType, logger: ReturnType<
   registerSnapshot(ctx, { store, logger })
 
   // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面
-  registerMemoryRpc(ctx, store, logger)
+  registerMemoryRpc(ctx, store)
 
   // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理；开关与间隔经配置
   const maintenanceConfig: MaintenanceConfig = {
-    enableMaintenance: config.enableMaintenance ?? DEFAULTS.enableMaintenance,
-    maintenanceIntervalHours: config.maintenanceIntervalHours ?? DEFAULTS.maintenanceIntervalHours,
+    enableMaintenance: config.enableMaintenance,
+    maintenanceIntervalHours: config.maintenanceIntervalHours,
   }
   new MemoryMaintenance({ store, logger, config: maintenanceConfig, now: () => Date.now() }).install(ctx)
 

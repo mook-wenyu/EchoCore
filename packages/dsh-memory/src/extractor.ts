@@ -48,9 +48,6 @@ interface PendingBatch {
   text: string
 }
 
-/** 会话事件监听器形态 */
-type SessionEventListener = (session: Session, event: SessionEvent) => void
-
 /**
  * 截尾保最新：把超长摘录裁剪到最近 maxChars 字符，并在 `\n` 边界落笔。
  *
@@ -85,7 +82,7 @@ export class MemoryExtractor {
   /** 注册 session/event 与 agent/disposed 监听（纯观察，无返回值约束） */
   install(ctx: Context): void {
     this.agents = ctx.get('agents')
-    ctx.on('session/event', this.onSessionEvent.bind(this) as SessionEventListener)
+    ctx.on('session/event', this.onSessionEvent.bind(this))
     // O1-4：会话结束兜底——清理该会话所有临时状态；有遗留批次则立即 flush
     ctx.on('agent/disposed', (payload: { agent: { id: string; session: Session } }) => {
       this.onDisposed(payload)
@@ -205,6 +202,11 @@ export class MemoryExtractor {
 
   /** 提取并入库：路由解析 → 文本截底 → LLM 调用 → 逐条写入（失败抛出，由调用方保持水位） */
   private async extractAndStore(session: Session, events: SessionEvent[], text: string): Promise<void> {
+    // R2-9/B9 失败语义（禁止"优化"为失败即丢）：
+    // - processTurnEnd/processCompaction 在 await 之后才推进水位/删除 pending——
+    //   抛错时两者均保留，下次触发会重试同一批事件；
+    // - 重试代价是重复 LLM 调用（create 去重合并兜底，不会产生重复条目）——
+    //   这是"数据完整性优先"的已知成本，不引入防抖复杂度（YAGNI）。
     const agent = this.agents?.get(session.id)
     const route = resolveRoute(session, agent)
     if (route === undefined) {

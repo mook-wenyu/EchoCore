@@ -17,7 +17,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 // 副作用导入：激活 dsh-compaction 对 SessionEventMap 的声明合并
 import '@deepseek-ai/dsh-compaction'
 
-import { DEFAULT_WORKSPACE } from './constants.js'
+import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS } from './constants.js'
 import type { MemoryStore } from './store.js'
 
 /** 会话快照模块依赖 */
@@ -54,7 +54,7 @@ async function recordSessionSummary(deps: SnapshotDeps, session: Session, event:
       content: `会话摘要：${summaryText}`,
       importance: 7,
       tags: ['session-summary'],
-      source: { sessionId: session.id, eventSeqs: event.data.shadowedSeqs, excerpt: summaryText.slice(0, 400) },
+      source: { sessionId: session.id, eventSeqs: event.data.shadowedSeqs, excerpt: summaryText.slice(0, EXCERPT_MAX_CHARS) },
       by: 'system',
     })
     .catch((error: unknown) => {
@@ -80,7 +80,7 @@ async function recordSessionEnd(deps: SnapshotDeps, agent: { id: string; session
       content,
       importance: 5,
       tags: ['snapshot'],
-      source: { sessionId: session.id, eventSeqs: [], excerpt: content.slice(0, 400) },
+      source: { sessionId: session.id, eventSeqs: [], excerpt: content.slice(0, EXCERPT_MAX_CHARS) },
       by: 'system',
     })
     .catch((error: unknown) => {

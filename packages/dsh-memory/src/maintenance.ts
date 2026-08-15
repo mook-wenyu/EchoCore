@@ -133,10 +133,10 @@ export class MemoryMaintenance {
     }
   }
 
-  /** 调度下一周期（setTimeout 链；清除旧挂起句柄防重入） */
+  /** 调度下一周期（setTimeout 链；清除旧挂起句柄防重入）。R2-10/M2：间隔最小 1 由 config schema 保证，此处不夹逼 */
   private schedule(): void {
     this.clearTimer()
-    const intervalMs = Math.max(1, this.deps.config.maintenanceIntervalHours) * 3_600_000
+    const intervalMs = this.deps.config.maintenanceIntervalHours * 3_600_000
     this.timer = setTimeout(() => this.onInterval(), intervalMs)
   }
 
@@ -193,7 +193,11 @@ export class MemoryMaintenance {
   /**
    * 任务 a：重复合并。
    * 同 workspace + 同 kind、tokenize Jaccard ≥ 0.85、重要度差 ≤ 2 的条目对，
-   * 保留新者（高重要度提升），旧者归档。每次操作均重读当前状态，跳过已归档。
+   * 保留新者（高重要度提升），旧者归档。
+   * 注意（R2-10/M1）：每对经 getById 重读当前状态是有意为之——mergePair 会
+   * 归档旧者/提升新者重要度，重读才能跳过已归档条目并感知重要度变化；
+   * getById 为同步内存读（table.get），窗口 20 条下约 380 次读，无性能问题，
+   * 勿"优化"为静态快照（会破坏已归档跳过语义）。
    */
   private async mergeDuplicates(window: MemoryEntry[]): Promise<void> {
     for (let i = 0; i < window.length; i++) {

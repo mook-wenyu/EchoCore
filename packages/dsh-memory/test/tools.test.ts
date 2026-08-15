@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
-import { registerMemoryTools, toDetail } from '../src/tools.js'
+import { registerMemoryTools, sessionIdOf, toDetail } from '../src/tools.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeTable } from './helpers.js'
@@ -151,9 +151,10 @@ describe('memory_note', () => {
     const result = (await def.execute(
       { content: '项目使用 pnpm workspace 管理多包' },
       fakeExec() as never,
-    )) as { merged: boolean; existingId: string }
+    )) as { merged: boolean; mergedWithId: string | undefined }
     expect(result.merged).toBe(true)
-    expect(result.existingId).toBe(existingId)
+    // R2-6/B6：合并时 mergedWithId 指向既有条目；未合并时该字段缺席（不再伪造空串）
+    expect(result.mergedWithId).toBe(existingId)
     expect(store.stats().total).toBe(1)
   })
 })
@@ -253,5 +254,16 @@ describe('memory_status', () => {
     const def = toolOf(tools, 'memory_status')
     const result = (await def.execute({}, fakeExec() as never)) as Record<string, unknown>
     expect(result).not.toHaveProperty('deleted')
+  })
+})
+
+// R2-5/B5：sessionId 解析——agent 缺失即抛错，禁止用 workspace 键伪造（改动前返回 DEFAULT_WORKSPACE，本测试失败）
+describe('sessionIdOf（B5 契约）', () => {
+  it('agent 存在时返回其 id', () => {
+    expect(sessionIdOf({ agent: { id: 's1', session: { id: 's1', header: { cwd: 'D:/workspace' } } } })).toBe('s1')
+  })
+
+  it('agent 缺失时抛错暴露契约违例', () => {
+    expect(() => sessionIdOf({ agent: undefined })).toThrow('缺少 agent 上下文')
   })
 })

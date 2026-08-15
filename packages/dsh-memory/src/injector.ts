@@ -20,7 +20,8 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { DEFAULT_WORKSPACE, MEMORY_PLUGIN_ID, shortSessionId } from './constants.js'
+import { DEFAULT_WORKSPACE, MEMORY_PLUGIN_ID } from './constants.js'
+import { formatMemoryLine } from './render.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
 
@@ -184,7 +185,13 @@ export function renderPack(entries: MemoryEntry[], budgetChars: number): Rendere
   let used = header.length + 1
   let truncated = false
   for (const entry of entries) {
-    const line = formatMemoryLine(entry)
+    const line = formatMemoryLine({
+      id: entry.id,
+      kind: entry.kind,
+      content: entry.content,
+      importance: entry.importance,
+      sessionId: entry.source.sessionId,
+    })
     if (used + line.length + 1 > budgetChars) {
       truncated = true
       break
@@ -198,12 +205,4 @@ export function renderPack(entries: MemoryEntry[], budgetChars: number): Rendere
     text += `\n（另有 ${entries.length - lines.length} 条相关记忆，可用 memory_recall 查看）`
   }
   return { text, ids: entries.slice(0, lines.length).map((entry) => entry.id) }
-}
-
-/** 单条记忆渲染：分类、内容、重要度、短 id（可追溯）、来源会话短 id（工具与注入共用） */
-export function formatMemoryLine(entry: MemoryEntry): string {
-  const memoryId = entry.id.slice(0, 8)
-  // 短会话 id 去 'session-' 前缀（直接 slice 会截到前缀本身，见 shortSessionId 注释）
-  const sourceSession = shortSessionId(entry.source.sessionId)
-  return `- [${entry.kind}] ${entry.content}（重要度 ${entry.importance}，记忆 #${memoryId}，来自会话 ${sourceSession}）`
 }

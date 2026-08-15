@@ -12,7 +12,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
-import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS, shortSessionId } from './constants.js'
+import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS } from './constants.js'
+import { formatMemoryLine } from './render.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry, MemoryKind } from './types.js'
 
@@ -74,9 +75,22 @@ export function toDetail(entry: MemoryEntry): MemoryDetail {
   }
 }
 
-/** 解析执行上下文中的 workspace（exec.agent 缺省时回退默认键） */
+/** 解析执行上下文中的 workspace（agent 缺省时回退默认键——"无项目"是合法业务语义，落入全局池） */
 export function workspaceOf(exec: { agent?: Agent }): string {
   return exec.agent?.session.header.cwd ?? DEFAULT_WORKSPACE
+}
+
+/**
+ * 解析执行上下文中的 sessionId。
+ * R2-5（B5）：DSH 契约下工具执行必有 agent（模型调用均发生在 agent 循环内；
+ * 无 agent 的原生直调在策略管道前被拒，见 dsh-tools ToolRunContext.agent 注释）。
+ * 缺失即抛错暴露契约违例——禁止用 workspace 键伪造 sessionId 写入来源数据（污染跨会话溯源）。
+ */
+export function sessionIdOf(exec: { agent?: Agent }): string {
+  if (exec.agent === undefined) {
+    throw new Error('工具执行缺少 agent 上下文：无法确定来源会话')
+  }
+  return exec.agent.id
 }
 
 /** 注册全部记忆工具；返回各注册的 disposer 集合（随插件 fiber 自动清理） */
@@ -126,12 +140,8 @@ function registerRecall(ctx: Context, deps: MemoryToolsDeps): void {
           additionalProperties: false,
         },
         render: (_args, value) => {
-          // 直接按行文本渲染，不再构造假 MemoryEntry 走 injector.formatMemoryLine
-          const lines = value.memories.map((memory) => {
-            const memoryId = memory.id.slice(0, 8)
-            const sessionId = shortSessionId(memory.sessionId)
-            return `- [${memory.kind}] ${memory.content}（重要度 ${memory.importance}，记忆 #${memoryId}，来自会话 ${sessionId}）`
-          })
+          // R2-7（B7）：渲染单源——直接走 render.formatMemoryLine（memory 形状即 MemoryLineView）
+          const lines = value.memories.map((memory) => formatMemoryLine(memory))
           const header =
             value.total === 0
               ? '记忆库中未找到相关记忆。'
@@ -207,10 +217,8 @@ function registerSearch(ctx: Context, deps: MemoryToolsDeps): void {
           additionalProperties: false,
         },
         render: (_args, value) => {
-          const lines = value.memories.map(
-            (memory) =>
-              `- [${memory.kind}] ${memory.content}（重要度 ${memory.importance}，记忆 #${memory.id.slice(0, 8)}，来自会话 ${shortSessionId(memory.sessionId)}）`,
-          )
+          // R2-7（B7）：渲染单源——toSummary 形状即 MemoryLineView（含 sessionId）
+          const lines = value.memories.map((memory) => formatMemoryLine(memory))
           return [{ type: 'text', text: `共 ${value.total} 条：\n${lines.join('\n')}` }]
         },
       },
@@ -257,7 +265,9 @@ function registerNote(ctx: Context, deps: MemoryToolsDeps): void {
           properties: {
             id: { type: 'string', required: true },
             merged: { type: 'boolean', required: true },
-            existingId: { type: 'string', required: true },
+            // R2-6（B6）：mergedWithId 仅在 merged=true 时有值（可选标注，V9 查证）；
+            // 禁止用空串伪造 required 假值
+            mergedWithId: { type: 'string' },
           },
           additionalProperties: false,
         },
@@ -265,7 +275,7 @@ function registerNote(ctx: Context, deps: MemoryToolsDeps): void {
           {
             type: 'text',
             text: value.merged
-              ? `内容与既有记忆 #${value.existingId?.slice(0, 8)} 合并，未新增条目。`
+              ? `内容与既有记忆 #${value.mergedWithId?.slice(0, 8)} 合并，未新增条目。`
               : `已记录记忆 #${value.id.slice(0, 8)}（可用 memory_audit ${value.id} 溯源）。`,
           },
         ],
@@ -273,13 +283,13 @@ function registerNote(ctx: Context, deps: MemoryToolsDeps): void {
       async execute(args, exec) {
         const result = await deps.store.create({
           workspace: workspaceOf(exec),
-          sessionId: exec.agent?.id ?? DEFAULT_WORKSPACE,
+          sessionId: sessionIdOf(exec),
           kind: args.kind ?? 'fact',
           content: args.content,
           importance: args.importance ?? 5,
           tags: args.tags,
           source: {
-            sessionId: exec.agent?.id ?? DEFAULT_WORKSPACE,
+            sessionId: sessionIdOf(exec),
             eventSeqs: [],
             excerpt: args.content.slice(0, EXCERPT_MAX_CHARS),
           },
@@ -288,7 +298,7 @@ function registerNote(ctx: Context, deps: MemoryToolsDeps): void {
         return {
           id: result.entry.id,
           merged: result.outcome.merged,
-          existingId: result.outcome.existingId ?? '',
+          mergedWithId: result.outcome.merged ? result.outcome.existingId : undefined,
         }
       },
     }),

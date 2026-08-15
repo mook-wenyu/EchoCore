@@ -13,7 +13,7 @@
  *   异步写回（失败只记录，不影响检索结果与主流程）。
  */
 
-import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
+import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 import { scoreEntry, tokenize } from './scoring.js'
 import {
@@ -217,6 +217,8 @@ export class MemoryStore {
    * 更新条目部分字段（追加 update 审计，更新时间戳）。
    * 白名单【不含 content】（O3）：改正文必须走 create 新建条目——content 关联 dedupKey，
    * 直接改 content 会使 dedupKey 索引与正文漂移、破坏去重。
+   * R2-2（B2）：只把"missing-key"（业务缺失）转换为 undefined；真实异常
+   * （IO 失败、schema 校验、领域关闭）原样上抛——禁止 catch 混吞掩盖存储故障。
    */
   async update(id: string, patch: Partial<Pick<MemoryEntry, 'kind' | 'importance' | 'tags'>>, by: AuditActor): Promise<MemoryEntry | undefined> {
     try {
@@ -226,8 +228,9 @@ export class MemoryStore {
         updatedAt: this.iso(),
         audit: [...current.audit, { action: 'update' as const, at: this.iso(), by }],
       }))
-    } catch {
-      return undefined // missing-key：不存在则返回 undefined（由调用方决定是否告警）
+    } catch (error) {
+      if (error instanceof DomainError && error.code === 'missing-key') return undefined
+      throw error
     }
   }
 
@@ -241,8 +244,9 @@ export class MemoryStore {
         audit: [...current.audit, { action: 'archive' as const, at: this.iso(), by }],
       }))
       return true
-    } catch {
-      return false
+    } catch (error) {
+      if (error instanceof DomainError && error.code === 'missing-key') return false
+      throw error
     }
   }
 

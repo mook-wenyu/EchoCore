@@ -63,6 +63,17 @@ export interface Config {
   maintenanceIntervalHours?: number
 }
 
+/**
+ * 解析后的必填配置（R2-4/B4 类型收窄）：
+ * 组合行 config 经 schemastery 校验时已填充默认值（运行时恒有值），
+ * 但 Config 接口全可选，类型层面无法表达"已填充"——沿用 DSH 生态
+ * 双类型模式（BasicCompactionConfig → ResolvedConfig）：
+ * apply 入口做一次显式解析 `{ ...DEFAULTS, ...config }`，此后装配
+ * 代码直接读必填字段，不再逐字段 `??`（运行时兜底是死分支，类型
+ * 收窄才是它的真实作用）。
+ */
+export type ResolvedConfig = Required<Config>
+
 /** 插件配置 schema（loader 校验与默认值填充；默认值全部引用 DEFAULTS 单源） */
 export const Config: z<Config> = z.object({
   injectBudgetChars: z.number().default(DEFAULTS.injectBudgetChars),
@@ -74,5 +85,6 @@ export const Config: z<Config> = z.object({
   enableAutoInject: z.boolean().default(DEFAULTS.enableAutoInject),
   enableExtractor: z.boolean().default(DEFAULTS.enableExtractor),
   enableMaintenance: z.boolean().default(DEFAULTS.enableMaintenance),
-  maintenanceIntervalHours: z.number().default(DEFAULTS.maintenanceIntervalHours),
+  /** 后台整理任务间隔（小时；R2-10/M2：最小 1，非法值由 schema 校验拒绝而非运行时夹逼） */
+  maintenanceIntervalHours: z.number().min(1).default(DEFAULTS.maintenanceIntervalHours),
 })

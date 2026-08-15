@@ -1,15 +1,35 @@
 /**
  * 共享测试辅助：内存假表（实现 KvTable 结构契约）。
- * 与领域层行为一致：update 对缺失键抛 missing-key；写操作即时生效。
+ * 与领域层行为一致：update 对缺失键抛 **DomainError('missing-key')**（R2-2/B2：
+ * store 只把该码转换为业务语义，其余异常上抛——假表必须抛同型错误才能测到
+ * 精确转换；普通 Error 会让 store 误判为"真实异常"而上抛，测不出业务路径）。
+ * R3-2：failNextWrite 钩子模拟持久化失败（真实异常传播路径的测试入口）。
  */
 
-import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
+import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 import type { MemoryEntry } from '../src/types.js'
 
 /** 内存假表：同步内存语义 + 异步签名（对齐 KvTable 接口） */
 export class FakeTable implements KvTable<string, MemoryEntry> {
   private readonly map = new Map<string, MemoryEntry>()
+  /** 下一次写操作（put/update/delete）注入的失败（R3-2：失败注入钩子，一次即清除） */
+  private nextWriteError: unknown = undefined
+
+  /** 注入下一次写失败（传 Error/DomainError/任意值）；返回 this 便于链式 */
+  failNextWrite(error: unknown): this {
+    this.nextWriteError = error
+    return this
+  }
+
+  /** 写前失败注入检查：有挂起错误则抛出并清除（一次性） */
+  private throwIfInjected(): void {
+    if (this.nextWriteError !== undefined) {
+      const error = this.nextWriteError
+      this.nextWriteError = undefined
+      throw error
+    }
+  }
 
   get(key: string): MemoryEntry | undefined {
     return this.map.get(key)
@@ -32,16 +52,19 @@ export class FakeTable implements KvTable<string, MemoryEntry> {
   }
 
   async put(key: string, value: MemoryEntry): Promise<void> {
+    this.throwIfInjected()
     this.map.set(key, value)
   }
 
   async delete(key: string): Promise<boolean> {
+    this.throwIfInjected()
     return this.map.delete(key)
   }
 
   async update(key: string, fn: (current: MemoryEntry) => MemoryEntry): Promise<MemoryEntry> {
+    this.throwIfInjected()
     const current = this.map.get(key)
-    if (current === undefined) throw new Error('missing-key')
+    if (current === undefined) throw new DomainError('missing-key', `记录不存在：${key}`)
     const next = fn(current)
     this.map.set(key, next)
     return next

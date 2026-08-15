@@ -130,6 +130,22 @@ describe('MemoryStore 状态流转', () => {
     expect(store.search({ query: '中文' })).toHaveLength(1)
     expect(store.getById(again.entry.id)?.status).toBe('active')
   })
+
+  // R2-2/B2：只把 missing-key 转换为业务语义，真实异常（IO/校验/closed）原样上抛——
+  // 禁止 catch 混吞掩盖存储故障（改动前：普通 Error 会被吞成 undefined，本测试失败）
+  it('update 遇真实异常（非 missing-key）上抛，不吞成 undefined', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    table.failNextWrite(new Error('磁盘写入失败'))
+    await expect(store.update('any-id', { importance: 9 }, 'tool')).rejects.toThrow('磁盘写入失败')
+  })
+
+  it('archive 遇真实异常（非 missing-key）上抛，不吞成 false', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    table.failNextWrite(new Error('磁盘写入失败'))
+    await expect(store.archive('any-id', 'tool')).rejects.toThrow('磁盘写入失败')
+  })
 })
 
 describe('MemoryStore.search', () => {

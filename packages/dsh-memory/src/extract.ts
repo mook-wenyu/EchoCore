@@ -104,16 +104,54 @@ export function renderEventsText(events: readonly SessionEvent[]): string {
 }
 
 /**
+ * 从文本中提取第一个平衡的 JSON 对象（跳过字符串内的花括号）。
+ * R2-11/M3：取代贪婪正则 `/\{[\s\S]*\}/`——后者会从首个 `{` 截到最后一个 `}`，
+ * LLM 输出在 JSON 后附带含 `}` 的说明文本时会被错误吞并。
+ */
+function extractBalancedJson(text: string): string | undefined {
+  const start = text.indexOf('{')
+  if (start === -1) return undefined
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) return text.slice(start, i + 1)
+    }
+  }
+  return undefined
+}
+
+/**
  * 解析 LLM 结构化输出为记忆列表。
  * 严格模式：非 JSON / 形状不符 / 分类非法 / 内容为空的条目一律丢弃；
  * 返回 [] 而非抛错（调用方据此判定"无可提取"）。
  */
 export function parseExtractionOutput(text: string): ExtractedMemory[] {
-  const match = text.match(/\{[\s\S]*\}/)
-  if (!match) return []
+  const match = extractBalancedJson(text)
+  if (match === undefined) return []
   let raw: unknown
   try {
-    raw = JSON.parse(match[0])
+    raw = JSON.parse(match) // match 已是提取出的完整 JSON 对象文本（extractBalancedJson）
   } catch {
     return []
   }
@@ -144,12 +182,17 @@ export function parseExtractionOutput(text: string): ExtractedMemory[] {
 /**
  * 解析会话的当前模型路由：最新 request/header → agent.options 回退。
  * 无路由返回 undefined（调用方跳过提取并告警）。
+ * R2-11/M4：倒序索引遍历不构造数组（`[...events].reverse()` 每次全量拷贝）。
  */
 export function resolveRoute(session: Session, agent: Agent | undefined): { provider: string; model: string } | undefined {
-  const header = [...session.events].reverse().find((event) => event.type === 'request/header')
-  if (header !== undefined) {
-    const config = header.data.header.config
+  const events = session.events
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (event === undefined) continue // noUncheckedIndexedAccess
+    if (event.type !== 'request/header') continue
+    const config = event.data.header.config
     if (config.provider && config.model) return { provider: config.provider, model: config.model }
+    break // 最近的 request/header 无有效路由，不再看更早的
   }
   if (agent !== undefined && agent.options.provider && agent.options.model) {
     return { provider: agent.options.provider, model: agent.options.model }

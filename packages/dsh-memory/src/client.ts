@@ -58,13 +58,15 @@ export interface MemoryPanelApi {
   status(): Promise<MemoryStatsView>
 }
 
-/** 从 ctx 装配面板 API（connection 缺失时所有调用返回空结果） */
+/** 从 ctx 装配面板 API（R2-3/B3：connection 为硬 inject，缺失则插件不加载，运行期必有） */
 export function createMemoryApi(ctx: Context): MemoryPanelApi {
-  const connection = ctx.get('connection') as { rpc: { call(channel: string, endpoint: string, payload: unknown): Promise<RpcResult<unknown>> } } | undefined
-  const call = async (endpoint: string, payload: unknown): Promise<RpcResult<unknown>> => {
-    if (connection === undefined) return { ok: false, error: { code: 'internal', message: 'connection 服务不可用', details: {} } }
-    return connection.rpc.call('/memory', endpoint, payload)
+  // ctx.get 返回 unknown（Cordis 未在 Context 类型声明 connection 服务），
+  // 类型强转保留；optional 守卫删除——守卫是防御性死代码（inject 语义保证存在）
+  const connection = ctx.get('connection') as {
+    rpc: { call(channel: string, endpoint: string, payload: unknown): Promise<RpcResult<unknown>> }
   }
+  const call = (endpoint: string, payload: unknown): Promise<RpcResult<unknown>> =>
+    connection.rpc.call('/memory', endpoint, payload)
   const unwrap = (result: RpcResult<unknown>): unknown => {
     if (result.ok) return result.value
     throw new Error(result.error.message)

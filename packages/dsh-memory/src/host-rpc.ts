@@ -55,14 +55,15 @@ export function createMemoryRpcHandler(store: MemoryStore): MemoryRpcHandler {
   }
 }
 
-/** 注册到 ctx.connection.rpc（connection 服务缺失时告警并跳过） */
-export function registerMemoryRpc(ctx: Context, store: MemoryStore, logger: Pick<ReturnType<Context['logger']>, 'warn'>): void {
-  const connection = ctx.get('connection') as
-    | { rpc: { handle(channel: string, handler: MemoryRpcHandler, options: { authority: string }): () => Promise<void> } }
-    | undefined
-  if (connection === undefined) {
-    logger.warn('[dsh-memory] connection 服务不可用，记忆面板 RPC 未注册')
-    return
+/**
+ * 注册到 ctx.connection.rpc。
+ * R2-3（B3）：connection 已声明为硬 inject（index.ts）——Cordis 语义"缺失则不加载"，
+ * 运行期必有该服务，删除 optional 守卫（防御性死代码）。
+ * ctx.get 返回 unknown，类型强转保留（Cordis 未在 Context 类型声明 connection）。
+ */
+export function registerMemoryRpc(ctx: Context, store: MemoryStore): void {
+  const connection = ctx.get('connection') as {
+    rpc: { handle(channel: string, handler: MemoryRpcHandler, options: { authority: string }): () => Promise<void> }
   }
   const dispose = connection.rpc.handle('/memory', createMemoryRpcHandler(store), { authority: 'loopback' })
   ctx.effect(() => () => {
