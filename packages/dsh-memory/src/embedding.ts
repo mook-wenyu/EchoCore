@@ -48,12 +48,13 @@ export class EmbeddingUnavailableError extends Error {
 /** 嵌入服务运行状态（一等状态，装配层与调用方据此决策） */
 export type EmbeddingState = 'disabled' | 'loading' | 'ready' | 'error'
 
-/** 远程嵌入配置（OpenAI 兼容 /embeddings 端点） */
+/** 远程嵌入 API key 环境变量名（用户拍板：apiKey 不落盘配置，从环境变量读取） */
+export const EMBEDDING_API_KEY_ENV = 'EMBEDDING_API_KEY'
+
+/** 远程嵌入配置（OpenAI 兼容 /embeddings 端点；apiKey 不在此——环境变量提供） */
 export interface RemoteEmbeddingConfig {
   /** 端点 base URL（如 https://api.siliconflow.cn/v1；尾部斜杠自动剥除） */
   baseUrl: string
-  /** API key（供应商独立 key，与 DSH/DeepSeek key 无关） */
-  apiKey: string
   /** 模型名（如 BAAI/bge-m3、Qwen/Qwen3-Embedding-0.6B） */
   model: string
   /** 期望输出维度（供应商文档声明；返回维度 ≠ 此值时报错防混维） */
@@ -118,14 +119,18 @@ export function defaultFetchRemoteEmbeddings(
   return remoteEmbedFetch(input, config)
 }
 
-/** OpenAI 兼容 /embeddings 请求实现（纯函数形态，便于直接单测） */
+/** OpenAI 兼容 /embeddings 请求实现（纯函数形态，便于直接单测；apiKey 从环境变量读取） */
 export async function remoteEmbedFetch(input: string[], config: RemoteEmbeddingConfig): Promise<Float32Array[]> {
+  const apiKey = process.env[EMBEDDING_API_KEY_ENV]
+  if (apiKey === undefined || apiKey === '') {
+    throw new EmbeddingUnavailableError(`远程嵌入不可用：环境变量 ${EMBEDDING_API_KEY_ENV} 未设置`)
+  }
   const base = config.baseUrl.replace(/\/+$/, '')
   const response = await fetch(`${base}/embeddings`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({ model: config.model, input, encoding_format: 'float' }),
   })
