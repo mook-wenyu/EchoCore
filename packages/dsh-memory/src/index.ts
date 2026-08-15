@@ -30,6 +30,7 @@ import { migrateMemoryJson, SqliteKvTable } from './sqlite-kv.js'
 import { MemoryStableSnapshot } from './stable-snapshot.js'
 import { MemoryStore } from './store.js'
 import { registerMemoryTools } from './tools.js'
+import { jiebaWords } from './scoring.js'
 import type { MemoryEntry } from './types.js'
 
 export const name = 'memory'
@@ -97,7 +98,7 @@ export async function mountMemory(
   ctx.effect(() => () => {
     if (db.isOpen) db.close()
   })
-  const table = new SqliteKvTable<MemoryEntry>(db, MEMORY_TABLE)
+  const table = new SqliteKvTable<MemoryEntry>(db, MEMORY_TABLE, (entry) => jiebaWords(entry.content).join(' '))
   if (table.size === 0) {
     const legacyFile = overrides.legacyJsonFile ?? legacyMemoryJsonFile()
     const { migrated, skipped } = await migrateMemoryJson(legacyFile, table, (raw) =>

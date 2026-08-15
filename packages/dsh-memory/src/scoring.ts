@@ -27,6 +27,9 @@ const CJK_GRAM = 2
 const WORD_RE = /[a-z0-9]+/g
 
 /** 基础半衰期（天）：importance 5 时的半衰期（与 P3 前默认一致） */
+import { Jieba } from '@node-rs/jieba'
+import { dict } from '@node-rs/jieba/dict'
+
 const BASE_HALF_LIFE_DAYS = 7
 
 /** 半衰期重要度敏感度：importance 每 +2，半衰期翻倍（2^((imp-5)/2)） */
@@ -76,8 +79,14 @@ function isCjk(ch: string): boolean {
 }
 
 /**
- * 文本分词：英文单词（小写）+ 中文连续段按二元组切分。
- * 例："使用 pnpm workspace" → ["pnpm", "workspace", "使用", "用p", "pn"（前两个来自"使用"的 2-gram）...]
+ * 文本分词（J1 升级，2026-08-15）：英文单词（小写）+ jieba 中文词（真实词边界）
+ * + 中文 2-gram（任意 2 字子串兜底）——**并集语义**：
+ * - jieba 词：真实词边界（修 2-gram 的"项目/项目偏"重叠歧义，语义质量）；
+ * - 2-gram 兜底：jieba 对未登录词会切碎成单字（OOV 缺陷），2-gram 保证
+ *   任意 2 字组合必命中——召回不丢失（"项目偏好"中"目偏"仍可检索）；
+ * - 输出去重（jieba 词与 2-gram 重叠只留一个——relevance 分母不稀释）。
+ * 例："记忆系统架构设计" → ["记忆系统", "架构设计", "记忆", "忆系", "系统", ...]
+ * jieba 单例惰性初始化（Jieba.withDict 默认词典；cut 同步 0.4ms/次）。
  */
 export function tokenize(text: string): string[] {
   const tokens: string[] = []
@@ -86,6 +95,20 @@ export function tokenize(text: string): string[] {
   // 英文/数字单词
   for (const match of lower.matchAll(WORD_RE)) {
     tokens.push(match[0])
+  }
+
+  // J1：jieba 中文词（真实词边界；过滤空白；英文词与 WORD_RE 重复由末尾去重收敛）。
+  // 中文单字丢弃——jieba 对 OOV 会切碎成单字，单字无检索价值且稀释 relevance
+  // 分母（实测 '怎么用' → '用' 单字使命中率 0.5→0.4 跌破门槛）；单字场景由
+  // 下方 2-gram 路径的退化分支覆盖（连续 CJK 段长度 1 时 push 单字）。
+  for (const word of jieba().cut(text)) {
+    const w = word.trim()
+    if (w === '') continue
+    if (isCjk(w[0] ?? '')) {
+      if (w.length >= 2) tokens.push(w.toLowerCase())
+    } else if (/^[a-z0-9]+$/i.test(w)) {
+      tokens.push(w.toLowerCase())
+    }
   }
 
   // 中文二元组：连续 CJK 字符按滑动窗口切分（长度 1 时退化为单字）
@@ -100,7 +123,39 @@ export function tokenize(text: string): string[] {
   }
   if (run.length > 0) appendCjkTokens(tokens, run)
 
-  return tokens
+  // J1 去重：jieba 词与 2-gram/英文重叠只留一个（relevance 分母不稀释；
+  // 顺序保持——先英文、再 jieba 词、后 2-gram 兜底）
+  return [...new Set(tokens)]
+}
+
+/**
+ * jieba 分词器单例（J1）：@node-rs/jieba N-API 预编译（Windows x64 免编译），
+ * 默认词典随包（Jieba.withDict）；惰性初始化——首次 tokenize 才加载词典
+ * （~10ms 一次性；cut 同步 ~0.4ms/次）。
+ */
+let jiebaInstance: Jieba | undefined
+function jieba(): Jieba {
+  if (jiebaInstance === undefined) {
+    jiebaInstance = Jieba.withDict(dict)
+  }
+  return jiebaInstance
+}
+
+/**
+ * jieba 中文词列表（J2 预分词列数据源；装配层派生 content_tokens 用）。
+ * 过滤空白与中文单字（与 tokenize 的 jieba 路径同语义——单字无索引价值）；
+ * 英文词不含（FTS5 unicode61 对英文按词边界天然切分，预分词列只补中文）。
+ */
+export function jiebaWords(text: string): string[] {
+  const words: string[] = []
+  for (const word of jieba().cut(text)) {
+    const w = word.trim()
+    if (w === '' || w.length === 0) continue
+    if (isCjk(w[0] ?? '')) {
+      if (w.length >= 2) words.push(w)
+    }
+  }
+  return words
 }
 
 /** 把一段连续 CJK 文本追加为二元组 token */

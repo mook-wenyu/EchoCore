@@ -37,9 +37,9 @@ import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
  * @param isValid 记录校验（memoryEntrySchema.safeParse）
  * @returns 迁移数（坏记录计入 skipped）
  */
-export async function migrateMemoryJson(
+export async function migrateMemoryJson<V>(
   jsonPath: string,
-  table: SqliteKvTable<unknown>,
+  table: SqliteKvTable<V>,
   isValid: (raw: unknown) => boolean,
 ): Promise<{ migrated: number; skipped: number }> {
   let raw: string
@@ -57,7 +57,7 @@ export async function migrateMemoryJson(
       skipped++
       continue
     }
-    await table.put(id, record)
+    await table.put(id, record as V)
     migrated++
   }
   return { migrated, skipped }
@@ -77,6 +77,12 @@ function deserialize(text: string): unknown {
  * KvTable 契约的 SQLite 适配层（V = 记录对象形态，与 storage-domain 同语义）。
  * 注意：KvTable 的 entries()/keys() 要求快照迭代——内存 Map 天然满足
  * （迭代期间写只改 Map 不破坏迭代器快照语义）。
+ *
+ * J2（2026-08-15 预分词列）：可选 `deriveTokens` 回调——装配层注入领域分词
+ * （jieba 词空格分隔），put/update 时同步写入 `content_tokens` 列。该列是
+ * **未来 FTS5 索引的数据源**（unicode61 对空格分隔中文词天然可索引）——当前
+ * 只写不读（5 万条规模才建 FTS 索引，YAGNI）；KvTable 通用性保持（回调注入
+ * 领域逻辑，本类不感知记录结构）。
  */
 export class SqliteKvTable<V> implements KvTable<string, V> {
   /** 内存权威态（同步读；KvTable 契约要求 get/entries 同步） */
@@ -91,16 +97,21 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
   /**
    * @param db 已打开的 SQLite 连接（调用方负责生命周期；测试用 :memory:）
    * @param tableName 表名（默认 entries；多域隔离时传不同表名）
+   * @param deriveTokens J2 可选分词派生（value → 空格分隔 token 文本；无则不写列）
    */
   constructor(
     private readonly db: DatabaseSync,
     private readonly tableName = 'entries',
+    private readonly deriveTokens?: (value: V) => string,
   ) {
     // WAL：写事务日志追加（~4MB checkpoint），主库不重写——O(1) 写的前提
     this.db.exec('PRAGMA journal_mode = WAL')
-    this.db.exec(`CREATE TABLE IF NOT EXISTS "${tableName}" (id TEXT PRIMARY KEY, value TEXT NOT NULL)`)
+    this.db.exec(
+      `CREATE TABLE IF NOT EXISTS "${tableName}" (id TEXT PRIMARY KEY, value TEXT NOT NULL, content_tokens TEXT)`,
+    )
     this.upsertStmt = this.db.prepare(
-      `INSERT INTO "${tableName}" (id, value) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value`,
+      `INSERT INTO "${tableName}" (id, value, content_tokens) VALUES (?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET value = excluded.value, content_tokens = excluded.content_tokens`,
     )
     this.deleteStmt = this.db.prepare(`DELETE FROM "${tableName}" WHERE id = ?`)
     // 启动加载：SQLite → 内存权威态（与 storage-json loadAll 同语义）
@@ -134,7 +145,7 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
   put(key: string, value: V): Promise<void> {
     this.cache.set(key, value)
     return this.enqueue(() => {
-      this.upsertStmt.run(key, serialize(value))
+      this.upsertStmt.run(key, serialize(value), this.deriveTokens?.(value) ?? null)
     })
   }
 
@@ -159,7 +170,7 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
     const next = fn(current)
     this.cache.set(key, next)
     return this.enqueue(() => {
-      this.upsertStmt.run(key, serialize(next))
+      this.upsertStmt.run(key, serialize(next), this.deriveTokens?.(next) ?? null)
     }).then(() => next)
   }
 

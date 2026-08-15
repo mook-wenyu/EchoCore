@@ -66,6 +66,31 @@ describe('tokenize', () => {
     expect(tokenize('')).toEqual([])
     expect(tokenize('   ')).toEqual([])
   })
+
+  it('J1 jieba 词边界：真实中文词入 token（并集语义，词+2-gram 兜底）', () => {
+    const tokens = tokenize('记忆系统架构设计')
+    // jieba 真实词边界（语义质量）
+    expect(tokens).toContain('记忆系统')
+    expect(tokens).toContain('架构设计')
+    // 2-gram 兜底（任意 2 字子串召回保持——jieba 不切的组合也能命中）
+    expect(tokens).toContain('忆系')
+    expect(tokens).toContain('统架')
+  })
+
+  it('J1 并集召回：jieba 未切出的 2 字组合仍可检索（2-gram 兜底不丢失）', () => {
+    // '项目偏好' jieba 切为 项目/偏好；'目偏' 由 2-gram 兜底
+    const tokens = tokenize('项目偏好')
+    expect(tokens).toContain('项目')
+    expect(tokens).toContain('偏好')
+    expect(tokens).toContain('目偏')
+  })
+
+  it('J1 输出去重：jieba 词与 2-gram 重叠不重复（Set 语义，分母不稀释）', () => {
+    const tokens = tokenize('记忆系统')
+    // '系统' 既是 jieba 词也是 2-gram——只出现一次
+    const count = tokens.filter((t) => t === '系统').length
+    expect(count).toBe(1)
+  })
 })
 
 describe('relevanceScore', () => {

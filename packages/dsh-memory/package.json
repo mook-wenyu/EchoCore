@@ -19,7 +19,10 @@
   "dsh": {
     "client": {
       "platform": "web",
-      "inject": ["slots", "connection"],
+      "inject": [
+        "slots",
+        "connection"
+      ],
       "immediately": true
     }
   },
@@ -48,6 +51,7 @@
     "@deepseek-ai/dsh-workspace": "^0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.0",
     "@huggingface/transformers": "^4.2.0",
+    "@node-rs/jieba": "^2.0.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {

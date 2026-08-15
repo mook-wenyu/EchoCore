@@ -105,6 +105,33 @@ describe('SqliteKvTable', () => {
     db.close()
     rmSync(join(path, '..'), { recursive: true, force: true })
   })
+
+  it('J2 预分词列：deriveTokens 回调写入 content_tokens（未来 FTS5 数据源）', async () => {
+    const path = tmpDbPath()
+    const db = new DatabaseSync(path)
+    const table = new SqliteKvTable<{ id: string; content: string }>(db, 'entries', (value) =>
+      value.content
+        .split(' ')
+        .filter((w) => w.length > 0)
+        .join(' '),
+    )
+    await table.put('a', { id: 'a', content: '记忆系统 架构设计' })
+    await table.update('a', (c) => ({ ...c, content: '记忆系统 覆盖机制' }))
+    const row = db.prepare('SELECT content_tokens FROM entries WHERE id = ?').get('a') as { content_tokens: string }
+    expect(row.content_tokens).toBe('记忆系统 覆盖机制')
+    db.close()
+    rmSync(join(path, '..'), { recursive: true, force: true })
+  })
+
+  it('J2 无 deriveTokens 时 content_tokens 为 NULL（通用 KvTable 语义保持）', async () => {
+    const path = tmpDbPath()
+    const { table, db } = setup(path)
+    await table.put('a', { id: 'a', n: 1 })
+    const row = db.prepare('SELECT content_tokens FROM entries WHERE id = ?').get('a') as { content_tokens: string | null }
+    expect(row.content_tokens).toBeNull()
+    db.close()
+    rmSync(join(path, '..'), { recursive: true, force: true })
+  })
 })
 
 void DomainError
