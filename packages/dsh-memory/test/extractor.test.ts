@@ -397,3 +397,58 @@ describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
     expect(llm.calls).toBe(1)
   })
 })
+
+describe('提取器串行链并发（O7 竞态防回归）', () => {
+  it('两事件背靠背入队：串行处理不交错、水位按序推进、无事件丢失', async () => {
+    const ctx = new FakeCtx()
+    const store = new MemoryStore(new FakeTable())
+    // 闸门式假 llm：第一次调用阻塞到 release，制造"处理未完成时下一事件入队"的窗口
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const transcripts: string[] = []
+    const llm = {
+      async *stream(options: Record<string, unknown>): AsyncIterable<StreamChunk> {
+        const transcript = (options.messages as Array<{ content: Array<{ text: string }> }>)[0]?.content[0]?.text ?? ''
+        transcripts.push(transcript)
+        await gate // 阻塞：模拟慢 LLM，制造链上堆积
+        yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+        yield { type: 'text-delta', index: 0, text: '{"memories":[]}' } as StreamChunk
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: '{"memories":[]}' } } as StreamChunk
+        yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+      },
+    }
+    const extractor = new MemoryExtractor({
+      store,
+      llm,
+      logger: { warn: () => {}, info: () => {} },
+      config: config({ minExtractChars: 5 }), // 阈值低于测试文本，确保每回合都触发提取
+    })
+    extractor.install(ctx as unknown as Context)
+    const listener = ctx.listeners.get('session/event')
+    if (listener === undefined) throw new Error('session/event 监听未注册')
+
+    // 两个回合背靠背投递（第二条在第一条处理中被阻塞时入队）
+    const session = makeSession('s1', [
+      headerEvent(1),
+      userEvent(2, '第一条记忆文本'),
+      turnEndEvent(10, 1),
+      userEvent(11, '第二条记忆文本'),
+      turnEndEvent(20, 2),
+    ])
+    listener(session, session.events[2] as SessionEvent) // turnEnd(10)
+    listener(session, session.events[4] as SessionEvent) // turnEnd(20)——第一条仍在链上阻塞
+    await settle()
+    // 释放闸门：两条处理按入队顺序完成
+    release()
+    await settle()
+
+    expect(transcripts.length).toBe(2)
+    expect(transcripts[0]).toContain('第一条记忆文本')
+    expect(transcripts[1]).toContain('第二条记忆文本')
+    // 串行不交错：第二条摘录不含第一条的批次（水位按序推进，无重复处理）
+    expect(transcripts[1]).not.toContain('第一条记忆文本')
+    expect(store.stats().total).toBe(0) // 摘录返回空 memories，无写入
+  })
+})

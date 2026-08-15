@@ -46,6 +46,7 @@ describe('memory RPC 端点', () => {
 
     await store.archive(id, 'tool')
     const active = await handler('list', { status: 'active' })
+    expect(active.ok).toBe(true)
     if (!active.ok) return
     expect((active.value as { total: number }).total).toBe(1)
   })
@@ -57,10 +58,13 @@ describe('memory RPC 端点', () => {
 
     const byKind = await handler('search', { kind: 'todo' })
     expect(byKind.ok).toBe(true)
-    if (byKind.ok) expect((byKind.value as { total: number }).total).toBe(1)
+    if (!byKind.ok) return
+    expect((byKind.value as { total: number }).total).toBe(1)
 
     const byQuery = await handler('search', { query: 'pnpm' })
-    if (byQuery.ok) expect((byQuery.value as { total: number }).total).toBe(1)
+    expect(byQuery.ok).toBe(true)
+    if (!byQuery.ok) return
+    expect((byQuery.value as { total: number }).total).toBe(1)
   })
 
   it('get：命中返回详情，未命中返回 found=false', async () => {
@@ -75,7 +79,9 @@ describe('memory RPC 端点', () => {
     expect(value.entry?.source.eventSeqs).toEqual([1, 2])
 
     const miss = await handler('get', { id: 'missing' })
-    if (miss.ok) expect((miss.value as { found: boolean }).found).toBe(false)
+    expect(miss.ok).toBe(true)
+    if (!miss.ok) return
+    expect((miss.value as { found: boolean }).found).toBe(false)
   })
 
   it('get：详情透传 supersede 链（supersededBy/supersedes）', async () => {
@@ -120,7 +126,8 @@ describe('memory RPC 端点', () => {
     await seed(store)
     const result = await handler('status', null)
     expect(result.ok).toBe(true)
-    if (result.ok) expect((result.value as { total: number }).total).toBe(1)
+    if (!result.ok) return
+    expect((result.value as { total: number }).total).toBe(1)
   })
 })
 
@@ -129,7 +136,8 @@ describe('memory RPC 载荷校验', () => {
     const { handler } = setup()
     const result = await handler('explode', {})
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.error.code).toBe('internal')
+    if (result.ok) return
+    expect(result.error.code).toBe('internal')
   })
 
   it('畸形载荷返回 internal 错误', async () => {

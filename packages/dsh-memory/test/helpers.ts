@@ -15,12 +15,16 @@ export class FakeTable implements KvTable<string, MemoryEntry> {
     return this.map.get(key)
   }
 
+  /**
+   * 快照迭代（对齐真实 KvTable 契约——已查证 dsh-storage-domain 的 entries()
+   * 返回内存快照数组的迭代器；live Map 迭代会在迭代中写入时产生语义差异）。
+   */
   entries(): IterableIterator<[string, MemoryEntry]> {
-    return this.map.entries()
+    return [...this.map.entries()][Symbol.iterator]() as IterableIterator<[string, MemoryEntry]>
   }
 
   keys(): IterableIterator<string> {
-    return this.map.keys()
+    return [...this.map.keys()][Symbol.iterator]() as IterableIterator<string>
   }
 
   get size(): number {

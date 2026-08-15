@@ -122,24 +122,28 @@ describe('MemoryInjector pre-step 注入', () => {
     await seed(store)
     const none = await preStep(makePayload('s1', '完全不相关的词汇组合'), async () => enterDecision())
     expect(none.kind).toBe('enter')
-    if (none.kind === 'enter') expect(none.messages).toHaveLength(1)
+    expect(none.messages).toHaveLength(1)
     const empty = await preStep({ agent: { id: 's1', session: makeSession('s1') }, messages: [{ id: 'x', role: 'user', content: [], source: { kind: 'user' } }] }, async () => enterDecision())
     expect(empty.kind).toBe('enter')
-    if (empty.kind === 'enter') expect(empty.messages).toHaveLength(1)
+    expect(empty.messages).toHaveLength(1)
   })
 
   it('workspace 隔离：他项目记忆不注入', async () => {
     const { preStep, store } = setup()
     await seed(store, { workspace: 'D:/other-project' })
     const decision = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
-    if (decision.kind === 'enter') expect(decision.messages).toHaveLength(1)
+    // 无条件断言（防弱断言静默跳过）：他项目记忆不注入 → 消息保持原样 1 条
+    expect(decision.kind).toBe('enter')
+    expect(decision.messages).toHaveLength(1)
   })
 
   it('enableAutoInject=false 时完全静默', async () => {
     const { preStep, store } = setup({ enableAutoInject: false })
     await seed(store)
     const decision = await preStep(makePayload('s1', 'pnpm'), async () => enterDecision())
-    if (decision.kind === 'enter') expect(decision.messages).toHaveLength(1)
+    // 无条件断言：开关关闭 → 原样透传 enter（注入发生则消息变 2，断言失败）
+    expect(decision.kind).toBe('enter')
+    expect(decision.messages).toHaveLength(1)
   })
 
   it('同一记忆已注入且仍在表层时不重复注入', async () => {
