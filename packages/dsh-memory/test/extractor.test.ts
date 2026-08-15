@@ -9,17 +9,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { MemoryExtractor, type ExtractorConfig } from '../src/extractor.js'
 import { MemoryStore } from '../src/store.js'
-import { FakeTable, settle } from './helpers.js'
-/** 假 ctx：捕获事件监听器，供测试直接驱动 */
-class FakeCtx {
-  readonly listeners = new Map<string, (...args: unknown[]) => void>()
-  on(type: string, listener: (...args: unknown[]) => void): void {
-    this.listeners.set(type, listener)
-  }
-  get(): undefined {
-    return undefined
-  }
-}
+import { FakeCtx, FakeTable, settle } from './helpers.js'
 
 /** 假 llm：记录调用次数与摘录文本，按设定返回 JSON 或抛错 */
 class FakeLlm {
@@ -131,7 +121,7 @@ function setup(options: { output?: string | Error; config?: ExtractorConfig } = 
   const logger = { warn: () => {}, info: () => {} }
   const extractor = new MemoryExtractor({ store, llm, logger, config: config(options.config) })
   extractor.install(ctx as unknown as Context)
-  const listener = ctx.listeners.get('session/event')
+  const listener = ctx.listener('session/event')
   if (listener === undefined) throw new Error('session/event 监听未注册')
   return { ctx, store, llm, listener }
 }
@@ -207,7 +197,7 @@ describe('MemoryExtractor 失败与开关', () => {
     const logger = { warn: () => {}, info: () => {} }
     const extractor = new MemoryExtractor({ store, llm: failing, logger, config: config() })
     extractor.install(ctx as unknown as Context)
-    const listener = ctx.listeners.get('session/event')
+    const listener = ctx.listener('session/event')
     if (listener === undefined) throw new Error('监听未注册')
 
     const session = makeSession('s1', [headerEvent(1), userEvent(2, '乙'.repeat(200)), turnEndEvent(3, 1)])
@@ -222,7 +212,7 @@ describe('MemoryExtractor 失败与开关', () => {
     const extractor2 = new MemoryExtractor({ store, llm: healthy, logger, config: config() })
     const ctx2 = new FakeCtx()
     extractor2.install(ctx2 as unknown as Context)
-    const listener2 = ctx2.listeners.get('session/event')
+    const listener2 = ctx2.listener('session/event')
     if (listener2 === undefined) throw new Error('监听未注册')
     listener2(session, turnEndEvent(5, 2))
     await settle()
@@ -268,7 +258,7 @@ describe('MemoryExtractor 长文本截断（O1-3 maxExtractChars）', () => {
       },
     })
     extractor.install(ctx as unknown as Context)
-    const listener = ctx.listeners.get('session/event')
+    const listener = ctx.listener('session/event')
     if (listener === undefined) throw new Error('监听未注册')
     return { warns, llm, listener, store }
   }
@@ -323,8 +313,8 @@ describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
       config: config({ minExtractChars: 1000 }), // 远高于文本量，正常路径不会触发
     })
     extractor.install(ctx as unknown as Context)
-    const listener = ctx.listeners.get('session/event')
-    const dispose = ctx.listeners.get('agent/disposed')
+    const listener = ctx.listener('session/event')
+    const dispose = ctx.listener('agent/disposed')
     if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
     const session = makeSession('s1', [headerEvent(1), userEvent(2, '短文本'), turnEndEvent(3, 1)])
     // 文本量 < minExtractChars(1000)：增量通道只挂起不提取
@@ -350,8 +340,8 @@ describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
       config: config({ minExtractChars: 1000 }),
     })
     extractor.install(ctx as unknown as Context)
-    const listener = ctx.listeners.get('session/event')
-    const dispose = ctx.listeners.get('agent/disposed')
+    const listener = ctx.listener('session/event')
+    const dispose = ctx.listener('agent/disposed')
     if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
     const session = makeSession('s1', [headerEvent(1), userEvent(2, '短文本'), turnEndEvent(3, 1)])
     listener(session, session.events[1] as SessionEvent)
@@ -380,8 +370,8 @@ describe('MemoryExtractor 会话结束 flush（O1-4）', () => {
       config: config({ minExtractChars: 1000 }),
     })
     extractor.install(ctx as unknown as Context)
-    const listener = ctx.listeners.get('session/event')
-    const dispose = ctx.listeners.get('agent/disposed')
+    const listener = ctx.listener('session/event')
+    const dispose = ctx.listener('agent/disposed')
     if (listener === undefined || dispose === undefined) throw new Error('监听未注册')
     const session = makeSession('s1', [headerEvent(1), userEvent(2, '短文本'), turnEndEvent(3, 1)])
     listener(session, session.events[1] as SessionEvent)
@@ -426,7 +416,7 @@ describe('提取器串行链并发（O7 竞态防回归）', () => {
       config: config({ minExtractChars: 5 }), // 阈值低于测试文本，确保每回合都触发提取
     })
     extractor.install(ctx as unknown as Context)
-    const listener = ctx.listeners.get('session/event')
+    const listener = ctx.listener('session/event')
     if (listener === undefined) throw new Error('session/event 监听未注册')
 
     // 两个回合背靠背投递（第二条在第一条处理中被阻塞时入队）

@@ -8,17 +8,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { registerSnapshot } from '../src/snapshot.js'
 import { MemoryStore } from '../src/store.js'
-import { FakeTable } from './helpers.js'
-
-/** 假 ctx：捕获 session/event 与 agent/disposed 监听 */
-class FakeCtx {
-  sessionListener: ((session: Session, event: SessionEvent) => void) | undefined
-  disposedListener: ((payload: { agent: { id: string; session: Session } }) => void) | undefined
-  on(type: string, listener: unknown): void {
-    if (type === 'session/event') this.sessionListener = listener as FakeCtx['sessionListener']
-    if (type === 'agent/disposed') this.disposedListener = listener as FakeCtx['disposedListener']
-  }
-}
+import { FakeCtx, FakeTable } from './helpers.js'
 
 /** 构造会话 */
 function makeSession(id: string, cwd = 'D:/workspace', createdAt = 1000): Session {
@@ -50,10 +40,9 @@ describe('registerSnapshot', () => {
     const ctx = new FakeCtx()
     const store = new MemoryStore(new FakeTable())
     registerSnapshot(ctx as unknown as Context, { store, logger: { warn: () => {}, info: () => {} } })
-    if (ctx.sessionListener === undefined) throw new Error('session/event 监听未注册')
 
     const session = makeSession('s1')
-    ctx.sessionListener(session, summaryEvent(5, [2, 3, 4], '本轮完成了记忆系统架构设计'))
+    ;(ctx.listener('session/event') as (s: Session, e: SessionEvent) => void)(session, summaryEvent(5, [2, 3, 4], '本轮完成了记忆系统架构设计'))
 
     // 快照登记为异步 fire-and-forget，等待落地
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -70,8 +59,7 @@ describe('registerSnapshot', () => {
     const ctx = new FakeCtx()
     const store = new MemoryStore(new FakeTable())
     registerSnapshot(ctx as unknown as Context, { store, logger: { warn: () => {}, info: () => {} } })
-    if (ctx.sessionListener === undefined) throw new Error('监听未注册')
-    ctx.sessionListener(makeSession('s1'), summaryEvent(5, [2], ''))
+    ;(ctx.listener('session/event') as (s: Session, e: SessionEvent) => void)(makeSession('s1'), summaryEvent(5, [2], ''))
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(store.stats().total).toBe(0)
   })
@@ -80,7 +68,6 @@ describe('registerSnapshot', () => {
     const ctx = new FakeCtx()
     const store = new MemoryStore(new FakeTable())
     registerSnapshot(ctx as unknown as Context, { store, logger: { warn: () => {}, info: () => {} } })
-    if (ctx.disposedListener === undefined) throw new Error('agent/disposed 监听未注册')
 
     // 会话期间产生 1 条记忆
     await store.create({
@@ -93,7 +80,7 @@ describe('registerSnapshot', () => {
     })
 
     const agent = { id: 's1', session: makeSession('s1') }
-    ctx.disposedListener({ agent })
+    ;(ctx.listener('agent/disposed') as (p: { agent: { id: string; session: Session } }) => void)({ agent })
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     const entries = store.listBySession('s1')

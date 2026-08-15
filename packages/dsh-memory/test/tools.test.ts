@@ -10,17 +10,7 @@ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { registerMemoryTools, sessionIdOf, toDetail } from '../src/tools.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
-import { FakeTable } from './helpers.js'
-
-/** 假 ctx：tools 服务形状（register 捕获定义） */
-class FakeCtx {
-  readonly definitions = new Map<string, ToolDefinition>()
-  readonly tools = {
-    register: (def: ToolDefinition): void => {
-      this.definitions.set(def.name, def)
-    },
-  }
-}
+import { FakeCtx, FakeTable } from './helpers.js'
 
 /** 假执行上下文（workspace 解析用） */
 function fakeExec(agentId = 's1', cwd = 'D:/workspace') {
@@ -30,13 +20,13 @@ function fakeExec(agentId = 's1', cwd = 'D:/workspace') {
   }
 }
 
-/** 组装被测对象：注册全部工具，返回定义表与 store */
+/** 组装被测对象：注册全部工具，返回定义表与 store（R3-1：统一 FakeCtx） */
 function setup() {
   const ctx = new FakeCtx()
   const table = new FakeTable()
   const store = new MemoryStore(table)
   registerMemoryTools(ctx as unknown as Context, { store })
-  return { tools: ctx.definitions, store, table }
+  return { tools: ctx.toolDefs, store, table }
 }
 
 /** 取一个工具定义 */

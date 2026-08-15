@@ -13,7 +13,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { MemoryMaintenance, type MaintenanceConfig } from '../src/maintenance.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry } from '../src/types.js'
-import { FakeTable } from './helpers.js'
+import { FakeCtx, FakeTable } from './helpers.js'
 
 /** 固定"现在"：用于过期判断与 store 时间戳（避免测试随时间漂移） */
 const NOW = Date.UTC(2025, 0, 15, 0, 0, 0)
@@ -21,18 +21,6 @@ const NOW = Date.UTC(2025, 0, 15, 0, 0, 0)
 const MS_PER_DAY = 86_400_000
 /** 定时器触发所需推进量（config 间隔取 1 小时） */
 const INTERVAL_MS = 3_600_000
-
-/** 假 ctx：捕获监听器与 effect disposer */
-class FakeCtx {
-  readonly listeners = new Map<string, Function>()
-  disposer?: () => void
-  on(type: string, listener: Function): void {
-    this.listeners.set(type, listener)
-  }
-  effect(fn: () => () => void): void {
-    this.disposer = fn()
-  }
-}
 
 /** 构造 request/header 事件（模型路由来源） */
 function headerEvent(seq: number): SessionEvent {
@@ -92,8 +80,8 @@ function setup(overrides: Partial<MaintenanceConfig> = {}) {
     table,
     store,
     maintenance,
-    sessionEvent: ctx.listeners.get('session/event') as (session: Session, event: SessionEvent) => void,
-    preStep: ctx.listeners.get('agent/pre-step') as (payload: unknown) => void,
+    sessionEvent: ctx.listener('session/event') as (session: Session, event: SessionEvent) => void,
+    preStep: ctx.listener('agent/pre-step') as (payload: unknown) => void,
   }
 }
 
@@ -258,7 +246,7 @@ describe('MemoryMaintenance 定时器清理', () => {
       await table.put(stale.id, stale)
       activate(sessionEvent, makeSession('s1')) // 活动 → 计时挂起
       // 生命周期 dispose：清空定时，解除活动态
-      ctx.disposer?.()
+      ctx.disposers[0]?.()
       await vi.advanceTimersByTimeAsync(INTERVAL_MS * 3)
       expect(store.getById(stale.id)?.status).toBe('active') // 不再触发
     } finally {
@@ -277,6 +265,6 @@ describe('MemoryMaintenance 定时器清理', () => {
     })
     maintenance.install(ctx as unknown as Context)
     expect(ctx.listeners.size).toBe(0) // 未注册任何监听
-    expect(ctx.disposer).toBeUndefined()
+    expect(ctx.disposers).toHaveLength(0)
   })
 })

@@ -34,7 +34,8 @@ export const memoryEntrySchema = z.object({
   sessionId: z.string(),
   kind: z.enum(MEMORY_KINDS),
   content: z.string(),
-  importance: z.number(),
+  // R3-4：重要度语义域 0..10（提取侧已 clamp；工具侧模型可传任意值——持久层是最后防线，越界拒绝入库）
+  importance: z.number().min(0).max(10),
   tags: z.array(z.string()),
   source: memorySourceSchema,
   dedupKey: z.string(),

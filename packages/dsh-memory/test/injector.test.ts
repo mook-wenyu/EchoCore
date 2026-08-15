@@ -11,19 +11,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { MemoryInjector, renderPack, textOfBatch, type InjectorConfig } from '../src/injector.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
-import { FakeTable } from './helpers.js'
-
-/** 假 ctx：捕获三类监听器 */
-class FakeCtx {
-  preStep: ((payload: unknown, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>) | undefined
-  sessionEvents: ((session: Session, event: SessionEvent) => void) | undefined
-  disposed: ((payload: { agent: { id: string; session: Session } }) => void) | undefined
-  on(type: string, listener: unknown): void {
-    if (type === 'agent/pre-step') this.preStep = listener as FakeCtx['preStep']
-    if (type === 'session/event') this.sessionEvents = listener as FakeCtx['sessionEvents']
-    if (type === 'agent/disposed') this.disposed = listener as FakeCtx['disposed']
-  }
-}
+import { FakeCtx, FakeTable } from './helpers.js'
 
 /** 会话结束载荷 */
 function disposePayload(id: string, session: Session): { agent: { id: string; session: Session } } {
@@ -72,7 +60,7 @@ async function seed(store: MemoryStore, input: Partial<NewMemoryInput> = {}): Pr
   return result.entry
 }
 
-/** 组装被测对象 */
+/** 组装被测对象（R3-1：统一 FakeCtx，监听器经 listener() 取用） */
 function setup(config: Partial<InjectorConfig> = {}) {
   const ctx = new FakeCtx()
   const table = new FakeTable()
@@ -90,8 +78,13 @@ function setup(config: Partial<InjectorConfig> = {}) {
     },
   })
   injector.install(ctx as unknown as Context)
-  if (ctx.preStep === undefined || ctx.sessionEvents === undefined) throw new Error('监听未注册')
-  return { ctx, store, injector, preStep: ctx.preStep, sessionEvents: ctx.sessionEvents, disposed: ctx.disposed }
+  const preStep = ctx.listener('agent/pre-step') as
+    | ((payload: unknown, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>)
+    | undefined
+  const sessionEvents = ctx.listener('session/event') as ((session: Session, event: SessionEvent) => void) | undefined
+  const disposed = ctx.listener('agent/disposed') as ((payload: { agent: { id: string; session: Session } }) => void) | undefined
+  if (preStep === undefined || sessionEvents === undefined) throw new Error('监听未注册')
+  return { ctx, store, injector, preStep, sessionEvents, disposed }
 }
 
 describe('MemoryInjector pre-step 注入', () => {

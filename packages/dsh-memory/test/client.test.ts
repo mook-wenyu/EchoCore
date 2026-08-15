@@ -104,9 +104,11 @@ describe('createMemoryApi unwrap 错误路径', () => {
     await expect(api.get('bad-id')).rejects.toThrow('id 非法')
   })
 
-  it('connection 服务缺失时所有调用以 internal 错误结束', async () => {
+  // R2-3/B3：connection 已声明为硬 inject（缺失则插件不加载），运行期必有。
+  // 缺失时直接 TypeError（契约违例暴露）——不再返回 internal 伪错误（旧的优雅降级已删除）。
+  it('connection 缺失时调用抛 TypeError（契约违例暴露，不静默降级）', async () => {
     const ctx = { get: () => undefined } as unknown as Context
     const api = createMemoryApi(ctx)
-    await expect(api.status()).rejects.toThrow()
+    await expect(api.status()).rejects.toThrow(TypeError)
   })
 })
