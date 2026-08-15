@@ -129,6 +129,16 @@ describe('MemoryInjector pre-step 注入', () => {
     expect(decision).toEqual(REJECT_DECISION)
   })
 
+  // waterfall 契约：下游 next() 抛错必须原样透传（注入器不得吞错掩盖下游失败）
+  it('下游 next() 抛错时原样透传（不吞错）', async () => {
+    const { preStep, store } = setup()
+    await seed(store)
+    const boom = new Error('下游瀑布流失败')
+    await expect(preStep(makePayload('s1', 'pnpm workspace'), async () => Promise.reject(boom))).rejects.toThrow(
+      '下游瀑布流失败',
+    )
+  })
+
   it('无命中或空批次不注入', async () => {
     const { preStep, store } = setup()
     await seed(store)

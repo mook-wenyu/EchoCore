@@ -134,6 +134,16 @@ export class MemoryStore {
    * 新建（非合并，O3/D-A）：扫描同 workspace 同 kind 的 active 条目，Jaccard 重合度 ≥ 0.7
    * 且创建不晚于新条目的，全部标记 supersededBy=新id、新条目 supersedes=其中最早创建者。
    */
+  /**
+   * 创建（或去重合并）一条记忆。
+   *
+   * 并发边界（显式声明，非防御代码）：本方法**非并发安全**——dedup 索引
+   * `byDedupKey` 在 `await table.put` 之后才落位（先持久后索引），两个并发
+   * create 同 dedupKey 会在索引落位前各自判定 miss，产生两条重复条目
+   * （检索仍可用，由 O8-M 重复合并兜底）。当前全部调用方（extractor 串行链、
+   * 工具顺序调用、RPC 只读）均串行 await 本方法，单进程内无真实并发路径；
+   * 若未来引入并发写入，需先加写入互斥。
+   */
   async create(input: NewMemoryInput): Promise<{ entry: MemoryEntry; outcome: MergeOutcome }> {
     const dedupKey = dedupKeyOf(input.content)
     // 归并索引粒度含 kind：跨分类的同内容不合并（O3）

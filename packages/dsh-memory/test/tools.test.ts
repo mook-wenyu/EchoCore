@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
-import { registerMemoryTools, sessionIdOf, toDetail } from '../src/tools.js'
+import { registerMemoryTools, sessionIdOf, toDetail, workspaceOf } from '../src/tools.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
@@ -255,5 +255,17 @@ describe('sessionIdOf（B5 契约）', () => {
 
   it('agent 缺失时抛错暴露契约违例', () => {
     expect(() => sessionIdOf({ agent: undefined })).toThrow('缺少 agent 上下文')
+  })
+})
+
+// workspaceOf 语义钉住：agent 缺失回退默认工作区（"无项目"是合法业务语义，落入全局池）——
+// 与 sessionIdOf 的"缺失即抛"形成对照：workspace 有默认池语义，sessionId 没有
+describe('workspaceOf（回退语义）', () => {
+  it('agent 存在时取 cwd', () => {
+    expect(workspaceOf({ agent: { session: { header: { cwd: 'D:/workspace' } } } })).toBe('D:/workspace')
+  })
+
+  it('agent 缺失时回退默认工作区（全局池语义）', () => {
+    expect(workspaceOf({ agent: undefined })).toBe('default')
   })
 })
