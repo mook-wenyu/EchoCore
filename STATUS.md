@@ -28,7 +28,8 @@
 
 ## 四、下次最该做的事
 
-1. **长会话压测**：400K 自动压缩 → 记忆提取 → 新会话召回；构造"新决策覆盖旧决策"验证 supersede 链（第一轮遗留项，未做运行时验证）。
+1. **✅ 长会话压测已闭环（2026-08-15 16:45）**：3090 实例以临时配置（thresholdRatio 0.05 + retainRatio 0.02，触发点 50K）驱动真实压缩，验证结果：压测会话（081f6852，Project Strategy 工作区）3 次压缩 → 3 条 session-summary + 10 条提取 fact（42:53 批量）+ 1 条 agent/disposed 快照；本会话（5a26b6a8）17+ 次压缩摘要 + 数百条提取条目。**压缩→提取→快照→召回全链路运行时验证通过**。压测配置已恢复 thresholdRatio 0.4（cordis.patch.yml 112 行，retainRatio 走默认 0.16 合规），3090 实例已停止。
+   - 过程教训：早期"压缩后 0 条目"结论为观测误判——`memory.json` 的 `createdAt/updatedAt` 是 **ISO 字符串**（UTC），数字时间比较全部失效；必须用字符串字典序比较或 `Date.parse` 后再比。
 2. 观察 `~/.dsh/storages/memory.json`：supersededBy 字段、maintenance 归档效果、R4 source 校验是否误报（真实数据量下）。
 3. 记忆投毒强防线评估：读 MemPoison（arXiv:2607.14651）/SMSR（arXiv:2606.12703）论文后裁决是否实施来源绑定。
 4. MemoryPanel 组件测试：若引入 jsdom/testing-library 依赖则补组件渲染测试（R3-5 升级）。
