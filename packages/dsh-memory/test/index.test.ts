@@ -57,8 +57,8 @@ function setup(openError?: Error) {
 }
 
 describe('插件组合根（index.ts）', () => {
-  it('inject 声明四服务硬依赖（缺失则 Cordis 不加载本插件）', () => {
-    expect(inject).toEqual(['storageDomain', 'llm', 'tools', 'connection'])
+  it('inject 声明五服务硬依赖（缺失则 Cordis 不加载本插件）', () => {
+    expect(inject).toEqual(['storageDomain', 'llm', 'tools', 'connection', 'systemPrompt'])
   })
 
   it('装配成功：领域打开、监听注册、effect 收集 close disposer', async () => {
@@ -79,6 +79,8 @@ describe('插件组合根（index.ts）', () => {
       { authority: 'loopback' },
     )
     expect(ctx.toolDefs.size).toBe(6)
+    // 稳定快照段已注册（P1：systemPrompt.context）
+    expect(ctx.systemPromptContexts.has('memory:snapshot')).toBe(true)
     // 卸载：effect disposer 触发 domain.close
     expect(storage.closed).toBe(0)
     for (const dispose of ctx.disposers) dispose()

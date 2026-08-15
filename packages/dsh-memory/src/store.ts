@@ -108,6 +108,14 @@ export class MemoryStore {
    * 记忆被归档后其键不再新增，空间可复用给新键。
    */
   private readonly lastTrackedAt = new Map<string, number>()
+  /**
+   * 内容变更版本（进程内）：create/update/archive（含 supersede 回写）落盘
+   * 成功后递增。供稳定快照（stable-snapshot）判断缓存是否失效；**访问追踪
+   * 回写（lastAccessAt/accessCount）不递增**——它不改变记忆内容，不应触发
+   * 快照重建（否则高频检索会让快照永不稳定）。进程内计数足够：快照缓存同
+   * 为进程内，重启后一并清空。
+   */
+  private revisionValue = 0
 
   constructor(
     table: KvTable<string, MemoryEntry>,
@@ -125,6 +133,11 @@ export class MemoryStore {
   /** 当前时刻 ISO 字符串 */
   private iso(): string {
     return new Date(this.now()).toISOString()
+  }
+
+  /** 当前内容变更版本（稳定快照失效判定用；见 revisionValue 注释） */
+  get revision(): number {
+    return this.revisionValue
   }
 
   /**
@@ -174,6 +187,7 @@ export class MemoryStore {
             },
           ],
         }))
+        this.revisionValue++
         return { entry: merged, outcome: { merged: true, existingId } }
       }
     }
@@ -202,6 +216,7 @@ export class MemoryStore {
       audit: [{ action: 'create', at: nowIso, by: input.by }],
     }
     await this.table.put(entry.id, entry)
+    this.revisionValue++
     this.byDedupKey.set(indexKey, entry.id)
     // 已落库后再回写旧条目（避免未持久化的新条目被误判为候选）
     for (const target of supersededTargets) {
@@ -239,6 +254,7 @@ export class MemoryStore {
       updatedAt: this.iso(),
       audit: [...current.audit, { action: 'supersede' as const, at: this.iso(), by, detail: `被记忆 #${newId} 覆盖` }],
     }))
+    this.revisionValue++
   }
 
   /** 读一条（同步，内存权威态） */
@@ -255,12 +271,14 @@ export class MemoryStore {
    */
   async update(id: string, patch: Partial<Pick<MemoryEntry, 'kind' | 'importance' | 'tags'>>, by: AuditActor): Promise<MemoryEntry | undefined> {
     try {
-      return await this.table.update(id, (current) => ({
+      const updated = await this.table.update(id, (current) => ({
         ...current,
         ...patch,
         updatedAt: this.iso(),
         audit: [...current.audit, { action: 'update' as const, at: this.iso(), by }],
       }))
+      this.revisionValue++
+      return updated
     } catch (error) {
       if (error instanceof DomainError && error.code === 'missing-key') return undefined
       throw error
@@ -276,6 +294,7 @@ export class MemoryStore {
         updatedAt: this.iso(),
         audit: [...current.audit, { action: 'archive' as const, at: this.iso(), by }],
       }))
+      this.revisionValue++
       return true
     } catch (error) {
       if (error instanceof DomainError && error.code === 'missing-key') return false
@@ -382,6 +401,30 @@ export class MemoryStore {
       result.push(entry)
     }
     result.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
+    return result.slice(0, limit)
+  }
+
+  /**
+   * 按重要度取条目（稳定快照取数）：同 workspace、active、未覆盖的条目按
+   * importance 降序（同分按创建时间倒序、同刻按 id 稳定）。与 listRecent
+   * （最近优先）不同——快照服务于"全局重要记忆稳定前缀"，必须按重要度选，
+   * 否则早期高重要度项目规则会被新产生的低重要度条目挤出。
+   */
+  listByImportance(workspace: string, limit: number): MemoryEntry[] {
+    const result: MemoryEntry[] = []
+    for (const [, entry] of this.table.entries()) {
+      if (!isSourceWellFormed(entry.source)) {
+        this.onCorruptSource?.(entry.id)
+        continue
+      }
+      if (entry.workspace !== workspace) continue
+      if (entry.status !== 'active') continue
+      if (entry.supersededBy !== undefined) continue
+      result.push(entry)
+    }
+    result.sort(
+      (a, b) => b.importance - a.importance || b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id),
+    )
     return result.slice(0, limit)
   }
 

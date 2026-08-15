@@ -26,3 +26,48 @@ export function formatMemoryLine(entry: MemoryLineView): string {
   const sourceSession = shortSessionId(entry.sessionId)
   return `- [${entry.kind}] ${entry.content}（重要度 ${entry.importance}，记忆 #${memoryId}，来自会话 ${sourceSession}）`
 }
+
+/** 预算渲染结果：文本 + 实际渲染条目的 id 列表（跳过制下不能按前 N 条推断） */
+export interface BudgetedPack {
+  text: string
+  renderedIds: string[]
+}
+
+/**
+ * 预算内逐条渲染共享实现（DRY：injector 实时包与 stable-snapshot 稳定快照
+ * 共用同一"声明头 + 逐行 bullet + 预算截断 + 超限提示"拼装逻辑，避免两处
+ * 各自实现导致格式漂移）。
+ * - header：注入声明头（MEMORY_INJECTION_HEADER）；
+ * - 预算按字符硬截断：放不下的条目**跳过并继续后续**（而非整体截断尾部）——
+ *   排序在前但超长的单条不应饿死后续较短的记忆（快照按重要度、实时包按
+ *   相关性排序，超长条目跳过是显式语义，不破坏顺序）；
+ * - 有跳过时追加超限提示（note 文案由调用方给——两处的提示措辞不同）。
+ * 返回 undefined 表示一条都放不下（不注入，避免空消息）。
+ */
+export function renderBudgetedPack(
+  entries: MemoryLineView[],
+  budgetChars: number,
+  header: string,
+  truncatedNote: (skipped: number) => string,
+): BudgetedPack | undefined {
+  const lines: string[] = []
+  const renderedIds: string[] = []
+  let used = header.length + 1
+  let skipped = 0
+  for (const entry of entries) {
+    const line = formatMemoryLine(entry)
+    if (used + line.length + 1 > budgetChars) {
+      skipped++
+      continue
+    }
+    lines.push(line)
+    renderedIds.push(entry.id)
+    used += line.length + 1
+  }
+  if (lines.length === 0) return undefined
+  let text = `${header}\n${lines.join('\n')}`
+  if (skipped > 0) {
+    text += `\n${truncatedNote(skipped)}`
+  }
+  return { text, renderedIds }
+}

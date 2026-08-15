@@ -31,6 +31,14 @@ export const DEFAULTS = {
   extractMaxTokens: 2048,
   /** 自动注入总开关 */
   enableAutoInject: true,
+  /** 稳定快照总开关（OPTIMIZATION_PLAN_3 P1：system 前缀缓存感知注入） */
+  enableSnapshot: true,
+  /** 稳定快照缓存窗口（ms；窗口内快照字节不变，保持 DeepSeek 前缀缓存命中） */
+  snapshotTtlMs: 300000,
+  /** 稳定快照预算上限（字符；重要性优先取数，预算内截断） */
+  snapshotBudgetChars: 8192,
+  /** 稳定快照 Top-K 候选上限（预算之外的保险，防止单 workspace 记忆过多时全表扫描） */
+  snapshotTopK: 30,
   /** 提取器总开关 */
   enableExtractor: true,
   /** 后台记忆整理任务开关（O8-M） */
@@ -55,6 +63,14 @@ export interface Config {
   extractMaxTokens?: number
   /** 自动注入总开关 */
   enableAutoInject?: boolean
+  /** 稳定快照总开关（system 前缀缓存感知注入） */
+  enableSnapshot?: boolean
+  /** 稳定快照缓存窗口（ms） */
+  snapshotTtlMs?: number
+  /** 稳定快照预算上限（字符） */
+  snapshotBudgetChars?: number
+  /** 稳定快照 Top-K 候选上限 */
+  snapshotTopK?: number
   /** 提取器总开关 */
   enableExtractor?: boolean
   /** 后台记忆整理任务开关 */
@@ -83,6 +99,11 @@ export const Config: z<Config> = z.object({
   maxExtractChars: z.number().default(DEFAULTS.maxExtractChars),
   extractMaxTokens: z.number().default(DEFAULTS.extractMaxTokens),
   enableAutoInject: z.boolean().default(DEFAULTS.enableAutoInject),
+  enableSnapshot: z.boolean().default(DEFAULTS.enableSnapshot),
+  /** 快照缓存窗口下限 1s（防配置 0 导致每轮重建，破坏"稳定"语义） */
+  snapshotTtlMs: z.number().min(1000).default(DEFAULTS.snapshotTtlMs),
+  snapshotBudgetChars: z.number().min(1).default(DEFAULTS.snapshotBudgetChars),
+  snapshotTopK: z.number().min(1).default(DEFAULTS.snapshotTopK),
   enableExtractor: z.boolean().default(DEFAULTS.enableExtractor),
   enableMaintenance: z.boolean().default(DEFAULTS.enableMaintenance),
   /** 后台整理任务间隔（小时；R2-10/M2：最小 1，非法值由 schema 校验拒绝而非运行时夹逼） */

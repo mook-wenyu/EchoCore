@@ -139,6 +139,18 @@ export class FakeCtx {
     },
   }
 
+  /** systemPrompt.context 注册捕获（P1 稳定快照用；键为段名，重复注册抛错对齐真实语义） */
+  readonly systemPromptContexts = new Map<string, unknown>()
+  /** systemPrompt 服务形状（context 注册捕获；section/variable 未消费暂不提供） */
+  readonly systemPrompt = {
+    context: (entry: { name: string; order: number; text: string | ((assembly: unknown) => string) }): void => {
+      if (this.systemPromptContexts.has(entry.name)) {
+        throw new Error(`duplicate prompt context name: ${entry.name}`)
+      }
+      this.systemPromptContexts.set(entry.name, entry)
+    },
+  }
+
   /** logger 收集器（index.ts 装配用 ctx.logger('memory')；按 level 分类记录） */
   readonly logRecords: Array<{ level: string; args: unknown[] }> = []
 
