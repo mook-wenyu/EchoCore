@@ -60,7 +60,7 @@ enable 开关）已固化为各模块内代码常量——依据 12-Factor（仅
 | `embeddingApiBaseUrl` | `''` | 远程嵌入 API base URL（OpenAI 兼容 `/embeddings`；空串 = 未配置远程） |
 | `embeddingApiKey` | `''` | 远程嵌入 API key——**字面 key 或 `env:NAME` 环境变量引用**（如 `env:SILICONFLOW_KEY`；DeepSeek 官方无 embeddings API，需另配供应商） |
 | `embeddingModel` | `''` | 远程嵌入模型名（如 `BAAI/bge-m3`、`Qwen/Qwen3-Embedding-0.6B`） |
-| `embeddingDimension` | 1024 | 远程嵌入维度（本地 384 不随此配置；按供应商文档声明） |
+| `embeddingDimension` | 1024 | 远程嵌入维度（本地 384 不随此配置；按供应商文档声明）。**请求体显式携带 `dimensions`=该值**（OpenAI/百炼兼容端点按此输出；2026-08-17 实测：不带时 qwen3.7-text-embedding 回默认 1024，与配置不符会被维度强校验拦截并回退本地——现已显式声明） |
 
 ### 语义嵌入（默认启用：远程优先 → 自动回退本地 → 都无则关闭）
 
@@ -96,7 +96,10 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 （2026-08-16 修复：原写回 cordis.patch.yml 的链路实为写进 cordis.yml——该文件
 每次启动被 DSH 重置为组合基底，保存的配置重启即丢失；settings.yaml 是 DSH
 官方用户设置 seam，内建插件配置页同款通道）。apiKey 行展示解析状态（字面 key
-或 `env:NAME` 引用是否可用）。
+或 `env:NAME` 引用是否可用）。**状态可见化**（2026-08-17）：面板统计行显示
+`嵌入状态：ready（后端：remote|local）`——远程验证失败时显式展示失败原因
+（如"返回维度 1024 ≠ 配置维度 2048"），杜绝"ready 但远程未生效"的静默降级；
+保存后自动刷新该状态行。
 
 ### 防上下文污染（F1-F5，2026-08-15）
 
@@ -177,6 +180,10 @@ node packages/dsh-memory/scripts/backup-memory.mjs [备份目录] [保留份数]
     提取/注入/快照对所有会话生效（插件按 sessionId 键控，单实例服务所有会话）；
   - `compaction-basic` 行按 id 解禁（web-app 默认禁用）并配置 `modelPolicies:
     thresholdRatio 0.4` → **全局 400K 无感自动压缩**（实测窗口 1M token）；各预设实例（0.8）保留为安全网。
+    ⚠️ **modelPolicies 是 provider+model 精确匹配**——默认模型换成
+    `teamorouter/deepseek-v4-flash` 后 0.4 不再命中（回落默认 0.8 → 触发点 800K），
+    需同步补对应策略（2026-08-17 实测：settings.yaml 默认模型换 provider 后 400K
+    自动压缩失效是同一根因）。
 - 设置页出现"记忆"面板（`dsh.client` 扫描捕获宿主行，客户端 bundle 经 `/plugins/@echocore/dsh-memory/client.js` 服务）。
 
 ### ⚠️ 集成约束（事故教训，务必遵守）
