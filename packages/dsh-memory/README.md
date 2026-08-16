@@ -76,10 +76,18 @@ enable 开关）已固化为各模块内代码常量——依据 12-Factor（仅
 
 运行期当前后端失败自动回退下一优先级（远程失败 → 切本地重试一次）。
 
-**全量索引构建**（2026-08-17 修复）：启动 ensureAll 按 **128/批**（用户拍板）批量嵌入
-（远程一次请求多条，摊薄 HTTP 往返——原逐条串行 6569 条需 30min~2h），每批完成
-后**增量落盘**（去抖 10s 合并），单批失败 logWarn 跳过继续（缺失条目保持纯关键词
-检索——索引是可重建的附加层显式语义），完成即全部落盘。
+**向量存储 = SQLite vec0 虚拟表**（2026-08-17 用户拍板 `@photostructure/sqlite-vec`
+生产 fork；与条目存储同一 memory.sqlite，表名 `vec_memory_<dim>` 按维度隔离）：
+- 向量 float32 二进制（X'hex'）驻库——2560 维 × 6500 条 ≈ **64MB**（原 JSON
+  数字数组文本 ≈ 317MB，10s 去抖整写/启动全量解析/内存 number[] 膨胀）；
+- 检索 = SQL KNN（`embedding MATCH … AND k = …`，C+SIMD brute-force，cosine
+  度量）——语义榜由 vec0 top-k 提供，store 融合评分不变（RRF）；
+- 写入 = 行级 upsert（WAL O(1)）；旧 JSON 索引（memory-embeddings-<dim>.json）
+  首启一次性迁移入表（原文件改名 .bak 保留）；
+- 全量构建 ensureAll：**128/批**批量嵌入（用户拍板），失败批跳过（缺失条目
+  保持纯关键词检索——索引是可重建附加层的显式语义）。
+- 已知 vec0 限制（实测）：embedding 列不接受 prepared 绑定参数（解析报错）——
+  向量字面量一律内联 SQL，memory_id 走标准单引号转义（无注入面）。
 
 ```bash
 # 仅本地：下载模型（hf-mirror，国内可达；或手动复制到模型目录）后重启
