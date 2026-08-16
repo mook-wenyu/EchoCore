@@ -1,12 +1,12 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-15（P1-P4 + 缺陷修复 A1-A4 + 2026 最佳实践 B1-B3）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-16（面板配置持久化修复——"保存成功但重启丢失"根因闭环）。
 
 ## 一、架构健康度
 
-- 模块总数：19（types / constants / config / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / stable-snapshot / embedding / embed-index / host-rpc / maintenance / render / client.ts 浏览器半 + scripts/build-client.mjs）
-- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants/render/embedding 被复用，无环
-- 单元测试 **258 个全绿**（19 文件，三次连跑稳定）；类型检查与构建通过
+- 模块总数：20（types / constants / config / settings / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / stable-snapshot / embedding / embed-index / host-rpc / maintenance / render / client.ts 浏览器半 + scripts/build-client.mjs）
+- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants/render/embedding 被复用，无环；`settings.ts` 仅被 `index.ts` 引用（组合根注入，无环）
+- 单元测试 **365 个全绿**（23 文件，三次连跑稳定）；类型检查与构建通过
 - 测试基建统一：FakeCtx 五合一（helpers.ts）、FakeTable 失败注入 + 快照迭代、可控 id 序列（vi.mock newMemoryId）、index.test 嵌入 mock（不真实加载 22MB 模型，533ms→15ms）
 
 ## 二、本次变更影响范围（P1-P4 + OPTIMIZATION_PLAN_4）
@@ -33,22 +33,25 @@
 - **注入相关性治理（P1-P3）**（8f69dac + 00e3b8a）：用户拍板全做含多查询（hindsight 评估 + Selective Memory/Mixpeek/agent-evolution-kit 2026 最佳实践）——①P2 写端 admission gate（extractor 通道零价值 importance=0/纯噪声 token<2 拒绝——写时过滤结构性优于读时，8:1 distractor 下读端归零写端 100%）；②P1 置信度三档注入（≥0.7 完整行 / 0.4-0.7 摘要行 / <0.4 跳过——替代单一 0.3 门槛）；③P3 会话上下文派生查询（近期 3 条消息拼接——换话题时历史主题词仍参与召回）。326 测试全绿
 - **第三轮全量盘点（R1-R5 + N2 + 需求 A/B）**（7ecf137 + c56b2cb + a4c634c）：用户拍板全做——①R1b 摘要行截断附"（原文 N 字符）"标记（词中间切断损失量可判断）；②R2 P2 拒绝计数入 memory_status（观测闭环——门拦了多少不再黑洞）；③R1a RRF+withScore 标定钉住（语义单榜=0.5 摘要档契约）；④R5 WAL 显式 checkpoint（wal_autocheckpoint=256 + checkpoint() TRUNCATE 回截）；⑤R3 P3 窗口滚动边界测试 + 拼接检索基准；⑥N2 目录注入（未展示条目标题目录 + 模型主动 memory_recall——防 known-information forgetting ICLR 2026，token 减 26-61%）；⑦需求 A 失败教训提取规则（insight + tags:['失败教训']——检索零新码）；⑧需求 B 用户强调提取规则（importance ≥7 自动保活）；⑨Agent 自进化查证（EDV 自我确认陷阱警示/SkillRevise 同构——教训需来源校验，dsh 已有 excerpt/audit）。337 测试全绿
 - **聚焦三项盘点（轻量 IDF + 面板测试 + recall@k）**（c7109f6 + 7798772 + b1490c6）：用户拍板"含轻量 IDF"——①轻量 IDF 加权关键词检索（bm25Idf + idfWeightedRelevance——保留 0-1 标定的 BM25 化：稀有词命中权重 > 常见词，全命中=1.0/零命中=0——注入三档不受影响；检索时按候选集统计 df 零维护；**df=0 修复**：候选集外词不进分母——长查询不再砸分到阈值下）；②面板 jsdom 行为测试（@testing-library/react 5 用例：初始加载/搜索/详情/O1 写失败/竞态守卫——devDeps 加 react/react-dom/jsdom/testing-library 测试依赖不进生产）；③benchmark 补 recall@k 评估（合成库 200 条实测 recall@5=1.0——原全为性能断言无质量评估）；④Agent 自进化评估交付（反思轮写门与流式 extractor 冲突不落地——教训验证规则已内建）。354 测试全绿
-- **接口契约变更**（累计）：配置项 19→4；`InjectorConfig/ExtractorConfig/SnapshotConfig/MaintenanceConfig` 接口删除；`MemoryStableSnapshot.EMPTY_IDS` 删除；CONFIG_DICT 改读 `Config.dict`（transform 包装移除后）；EmbeddingIndexDeps.service 加 `dimension`；`createMemoryRpcHandler(store, rpc)`/`registerMemoryRpc(ctx, store, config)`；MemoryPanelApi 加 getConfig/setConfig；MemoryPanelConfigView 仅 5 字段
+- **面板配置持久化修复（"保存成功但重启后配置丢失"）**（155ed81 + 87dee21 + 0d2a21b）：用户实测报障，根因三条证据链闭合——保存原经 `fiber.update(noSave=false)` → loader internal/update 写回 entry.options.config + tree.write() → 写进 cordis.yml；而 DSH 每次启动 prepareProfile 无条件把 cordis.yml 重写为 []（组合基底文件），保存的配置下次启动被清空。修复（用户拍板：settings.yaml 通道 + 保持插件重启生效）：①新增 `src/settings.ts` settings seam——命名空间 memory 注册（entry 配置为 base 层）+ setSource/onChange + 面板持久化通道 + 幂等内存重启（sameConfig 守卫防注册期"重启→再注册→再重启"环与并发双重启）；②host-rpc `MemoryRpcContext` 改 `config()/settings/applyChange` 契约，setConfig 先落盘 settings.yaml 再重启，持久化失败整体拒绝（绝不静默"保存成功"）；③依赖新增 @deepseek-ai/dsh-settings（DSH 官方用户设置 seam，内建插件配置页同款通道）。**实机验证**（`scripts/verify-persist.mjs`，真实宿主 boot 链路 + 独立进程模拟重启）：保存后 settings.yaml 出现 memory 段 4 项全含 ✓、cordis.yml 保持 [] 不被污染 ✓、保存触发插件重启（RPC 重注册）✓、模拟 dsh 重启后未保存即恢复全部配置 ✓（EXIT 0）。365 测试全绿
+- **接口契约变更**（累计）：配置项 19→4；`InjectorConfig/ExtractorConfig/SnapshotConfig/MaintenanceConfig` 接口删除；`MemoryStableSnapshot.EMPTY_IDS` 删除；CONFIG_DICT 改读 `Config.dict`（transform 包装移除后）；EmbeddingIndexDeps.service 加 `dimension`；`createMemoryRpcHandler(store, rpc)`/`registerMemoryRpc(ctx, store, config)` → `registerMemoryRpc(ctx, store, rpc)`（rpc 由 `{config: ResolvedConfig, fiber}` 改 `{config(), settings, applyChange}`）；`MountOverrides` 加 `seam`；MemoryPanelApi 加 getConfig/setConfig；MemoryPanelConfigView 仅 5 字段
 - **提交**：92a2725（PLAN4）→ d5a9eda（A1）→ 16a6677（A2）→ 2e20f1f（A3）→ 35911f6（A4）→ 8d4a36f（B1）→ cca7d8d（B2）→ 2bcd2a5（B3）→ 本轮文档
 
 ## 三、已知风险点（诚实自曝）
 
-1. **缓存命中率未实测**：P1 的 cacheReadTokens 收益无基线；观测通道现成（UI"缓存命中 %"行），3 轮 on/off 对照即可量化；业界基线提示工具稳定会话自然 ~90%（permafrost）。
-2. **维护合并与 create supersede 的微竞态**（A4 已加固 supersededBy 检查，但同刻并发窗口仍理论上存在——真实场景提取串行 + 维护 6h 后跑不触发；测试以顺序场景钉住）。
-3. **MemoryPanel 组件渲染测试缺失**：组件层依赖浏览器 DOM，测试环境未引入 jsdom/testing-library；createMemoryApi 全方法已覆盖，组件层靠真机验证。
-4. **记忆投毒 L2/L3 未防护**（评估记录于 README）：当前防线挡 L1；升级条件 = 出现多来源写入（第三方工具/子代理写库）。
-5. extractor 失败重试的重复 LLM 调用（已知成本）；opencode-acp 版本轨脱节（外部）；嵌入启用后 supersede/归档向量联动已就绪但未真机验证。
+1. **插件存储/模型路径硬编码 `homedir()/.dsh`**（忽略 DSH_HOME 环境变量）：实机验证脚本只能读取性触碰真实 ~/.dsh/storages（memory.sqlite / 嵌入索引 / 22MB 本地模型，模型加载致 apply 数秒）。测试隔离依赖 MountOverrides（单测路径）；若未来要支持 DSH_HOME 覆盖（CI/多实例），需把 `defaultMemoryDbFile/defaultEmbeddingModelDir` 改为经 dsh-home-paths 解析——**本次只报告未修改**（真实部署 DSH_HOME==~/.dsh 无差异）。
+2. **profile `pnpm install` 受供应链策略门拦截**（dshmarket@1.9.0 发布年龄不足，存量锁文件问题）：部署需 `pnpm install --trust-lockfile`（已写入 profile 的 pnpm-workspace.yaml minimumReleaseAgeExclude）。
+3. **settings.yaml 手工编辑的并发语义**：settings 提供者热重载，多处编辑器同时写同一文件时以最后提交为准（DSH 官方机制，与本插件无关）；面板保存失败会整体拒绝并提示，不会半写。
+4. **settings 段非空时启动多一次插件重启**：settings.yaml 已有 memory 段时，首次装配注册后初始 onChange 检测到合并配置 ≠ entry 配置 → 内存重启一次（毫秒级，实机验证可见）——设计如此（防重启环的幂等守卫），启动感知可忽略。
+5. **缓存命中率未实测**：P1 的 cacheReadTokens 收益无基线；观测通道现成（UI"缓存命中 %"行），3 轮 on/off 对照即可量化；业界基线提示工具稳定会话自然 ~90%（permafrost）。
+6. **维护合并与 create supersede 的微竞态**（A4 已加固 supersededBy 检查，但同刻并发窗口仍理论上存在——真实场景提取串行 + 维护 6h 后跑不触发；测试以顺序场景钉住）。
+7. **记忆投毒 L2/L3 未防护**（评估记录于 README）：当前防线挡 L1；升级条件 = 出现多来源写入（第三方工具/子代理写库）。
+8. extractor 失败重试的重复 LLM 调用（已知成本）；opencode-acp 版本轨脱节（外部）。
 
 ## 四、下次最该做的事
 
-1. **重启 3080 实例**：当前进程（18:00 启动）运行旧代码——重启后新代码（面板配置/RRF/嵌入默认启用/配置面 4 项/F1-G5 治理）才生效。重启前先跑 `scripts/backup-memory.mjs` 刷新备份。
+1. **重启 3080 实例**：当前进程运行旧代码——重启后新代码（配置持久化 settings.yaml 通道等）才生效；重启前先跑 `scripts/backup-memory.mjs` 刷新备份。重启后到设置页「记忆」保存一次配置，确认 `~/.dsh/settings.yaml` 出现 `memory:` 段且 cordis.yml 保持 []。
 2. **⚠️ 已撤销（2026-08-15）：降 settings.yaml maxTokens 384000→65536 是错误方案**——maxTokens 是模型最大输出上限，降它截断生成能力（用户否决）。溢出事故真实根因在宿主域：dsh-token-meter CHARS_PER_TOKEN=4 低估 2-3 倍 + 压缩触发/停止口径分裂 + 收益保护死锁（记忆 #f98ca946，harness 域缺陷，不属于 dsh-memory 修复范围）。正确路径：向宿主报 token-meter 缺陷；dsh-memory 侧已做注入预算上限 + 摘要截断治理。
 3. **备份脚本配计划任务**：`scripts/backup-memory.mjs` 已就绪（默认保留 10 份），建议每日定时运行。
 4. 缓存命中率基线实测（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益。
-5. 观察 memory.json：maintenance 首周期执行效果（降权放宽 imp≤5/批量 200/间隔 1h + 会话摘要归档收敛）。
-6. MemoryPanel 组件渲染测试：若引入 jsdom/testing-library 则补组件测试。
+5. 观察 memory.sqlite：maintenance 首周期执行效果（降权放宽 imp≤5/批量 200/间隔 1h + 会话摘要归档收敛）。
