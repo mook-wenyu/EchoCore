@@ -1,18 +1,22 @@
 #!/usr/bin/env node
 /**
- * 配置持久化链路实机验证脚本（2026-08-16 根因修复——"面板保存成功但重启后配置丢失"）。
+ * 配置持久化链路实机验证脚本（2026-08-16 根因修复——"面板保存成功但重启后配置丢失"
+ * + 二次实测"保存即 fatal load failure"）。
  *
  * 用 DSH 真实启动链（@deepseek-ai/dsh-app-boot 的 boot() + 真实 loader /
  * include / settings-file 提供者）在隔离的临时 DSH_HOME 里跑最小 profile，
  * 驱动记忆插件面板 setConfig 的完整宿主链路，断言：
  *   1. 保存后 settings.yaml 出现 memory 段（新持久化通道落盘）；
  *   2. cordis.yml 不被污染（保持组合基底 []——旧链路写回目标，每次启动被重置）；
- *   3. 保存触发插件内存重启（RPC 重新注册）；
+ *   3. 保存**实时生效**（无插件重启——重启与 apply 秒级异步段竞态，二次实测
+ *      fatal load failure 根因）：RPC 保持单次注册，getConfig 立即返回新配置；
  *   4. 独立进程重新 boot（模拟 dsh 重启）后，未再保存即从 settings.yaml 读回
- *      配置（getConfig 返回保存值）——"重启后配置不再丢失"。
+ *      配置（getConfig 返回保存值）——"重启后配置不再丢失"端到端闭环。
  *
  * 用法：node scripts/verify-persist.mjs [--phase2 <根目录>]
  *   --phase2：仅执行"重启后读回"断言（由 phase 1 以子进程方式调用，模拟全新进程）。
+ *   VERIFY_REAL_SYSTEM_PROMPT=1：以真实 dsh-system-prompt 服务替代 stub——
+ *     验证保存实时生效路径不与 NamedEntries 严格重复检测冲突（memory:snapshot）。
  */
 
 import { spawn } from 'node:child_process'
@@ -58,7 +62,7 @@ const SAVE_PAYLOAD = {
 }
 
 /** boot 前的宿主 stub（llm/tools/connection/systemPrompt——web 面由 dsh-web-app 提供） */
-function prepareStubs(ctx, captured) {
+async function prepareStubs(ctx, captured) {
   ctx.provide('llm', { stream: async function* stream() {} })
   ctx.provide('tools', { register: () => {} })
   ctx.provide('connection', {
@@ -70,6 +74,15 @@ function prepareStubs(ctx, captured) {
       },
     },
   })
+  // 真实 systemPrompt 服务（含 NamedEntries 重复检测——面板保存触发的插件重启
+  // 若未正确清理命名上下文，会在此暴露 "memory:snapshot is already registered"）
+  if (process.env.VERIFY_REAL_SYSTEM_PROMPT === '1') {
+    const { SystemPrompt } = await import(
+      pathToFileURL(join(DSH_PKG, 'node_modules', '@deepseek-ai', 'dsh-system-prompt', 'lib', 'index.js')).href
+    )
+    await ctx.plugin(SystemPrompt, { includeHarnessIdentity: false })
+    return
+  }
   ctx.provide('systemPrompt', { context: () => {} })
 }
 
@@ -156,7 +169,7 @@ async function phase1(root) {
   assert(captured.handlers['/memory'] !== undefined, '记忆插件 RPC 已注册（初始装配）')
   const initialHandleCount = captured.handleCount
 
-  // 面板保存：真实 RPC 处理器 → settings.update（落盘）→ applyChange（内存重启）
+  // 面板保存：真实 RPC 处理器 → settings.update（落盘）→ applyChange（实时热换，无重启）
   const result = await rpc('setConfig', SAVE_PAYLOAD)
   assert(result.ok === true, 'setConfig 返回 ok')
   const view = result.value.config
@@ -168,14 +181,11 @@ async function phase1(root) {
   // 2) cordis.yml 不被污染（旧链路写回目标保持组合基底）
   assert(readFileSync(cordisPath, 'utf8') === ROOT_CONFIG, 'cordis.yml 保持组合基底（未被 loader 写回污染）')
 
-  // 3) 插件内存重启（等待重启落定后的新 RPC 注册——重启后的 apply 会再次加载
-  //    真实本地嵌入模型，耗时数秒）
-  const afterRpc = await waitForRpc(captured, 60000, initialHandleCount + 1)
-  assert(captured.handleCount === initialHandleCount + 1, `保存触发插件重启（RPC 重注册：${captured.handleCount}）`)
-
-  // 重启后的新装配已读入合并配置
-  const after = await afterRpc('getConfig', null)
-  assert(after.ok === true && after.value.config.embeddingModel === 'verify-model', '重启后 getConfig 返回保存值')
+  // 3) 实时生效（无插件重启——重启与 apply 秒级异步段竞态，2026-08-16 实测
+  //    fatal load failure 根因）：RPC 保持单次注册；getConfig 立即返回保存值
+  assert(captured.handleCount === initialHandleCount, `保存实时生效（无重启——RPC 保持注册：${captured.handleCount}）`)
+  const after = await rpc('getConfig', null)
+  assert(after.ok === true && after.value.config.embeddingModel === 'verify-model', '保存后 getConfig 立即返回新配置')
 
   // 释放锁与 watcher 后再起"重启"进程（dispose 竞态的无害拒绝由 exit 兜底——见 phase2）
   await ctx.fiber.dispose().catch(() => {})
@@ -187,7 +197,7 @@ async function phase1(root) {
   })
   const code = await new Promise((resolve) => child.on('exit', resolve))
   if (code !== 0) throw new Error(`phase 2 失败（退出码 ${code}）——重启后配置丢失仍存在`)
-  console.log('验证全部通过：保存 → 重启 → 配置仍在。')
+  console.log('验证全部通过：保存 → 实时生效 → 重启后配置仍在。')
   return { home, profileDir }
 }
 
@@ -200,8 +210,8 @@ async function phase2(root) {
     assert(result.value.config[key] === value, `重启后 ${key} = ${String(value)}（从 settings.yaml 读回）`)
   }
   console.log('phase 2 通过：未保存即从 settings.yaml 恢复全部 4 项配置。')
-  // 直接退出（不做优雅 dispose：apply 的嵌入 init 仍在加载真实模型，dispose 会
-  // 与其异步续体竞争产生无害的 unhandledRejection——进程退出即终止一切）
+  // 直接退出（不做优雅 dispose——嵌入 init 加载真实本地模型耗时数秒，且插件
+  // apply 完成后 dispose 本身干净；process.exit 兜底终止 watcher/timer 即可）
   process.exit(0)
 }
 
