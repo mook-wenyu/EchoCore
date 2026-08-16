@@ -4,7 +4,8 @@
  *
  * 从 hf-mirror.com（国内可达镜像）下载 Xenova/all-MiniLM-L6-v2 的
  * q8 量化 ONNX 文件与 tokenizer 文件到目标目录（默认
- * ~/.dsh/storages/embedding-model，与插件默认 embeddingModelDir 一致）。
+ * $DSH_HOME/storages/embedding-model，未设 DSH_HOME 时为 ~/.dsh/storages/
+ * embedding-model——与插件默认 embeddingModelDir 同源，经 dsh-home-paths 解析）。
  *
  * 用法：node scripts/download-embedding-model.mjs [目标目录]
  * 运行后重启实例生效——嵌入默认启用：启动时检测模型文件存在性，
@@ -12,8 +13,8 @@
  */
 
 import { mkdir, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 const MIRROR = 'https://hf-mirror.com/Xenova/all-MiniLM-L6-v2/resolve/main'
 /** 需要下载的文件（q8 量化模型 + tokenizer 全套） */
@@ -26,7 +27,7 @@ const FILES = [
   'vocab.txt',
 ]
 
-const targetDir = process.argv[2] ?? join(homedir(), '.dsh', 'storages', 'embedding-model')
+const targetDir = process.argv[2] ?? dshHomePath('storages', 'embedding-model')
 // transformers.js 按模型 id（Xenova/all-MiniLM-L6-v2）在 localModelPath 下
 // 拼子目录加载——文件必须落在 <modelDir>/Xenova/all-MiniLM-L6-v2/<file>
 const modelRoot = join(targetDir, 'Xenova', 'all-MiniLM-L6-v2')

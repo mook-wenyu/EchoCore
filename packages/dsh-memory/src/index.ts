@@ -10,13 +10,12 @@
  * 平面规则：本插件不发布服务，组合行可松散挂载（见实现计划 §2.3）。
  */
 
-import { homedir } from 'node:os'
-import { join } from 'node:path'
 import { rename } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
 
 import type { Context } from '@deepseek-ai/cordis'
 
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { Config, DEFAULTS, type Config as ConfigType, type ResolvedConfig } from './config.js'
 import { EmbeddingIndex } from './embed-index.js'
 import { EmbeddingService, EmbeddingUnavailableError, resolveApiKey, type EmbeddingHolder } from './embedding.js'
@@ -77,14 +76,16 @@ function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig
   return { config: seam.effective, settings: seam.channel, applyChange: seam.applyChange }
 }
 
-/** 嵌入索引文件路径（按维度隔离：本地 384 / 远程配置值——不同维度混用会使余弦失真） */
+/** 嵌入索引文件路径（按维度隔离：本地 384 / 远程配置值——不同维度混用会使余弦失真）。
+ * 存储路径经 dsh-home-paths 解析（DSH_HOME 优先、~/.dsh 回退——与 settings.yaml
+ * 同源；多实例/CI 隔离，2026-08-16 用户拍板）。 */
 function defaultEmbeddingsFile(dimension: number): string {
-  return join(homedir(), '.dsh', 'storages', `memory-embeddings-${dimension}.json`)
+  return dshHomePath('storages', `memory-embeddings-${dimension}.json`)
 }
 
 /** 嵌入模型目录默认路径（空配置时；含 onnx/model_quantized.onnx 与 tokenizer 文件） */
 function defaultEmbeddingModelDir(): string {
-  return join(homedir(), '.dsh', 'storages', 'embedding-model')
+  return dshHomePath('storages', 'embedding-model')
 }
 
 // ── 嵌入后端实时热换（配置保存后原位生效，不重启插件） ──────────────────────
@@ -173,12 +174,12 @@ async function initEmbedding(
 
 /** 记忆库 SQLite 文件路径（替代旧 memory.json；WAL O(1) 写，见 sqlite-kv.ts） */
 function defaultMemoryDbFile(): string {
-  return join(homedir(), '.dsh', 'storages', 'memory.sqlite')
+  return dshHomePath('storages', 'memory.sqlite')
 }
 
 /** 旧 storage-json 记忆库文件路径（首启迁移源；迁移后改名为 .bak 保留） */
 function legacyMemoryJsonFile(): string {
-  return join(homedir(), '.dsh', 'storages', 'memory.json')
+  return dshHomePath('storages', 'memory.json')
 }
 
 /** 装配覆盖项（测试注入：隔离真实用户目录的存储文件） */

@@ -96,8 +96,8 @@ export interface EmbeddingServiceDeps {
   hasLocalModel?: () => Promise<boolean>
   /** 本地后端加载（默认 ONNX pipeline；测试注入假实现） */
   loadLocalBackend?: () => Promise<LocalEmbeddingBackend>
-  /** 远程嵌入调用（默认 fetch OpenAI 兼容端点；测试注入） */
-  fetchRemoteEmbeddings?: (input: string[], config: RemoteEmbeddingConfig) => Promise<Float32Array[]>
+  /** 远程嵌入调用（默认 fetch OpenAI 兼容端点，带超时+重试；测试注入） */
+  fetchRemoteEmbeddings?: (input: string[], config: RemoteEmbeddingConfig, opts?: EmbeddingFetchOptions) => Promise<Float32Array[]>
 }
 
 /** 默认本地模型存在性检测：检查 ONNX 模型文件（q8 量化文件为关键件） */
@@ -131,44 +131,114 @@ export function defaultLoadLocalBackend(modelDir: string): () => Promise<LocalEm
   }
 }
 
-/** 默认远程嵌入调用：OpenAI 兼容 POST {baseUrl}/embeddings（返回维度强校验） */
+/**
+ * 远程嵌入请求选项。
+ * 超时与重试依据（2026-08-16 用户拍板 + https://undici.nodejs.org/ + openai-node）：
+ * Node fetch 无默认整体超时（undici 连接 10s 固定、响应 300s），挂起端点会让
+ * 保存/检索/启动无限等待——必须显式 AbortSignal.timeout。/embeddings 幂等
+ * （同输入同向量），可安全重试（连接错误/超时/HTTP 408,409,429,5xx；不重试
+ * 4xx 其余——请求语义错误重试无益）。
+ */
+export interface EmbeddingFetchOptions {
+  /** 单次请求超时（毫秒）。默认 90_000（批量写路径）；验证 15_000、单条检索 15_000 */
+  timeoutMs?: number
+  /** 重试次数（默认 2）。验证用 0（失败立即回退本地——职责是快速判定可用性） */
+  retries?: number
+}
+
+/** 可重试 HTTP 状态（openai-node 同集） */
+const RETRYABLE_STATUS = new Set([408, 409, 429, 500, 502, 503, 504])
+/** 指数退避基数（毫秒，第 n 次重试前等待；n 从 0 起）+ 随机 jitter ≤200ms */
+const RETRY_DELAYS_MS = [1_000, 4_000]
+/** 默认批量写路径超时（openai-node 官方 10min 上限之下的务实值：低频单批 64 条） */
+export const DEFAULT_REMOTE_TIMEOUT_MS = 90_000
+export const DEFAULT_REMOTE_RETRIES = 2
+/** 验证调用：15s 单发（失败立即回退本地——验证职责是快速判定可用性，不赌重试） */
+export const VERIFY_FETCH_OPTS: EmbeddingFetchOptions = { timeoutMs: 15_000, retries: 0 }
+/** 单条检索调用：15s + 1 重试（检索不无限等，但瞬断可恢复——防误降级本地） */
+export const SINGLE_FETCH_OPTS: EmbeddingFetchOptions = { timeoutMs: 15_000, retries: 1 }
+/** 批量写路径（indexEntry/ensureAll）：90s + 2 重试（瞬断不杀整批） */
+export const BATCH_FETCH_OPTS: EmbeddingFetchOptions = { timeoutMs: DEFAULT_REMOTE_TIMEOUT_MS, retries: DEFAULT_REMOTE_RETRIES }
+
+function retryDelayMs(attempt: number): number {
+  const base = RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1]!
+  return base + Math.floor(Math.random() * 200)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** 可重试网络层错误：AbortSignal.timeout 超时（DOMException TimeoutError）或 fetch 连接失败（TypeError） */
+function isRetryableNetworkError(error: unknown): boolean {
+  return (error instanceof DOMException && error.name === 'TimeoutError') || error instanceof TypeError
+}
+
+/** 默认远程嵌入调用：OpenAI 兼容 POST {baseUrl}/embeddings（返回维度强校验；带超时+重试） */
 export function defaultFetchRemoteEmbeddings(
   input: string[],
   config: RemoteEmbeddingConfig,
+  opts: EmbeddingFetchOptions = {},
 ): Promise<Float32Array[]> {
-  return remoteEmbedFetch(input, config)
+  return remoteEmbedFetch(input, config, opts)
 }
 
 /** OpenAI 兼容 /embeddings 请求实现（纯函数形态，便于直接单测；apiKey 经 resolveApiKey 解析） */
-export async function remoteEmbedFetch(input: string[], config: RemoteEmbeddingConfig): Promise<Float32Array[]> {
+export async function remoteEmbedFetch(
+  input: string[],
+  config: RemoteEmbeddingConfig,
+  opts: EmbeddingFetchOptions = {},
+): Promise<Float32Array[]> {
   const apiKey = resolveApiKey(config.apiKey)
   if (apiKey === undefined) {
     throw new EmbeddingUnavailableError(`远程嵌入不可用：embeddingApiKey 未配置或引用的环境变量未设置（支持字面 key 或 env:NAME）`)
   }
   const base = config.baseUrl.replace(/\/+$/, '')
-  const response = await fetch(`${base}/embeddings`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ model: config.model, input, encoding_format: 'float' }),
-  })
-  if (!response.ok) {
-    const body = await response.text().catch(() => '')
-    throw new EmbeddingUnavailableError(`远程嵌入 API 失败：HTTP ${response.status}${body ? ` ${body.slice(0, 200)}` : ''}`)
-  }
-  const payload = (await response.json()) as { data: Array<{ embedding: number[] }> }
-  return payload.data.map((item) => {
-    // 维度强校验：返回维度 ≠ 配置维度 → 显式报错（同一索引混维会使余弦失真）
-    if (item.embedding.length !== config.dimension) {
-      throw new EmbeddingUnavailableError(
-        `远程嵌入返回维度 ${item.embedding.length} ≠ 配置维度 ${config.dimension}` +
-          `（请核对 embeddingDimension 并删除旧嵌入索引重建）`,
-      )
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_REMOTE_TIMEOUT_MS
+  const retries = opts.retries ?? DEFAULT_REMOTE_RETRIES
+  for (let attempt = 0; ; attempt++) {
+    const canRetry = attempt < retries
+    try {
+      const response = await fetch(`${base}/embeddings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ model: config.model, input, encoding_format: 'float' }),
+        // 显式超时：Node fetch 默认无整体超时，挂起端点会把保存/检索/启动无限卡死
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      if (!response.ok) {
+        const body = await response.text().catch(() => '')
+        // 可重试状态且重试未耗尽 → 退避后重试；否则按 API 错误抛出
+        if (canRetry && RETRYABLE_STATUS.has(response.status)) {
+          await sleep(retryDelayMs(attempt))
+          continue
+        }
+        throw new EmbeddingUnavailableError(`远程嵌入 API 失败：HTTP ${response.status}${body ? ` ${body.slice(0, 200)}` : ''}`)
+      }
+      const payload = (await response.json()) as { data: Array<{ embedding: number[] }> }
+      return payload.data.map((item) => {
+        // 维度强校验：返回维度 ≠ 配置维度 → 显式报错（同一索引混维会使余弦失真）
+        if (item.embedding.length !== config.dimension) {
+          throw new EmbeddingUnavailableError(
+            `远程嵌入返回维度 ${item.embedding.length} ≠ 配置维度 ${config.dimension}` +
+              `（请核对 embeddingDimension 并删除旧嵌入索引重建）`,
+          )
+        }
+        return Float32Array.from(item.embedding)
+      })
+    } catch (error) {
+      // 网络层可重试（超时/连接失败）→ 退避重试；非可重试（HTTP 4xx 语义错误/
+      // 维度不匹配/JSON 解析失败）立即上抛（调用方回退关键词/本地）
+      if (canRetry && isRetryableNetworkError(error)) {
+        await sleep(retryDelayMs(attempt))
+        continue
+      }
+      throw error
     }
-    return Float32Array.from(item.embedding)
-  })
+  }
 }
 
 /** 语义检索降级回调（装配层注入 logger；embed 运行期故障时记录并回退关键词） */
@@ -186,12 +256,18 @@ export class EmbeddingService {
 
   private readonly hasLocalModel: () => Promise<boolean>
   private readonly loadLocalBackend: () => Promise<LocalEmbeddingBackend>
-  private readonly fetchRemoteEmbeddings: (input: string[], config: RemoteEmbeddingConfig) => Promise<Float32Array[]>
+  private readonly fetchRemoteEmbeddings: (
+    input: string[],
+    config: RemoteEmbeddingConfig,
+    opts?: EmbeddingFetchOptions,
+  ) => Promise<Float32Array[]>
 
   constructor(private readonly deps: EmbeddingServiceDeps) {
     this.hasLocalModel = deps.hasLocalModel ?? defaultHasLocalModel(deps.modelDir)
     this.loadLocalBackend = deps.loadLocalBackend ?? defaultLoadLocalBackend(deps.modelDir)
-    this.fetchRemoteEmbeddings = deps.fetchRemoteEmbeddings ?? ((input, config) => defaultFetchRemoteEmbeddings(input, config))
+    this.fetchRemoteEmbeddings =
+      deps.fetchRemoteEmbeddings ??
+      ((input, config, opts) => defaultFetchRemoteEmbeddings(input, config, opts))
   }
 
   /** 当前状态（一等状态，调用方门控） */
@@ -236,8 +312,9 @@ export class EmbeddingService {
     const remote = this.deps.remote
     if (remote !== undefined) {
       try {
-        // 远程优先：一次短文本验证（配置/网络/鉴权/维度全链路）
-        await this.fetchRemoteEmbeddings(['验证'], remote)
+        // 远程优先：一次短文本验证（配置/网络/鉴权/维度全链路）。15s 单发——
+        // 验证职责是快速判定可用性，挂起/失败立即回退本地（验证不赌重试）
+        await this.fetchRemoteEmbeddings(['验证'], remote, VERIFY_FETCH_OPTS)
         this.backend = 'remote'
         this.dimensionValue = remote.dimension
         this.stateValue = 'ready'
@@ -262,10 +339,11 @@ export class EmbeddingService {
     if (this.stateValue !== 'ready') {
       throw new EmbeddingUnavailableError(`语义嵌入不可用（state=${this.stateValue}）`)
     }
-    return this.embedWithFallback([text]).then((vectors) => vectors[0]!)
+    // 单条检索：15s + 1 重试（检索不无限等，瞬断可恢复防误降级本地）
+    return this.embedWithFallback([text], SINGLE_FETCH_OPTS).then((vectors) => vectors[0]!)
   }
 
-  /** 批量嵌入（内部按 64 条分批，摊薄单次调用开销） */
+  /** 批量嵌入（内部按 64 条分批，摊薄单次调用开销；90s + 2 重试——瞬断不杀整批） */
   async embedMany(texts: string[]): Promise<Float32Array[]> {
     if (this.stateValue !== 'ready') {
       throw new EmbeddingUnavailableError(`语义嵌入不可用（state=${this.stateValue}）`)
@@ -274,19 +352,20 @@ export class EmbeddingService {
     const BATCH = 64
     for (let i = 0; i < texts.length; i += BATCH) {
       const chunk = texts.slice(i, i + BATCH)
-      results.push(...(await this.embedWithFallback(chunk)))
+      results.push(...(await this.embedWithFallback(chunk, BATCH_FETCH_OPTS)))
     }
     return results
   }
 
   /**
-   * 带运行期回退的嵌入：当前后端失败 → 有下一优先级后端则切换并重试一次
-   * （用户拍板"自动回退"的运行期形态）；无后备则抛错（调用方显式降级关键词）。
+   * 带运行期回退的嵌入：当前后端失败（重试耗尽后）→ 有下一优先级后端则切换并
+   * 重试一次（用户拍板"自动回退"的运行期形态）；无后备则抛错（调用方显式降级
+   * 关键词）。超时/连接类失败由 remoteEmbedFetch 内部退避重试，此层只做后端回退。
    */
-  private async embedWithFallback(texts: string[]): Promise<Float32Array[]> {
+  private async embedWithFallback(texts: string[], opts?: EmbeddingFetchOptions): Promise<Float32Array[]> {
     try {
       if (this.backend === 'remote' && this.deps.remote !== undefined) {
-        return await this.fetchRemoteEmbeddings(texts, this.deps.remote)
+        return await this.fetchRemoteEmbeddings(texts, this.deps.remote, opts)
       }
       if (this.backend === 'local' && this.localBackend !== undefined) {
         const vectors: Float32Array[] = []

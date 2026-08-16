@@ -8,8 +8,9 @@
  * backup API（node:sqlite 内置）做一致性快照。
  *
  * 功能：
- * - 备份 ~/.dsh/storages/memory.sqlite → 备份目录（默认
- *   ~/.dsh/storages/backups/memory-<YYYYMMDD-HHmmss>.sqlite）；
+ * - 备份 $DSH_HOME/storages/memory.sqlite → 备份目录（默认
+ *   $DSH_HOME/storages/backups/memory-<YYYYMMDD-HHmmss>.sqlite；未设 DSH_HOME
+ *   时为 ~/.dsh/storages/backups/——与插件存储同源，经 dsh-home-paths 解析）；
  * - 清理旧备份：按文件名时间戳排序，仅保留最近 N 份（默认 10）。
  *
  * 用法：
@@ -22,12 +23,12 @@
  */
 
 import { mkdir, readdir, rm, access } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync, backup } from 'node:sqlite'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 /** 源文件：记忆库 SQLite（WAL 模式；backup API 保证一致性快照） */
-const SOURCE = join(homedir(), '.dsh', 'storages', 'memory.sqlite')
+const SOURCE = dshHomePath('storages', 'memory.sqlite')
 
 /** 时间戳文件名（秒级精度；同秒多次运行由保留策略收敛） */
 function stamp() {
@@ -37,7 +38,7 @@ function stamp() {
 }
 
 async function main() {
-  const targetDir = process.argv[2] ?? join(homedir(), '.dsh', 'storages', 'backups')
+  const targetDir = process.argv[2] ?? dshHomePath('storages', 'backups')
   const keep = Number(process.argv[3] ?? 10)
   if (!Number.isInteger(keep) || keep < 1) {
     throw new Error(`保留份数必须为正整数（收到 ${process.argv[3]}）`)

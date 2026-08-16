@@ -8,7 +8,7 @@
  * 存储路径经 MountOverrides 注入临时目录——测试绝不触碰真实用户目录。
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -281,4 +281,24 @@ describe('插件组合根（index.ts）', () => {
     expect(connection.rpc.handle).toHaveBeenCalledTimes(1)
     await cleanup(ctx, store.dir)
   })
+
+  it('B1 DSH_HOME 优先：未传 overrides 时存储落在 $DSH_HOME/storages（与 settings.yaml 同源）', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dshhome-'))
+    const { ctx } = setup()
+    vi.stubEnv('DSH_HOME', home)
+    try {
+      // 预建 storages 目录（真实部署由 dsh 创建；SQLite 不自动建父目录）
+      mkdirSync(join(home, 'storages'), { recursive: true })
+      // 故意不传 dbFile/legacyJsonFile——走默认路径（此时 DSH_HOME 应接管）
+      await mountMemory(ctx as never, { ...DEFAULTS } as never, { warn: () => {}, info: () => {} } as never)
+      // 记忆库落在 $DSH_HOME/storages/memory.sqlite（而非真实 ~/.dsh）
+      expect(existsSync(join(home, 'storages', 'memory.sqlite'))).toBe(true)
+    } finally {
+      vi.unstubAllEnvs()
+      for (const dispose of ctx.disposers) dispose()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
 })
+

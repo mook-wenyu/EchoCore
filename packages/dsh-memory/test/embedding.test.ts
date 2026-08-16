@@ -14,7 +14,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { EmbeddingIndex } from '../src/embed-index.js'
-import { EmbeddingService, EmbeddingUnavailableError, cosine, resolveApiKey } from '../src/embedding.js'
+import { EmbeddingService, EmbeddingUnavailableError, cosine, remoteEmbedFetch, resolveApiKey } from '../src/embedding.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeTable } from './helpers.js'
@@ -197,6 +197,115 @@ describe('EmbeddingService 状态机（远程优先回退本地）', () => {
     const v = await service.embed('测试')
     expect(v).toHaveLength(384)
     expect(service.dimension).toBe(384)
+  })
+
+  it('超时策略按调用面传参：验证 15s 单发 / 单条 15s+1 重试 / 批量 90s+2 重试', async () => {
+    const received: Array<{ opts?: { timeoutMs?: number; retries?: number } }> = []
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      remote: remoteConfig,
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: async (input, config, opts) => {
+        received.push({ opts })
+        return fakeRemote(input, config)
+      },
+    })
+    await service.init() // 验证：VERIFY_FETCH_OPTS
+    expect(received[0]?.opts).toEqual({ timeoutMs: 15_000, retries: 0 })
+    await service.embed('单条') // 检索：SINGLE_FETCH_OPTS
+    expect(received[1]?.opts).toEqual({ timeoutMs: 15_000, retries: 1 })
+    await service.embedMany(['批量', '嵌入']) // 写路径：BATCH_FETCH_OPTS
+    expect(received[2]?.opts).toEqual({ timeoutMs: 90_000, retries: 2 })
+  })
+})
+
+describe('remoteEmbedFetch 超时与重试', () => {
+  const remoteConfig = { baseUrl: 'https://api.example.com/v1', apiKey: 'sk-test', model: 'm', dimension: 4 }
+  /** 构造 4 维全 1 的假响应体 */
+  function okResponse(): { ok: true; status: number; async text(): Promise<string>; async json(): Promise<unknown> } {
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return ''
+      },
+      async json() {
+        return { data: [{ embedding: [1, 1, 1, 1] }] }
+      },
+    }
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('携带 AbortSignal.timeout（显式超时——Node fetch 默认无整体超时）', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(okResponse() as never)
+    const inputTexts = ['测试']
+    await remoteEmbedFetch(inputTexts, remoteConfig, { timeoutMs: 5_000, retries: 0 })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [, init] = fetchMock.mock.calls[0]!
+    expect((init as { signal?: AbortSignal }).signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('网络层失败（TypeError fetch failed）→ 指数退避重试后成功', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(okResponse() as never)
+    const result = await remoteEmbedFetch(['测试'], remoteConfig)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(Array.from(result[0]!)).toEqual([1, 1, 1, 1])
+  })
+
+  it('可重试 HTTP 状态（429）→ 重试；非重试状态（400）→ 立即抛错不重试', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock
+      .mockResolvedValueOnce({ ok: false, status: 429, async text() { return 'rate limited' } } as never)
+      .mockResolvedValueOnce(okResponse() as never)
+    const result = await remoteEmbedFetch(['测试'], remoteConfig)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    fetchMock.mockReset()
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 400, async text() { return 'bad request' } } as never)
+    await expect(remoteEmbedFetch(['测试'], remoteConfig)).rejects.toThrow('HTTP 400')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('超时（TimeoutError）→ 按可重试处理退避重试', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const timeoutError = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    fetchMock
+      .mockRejectedValueOnce(timeoutError)
+      .mockResolvedValueOnce(okResponse() as never)
+    const result = await remoteEmbedFetch(['测试'], remoteConfig)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(Array.from(result[0]!)).toEqual([1, 1, 1, 1])
+  })
+
+  it('retries=0：网络失败立即上抛不重试（验证调用语义）', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockRejectedValueOnce(new TypeError('fetch failed'))
+    await expect(remoteEmbedFetch(['测试'], remoteConfig, { timeoutMs: 15_000, retries: 0 })).rejects.toThrow()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('维度不匹配不重试（EmbeddingUnavailableError，语义错误）', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      async text() {
+        return ''
+      },
+      async json() {
+        return { data: [{ embedding: [1, 1] }] } // 2 维 ≠ 配置 4 维
+      },
+    } as never)
+    await expect(remoteEmbedFetch(['测试'], remoteConfig)).rejects.toThrow('维度')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
 
