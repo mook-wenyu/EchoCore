@@ -7,6 +7,8 @@ import { describe, expect, it } from 'vitest'
 
 import {
   adaptiveHalfLifeDays,
+  bm25Idf,
+  idfWeightedRelevance,
   importanceFactor,
   MIN_RELEVANCE_SCORE,
   modulatedHalfLifeDays,
@@ -107,6 +109,69 @@ describe('relevanceScore', () => {
 
   it('空查询得 0 分', () => {
     expect(relevanceScore([], new Set(['pnpm']))).toBe(0)
+  })
+})
+
+// 轻量 IDF 加权（决策：含轻量 IDF——保留 0-1 标定的 BM25 化）。
+// 检索时按候选集统计 df（零维护），使稀有词命中权重大于常见词，同命中数下可区分条目。
+describe('idfWeightedRelevance（轻量 IDF 加权）', () => {
+  it('全命中 = 1.0（0-1 上界保留——注入 0.7/0.4 三档语义不变）', () => {
+    // N=3 候选，token 出现在全部候选（df=N，idf 趋小）仍全命中 = 1
+    const df = { rareB: 1, common: 3, common2: 3 }
+    expect(
+      idfWeightedRelevance(['common', 'common2'], new Set(['common', 'common2']), (t) => df[t] ?? 0, 3),
+    ).toBeCloseTo(1, 10)
+    // 稀有词全命中同样 = 1
+    expect(idfWeightedRelevance(['rareB'], new Set(['rareB']), (t) => df[t] ?? 0, 3)).toBeCloseTo(1, 10)
+  })
+
+  it('零命中 = 0', () => {
+    expect(idfWeightedRelevance(['a', 'b'], new Set(['x', 'y']), () => 1, 3)).toBe(0)
+  })
+
+  it('空查询 = 0', () => {
+    expect(idfWeightedRelevance([], new Set(['a']), () => 1, 3)).toBe(0)
+  })
+
+  it('稀有词命中权重 > 常见词命中（同命中数下 IDF 区分条目）', () => {
+    // 候选 N=3：rareB 仅 1 条含，common 3 条全含，mid 2 条含；
+    // 两查询 token 均为非零 df（不引入 df=0 稀释，只对比命中 token 的稀有度）
+    const df = { rareB: 1, common: 3, mid: 2 }
+    const hitRare = idfWeightedRelevance(['rareB', 'mid'], new Set(['rareB']), (t) => df[t] ?? 0, 3)
+    const hitCommon = idfWeightedRelevance(['common', 'mid'], new Set(['common']), (t) => df[t] ?? 0, 3)
+    // 同为 1/2 命中，命中"稀有 token"的那条权重更高（IDF 区分条目核心语义）
+    expect(hitRare).toBeGreaterThan(hitCommon)
+  })
+
+  it('df=N 的常见词 idf 趋近 0（BM25 让常见词几乎不贡献权重）', () => {
+    expect(bm25Idf(3, 3)).toBeLessThan(bm25Idf(3, 1))
+    expect(bm25Idf(3, 3)).toBeCloseTo(Math.log(0.5 / 3.5 + 1), 10)
+    expect(bm25Idf(3, 0)).toBeGreaterThan(bm25Idf(3, 3))
+  })
+
+  it('df=0 用最大 idf 保底且恒为正（只进分母稀释弱相关，不取负）', () => {
+    expect(bm25Idf(3, 0)).toBeGreaterThan(0)
+    // N 增大使 df=0 的 idf 更大（更罕见）
+    expect(bm25Idf(20, 0)).toBeGreaterThan(bm25Idf(3, 0))
+  })
+
+  it('部分命中 = 命中的 idf 占比（0..1 之间；候选集外 df=0 词不进分母）', () => {
+    // N=2：a/c 在候选集（df=1），只命中 a → 0.5（分母 = a+c 的 idf）
+    const df = { a: 1, c: 1 }
+    const score = idfWeightedRelevance(['a', 'c'], new Set(['a']), (t) => df[t] ?? 0, 2)
+    expect(score).toBeCloseTo(0.5, 10)
+    // 候选集外词 b（df=0）不进分母——候选集内全命中仍 1.0（相对匹配度语义）
+    const scoreFull = idfWeightedRelevance(['a', 'b'], new Set(['a']), (t) => df[t] ?? 0, 2)
+    expect(scoreFull).toBe(1)
+    // 命中 token 越多比例越高（df 相同时）
+    const score3 = idfWeightedRelevance(['a', 'c'], new Set(['a', 'c']), (t) => df[t] ?? 0, 2)
+    expect(score3).toBeGreaterThan(score)
+    // 全部 token 候选集外 → 0（候选集内无匹配面）
+    expect(idfWeightedRelevance(['x', 'y'], new Set(['x']), () => 0, 2)).toBe(0)
+  })
+
+  it('未命中集为空的退化（n<=0）返回 0，不抛错', () => {
+    expect(idfWeightedRelevance(['a'], new Set(['a']), () => 1, 0)).toBe(0)
   })
 })
 

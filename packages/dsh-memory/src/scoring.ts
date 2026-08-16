@@ -174,6 +174,8 @@ function appendCjkTokens(tokens: string[], run: string): void {
 /**
  * 相关性得分：查询 token 中被条目命中的比例（0..1）。
  * 命中判定为 token 精确包含于条目 token 集合；空查询得 0 分。
+ * 注：为关键词路径的默认（无 df 上下文）打分保留——store 关键词分支现改用
+ * idfWeightedRelevance（轻量 IDF 加权），本函数仍供其他无候选集场景使用。
  */
 export function relevanceScore(queryTokens: string[], entryTokens: Set<string>): number {
   if (queryTokens.length === 0) return 0
@@ -182,6 +184,54 @@ export function relevanceScore(queryTokens: string[], entryTokens: Set<string>):
     if (entryTokens.has(token)) matched++
   }
   return matched / queryTokens.length
+}
+
+/**
+ * BM25 逆文档频率：max(0, ln((N - df + 0.5) / (df + 0.5) + 1))。
+ * - df=0 时自动取得最大值（df 越小 idf 越大）——"缺失"查询 token 用最大 idf 保底，
+ *   无需特判；这些 token 只出现在分母（条目不包含即永不命中），稀释弱相关；
+ * - df=N（所有候选都含）时 idf→趋近 0 而不取负（对数内 +1 保证 ln>1 恒正）；
+ * - 返回严格 > 0（N ≥ df ≥ 0 时对数内 > 1），不会造成除零。
+ */
+export function bm25Idf(n: number, df: number): number {
+  return Math.max(0, Math.log((n - df + 0.5) / (df + 0.5) + 1))
+}
+
+/**
+ * 轻量 IDF 加权相关性（0..1）——关键词路径的 BM25 化，保留 0-1 绝对标定：
+ *   分子 = Σ(命中 query token 的 idf)；分母 = Σ(df>0 的 query token 的 idf)。
+ * - 全命中（候选集内所有 query token 都命中）→ 分子 = 分母 = 1.0（0-1 上界不受
+ *   IDF 影响——注入三档 0.7/0.4 语义保持）；
+ * - 零命中 → 0；部分命中 → 命中的 idf 占比（稀有词命中权重大于常见词，同命中数下
+ *   IDF 可区分条目）；
+ * - **df=0 的 query token 不进分母**（2026-08-16 修复）：候选集完全无此词时它对
+ *   候选集无区分意义——若进分母（最大 idf），长查询（P3 拼接/含噪声词）会把命中
+ *   条目的分砸到注入阈值以下（既有测试实证：'pnpm workspace 怎么' 的 '怎么'、
+ *   3 段拼接的 2-gram 使相关记忆跌破 0.4）。分数语义 = 候选集内的相对匹配度。
+ * - 分母为 0（全部 query token 均 df=0）→ 0（候选集内无任何匹配面）。
+ *
+ * df 与 N 由调用方在检索时对候选集统计（零维护——无写路径改动）：
+ *   df = 某 query token 在候选集中出现的条目数；N = 候选集大小。
+ * df(token) 对未出现 token 应返回 0。用传入的 df 回调逐 token 查询，避免建立全量表。
+ */
+export function idfWeightedRelevance(
+  queryTokens: string[],
+  entryTokens: ReadonlySet<string>,
+  df: (token: string) => number,
+  n: number,
+): number {
+  if (queryTokens.length === 0 || n <= 0) return 0
+  let numerator = 0
+  let denominator = 0
+  for (const token of queryTokens) {
+    const tokenDf = df(token)
+    if (tokenDf <= 0) continue // 候选集外词：不进分母（见函数注释）
+    const idf = bm25Idf(n, tokenDf)
+    denominator += idf
+    if (entryTokens.has(token)) numerator += idf
+  }
+  // 全部 token 均候选集外 → 候选集内无匹配面
+  return denominator <= 0 ? 0 : numerator / denominator
 }
 
 /**

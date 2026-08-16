@@ -320,8 +320,28 @@ describe('MemoryStore.search', () => {
     // importance=1 而非 0：0 会被 P2 写端门拒绝而不落库（见写端门用例），
     // 此处需真实入库再验证 minScore 过滤逻辑本身
     await store.create(input({ content: 'pnpm workspace', importance: 1 }))
+    // 弱词 df>0 构造（新 IDF 语义：候选集外词不进分母——需候选集内词才有区分）
+    await store.create(input({ content: '完全不相关的词', importance: 1 }))
     const results = store.search({ query: 'pnpm workspace 完全不相关的词', minScore: 0.5 })
-    expect(results).toEqual([])
+    // 弱命中条目（2/5 ≈0.4）被过滤——强命中条目（3/5 ≈0.6）可返回（不同条目）
+    expect(results.some((e) => e.content === 'pnpm workspace')).toBe(false)
+  })
+
+  it('轻量 IDF：同命中数下稀有词条目分 > 常见词条目（df 统计正确）', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    // importance/时间全同（相同 timeImportanceFactor）——纯对比 IDF 对命中权重的区分。
+    // 两条目同为 1/2 命中：R 命中稀有词 pkg（df=1）、C 命中常见词 code（df=2，E 也含）。
+    await store.create(input({ content: 'pkg 项目', importance: 5 }))
+    await store.create(input({ content: 'code 项目', importance: 5 }))
+    await store.create(input({ content: 'code 额外条目', importance: 5 }))
+
+    const scored = store.search({ query: 'pkg code', withScore: true })
+    expect(scored).toHaveLength(3) // 三条均至少命中一个查询 token（pkg 或 code）
+    const scoreOf = (content: string): number => scored.find((s) => s.entry.content === content)?.score ?? 0
+    // 同为 1/2 命中：命中稀有词 pkg 的条目分 > 命中常见词 code 的条目（IDF 从 df 区分）
+    expect(scoreOf('pkg 项目')).toBeGreaterThan(scoreOf('code 项目'))
+    // 两条 code 条目 df 相同（df=2）→ 命中权重相同 → 分相等（commas 与 '项目' 冗余 token 不影响）
+    expect(scoreOf('code 项目')).toBe(scoreOf('code 额外条目'))
   })
 })
 

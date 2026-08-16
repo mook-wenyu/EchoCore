@@ -16,7 +16,7 @@
 import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 import { cosine } from './embedding.js'
-import { relevanceScore, rrfScore, timeImportanceFactor, tokenize } from './scoring.js'
+import { idfWeightedRelevance, relevanceScore, rrfScore, timeImportanceFactor, tokenize } from './scoring.js'
 import {
   dedupKeyOf,
   newMemoryId,
@@ -517,10 +517,25 @@ export class MemoryStore {
           if (score >= minScore) scored.push({ entry, score })
         }
       } else {
+        // 轻量 IDF 加权关键词路径（保留 0-1 标定，注入分档不受影响）：
+        // 1) 先一次性统计 query tokens 在候选集（matches）中的文档频率 df——
+        //    零维护（无写路径改动，检索时按候选集现算）；df=0 的 token 由 scoring
+        //    侧按最大 idf 保底（只进分母，稀释弱相关）；
+        // 2) 再逐条目算 idfWeightedRelevance：稀有词命中权重大于常见词，同命中
+        //    数下 IDF 可区分条目——全命中仍 = 1.0、零命中 = 0、0-1 尺度保持。
+        const df = new Map<string, number>()
+        for (const entry of matches) {
+          const tokens = this.cachedTokens(entry)
+          for (const t of queryTokenList) {
+            if (tokens.has(t)) df.set(t, (df.get(t) ?? 0) + 1)
+          }
+        }
         for (const entry of matches) {
           // R1：缓存 token 集合替代 memoryScore 内部重复 tokenize（计算等价：
           // memoryScore = relevance × timeImportanceFactor，relevance=0 → 0 < minScore 不过）
-          const score = relevanceScore(queryTokenList, this.cachedTokens(entry)) * timeImportanceFactor(entry, now)
+          const score =
+            idfWeightedRelevance(queryTokenList, this.cachedTokens(entry), (t) => df.get(t) ?? 0, matches.length) *
+            timeImportanceFactor(entry, now)
           if (score >= minScore) scored.push({ entry, score })
         }
       }

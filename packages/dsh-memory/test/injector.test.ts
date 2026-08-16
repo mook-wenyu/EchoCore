@@ -177,14 +177,17 @@ describe('MemoryInjector pre-step 注入', () => {
   })
 
   // F2（相关性硬门槛）：旧 MIN_SCORE=0.15 会放行、但新硬门槛 0.3 会拦截的
-  // "低相关"记忆不再注入。构造 10-token 查询仅命中 2 个（relevance=0.2 → 区间
-  // 0.15-0.3 内）：新近 fresh 条目 factor≈0.75 → score≈0.15，恰好落在
-  // [旧门槛, 新门槛) 之间——旧版本注入消息，新版本拒绝（行为变化验证）。
+  // "低相关"记忆不再注入。构造 10-token 查询 + 10 条候选（每条仅含 1 个查询词、
+  // 其余词 df>0 需候选覆盖——新 IDF 语义：候选集外词不进分母）——每条命中
+  // 1/10 = 0.1 × factor ≈0.075 < 0.4 → 全部不注入。
   it('低相关记忆（relevance 落在 0.15-0.3 区间）不再注入（F2 硬门槛）', async () => {
     const { preStep, store } = setup()
-    // 记忆仅含查询 10 个词 token 中的前 2 个 → relevance = 2/10 = 0.2
-    await seed(store, { content: longContent('alpha beta 一次性备注'), importance: 5 })
-    const query = 'alpha beta gamma delta epsilon zeta eta theta iota kappa'
+    const words = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta', 'iota', 'kappa']
+    // 10 条候选：每条含 1 个查询词（df>0）+ 独立内容——查询 10 词时每条仅 1/10 命中
+    for (const word of words) {
+      await seed(store, { content: longContent(`${word} 一次性备注`), importance: 5 })
+    }
+    const query = words.join(' ')
     const decision = await preStep(makePayload('s1', query), async () => enterDecision())
     // 无条件断言（防弱断言静默跳过）：低相关记忆不注入 → 消息保持原样 1 条
     expect(decision.kind).toBe('enter')
