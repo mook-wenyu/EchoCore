@@ -49,6 +49,9 @@ importers:
       '@node-rs/jieba':
         specifier: ^2.0.2
         version: 2.0.2
+      '@photostructure/sqlite-vec':
+        specifier: ^1.2.0
+        version: 1.2.0
       zod:
         specifier: ^4.4.3
         version: 4.4.3
@@ -1003,6 +1006,11 @@ packages:
   '@node-rs/jieba@2.0.2':
     resolution: {integrity: sha512-aONN6nwpbwHKenEzCcYUbm6ZFHWEs7N5eas7zwWFs3c4MmEdN79m9Si4PvOxCp285I2M+g4MfLyUm9WcYaQi7Q==}
     engines: {node: '>= 10'}
+
+  '@photostructure/sqlite-vec@1.2.0':
+    resolution: {integrity: sha512-hfVdcPYDcYdcg1MAFev56sO+L39loLbv9e1nKhxQSuHlvnvyNdUJR+Ly1iWuWIiWQDDo/leLFWeCmb/hX0+kKw==}
+    engines: {node: '>=14.0.0'}
+    os: [darwin, linux, win32]
 
   '@protobufjs/aspromise@1.1.2':
     resolution: {integrity: sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ==}
@@ -2552,6 +2560,8 @@ snapshots:
       '@node-rs/jieba-win32-arm64-msvc': 2.0.2
       '@node-rs/jieba-win32-ia32-msvc': 2.0.2
       '@node-rs/jieba-win32-x64-msvc': 2.0.2
+
+  '@photostructure/sqlite-vec@1.2.0': {}
 
   '@protobufjs/aspromise@1.1.2': {}
 

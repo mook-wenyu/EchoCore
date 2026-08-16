@@ -452,16 +452,17 @@ export interface EmbeddingHolder {
 }
 
 /**
- * 语义增强检索（P4，注入器与工具共用）：
+ * 语义增强检索（P4，注入器与工具共用；2026-08-17 用户拍板 sqlite-vec 甲方案）：
  * - 嵌入未启用/未就绪 → 纯关键词路径（状态门控，无异常路径）；
- * - 就绪 → 计算查询向量 + 提供条目向量查找，走 store 融合评分；
+ * - 就绪 → 计算查询向量，语义榜由 vec0 KNN 排名器提供（SQL C+SIMD 检索，
+ *   store 语义榜可注入——替代进程内全量余弦），走 store 融合评分；
  * - 运行期嵌入故障（EmbeddingUnavailableError）→ 显式记录（logWarn）并
  *   回退纯关键词——这是"语义层故障时检索保持可用"的显式降级，非静默吞错。
  */
 export async function searchWithSemantic<T>(
   store: { search(options: import('./store.js').SearchOptions): T[] },
   embedding: EmbeddingService | undefined,
-  index: { get(id: string): number[] | undefined } | undefined,
+  index: { knn(queryVector: Float32Array, k: number): Array<{ id: string; cosine: number }> } | undefined,
   query: string,
   options: SemanticSearchExtra,
   logWarn: (message: string, error?: unknown) => void,
@@ -475,7 +476,8 @@ export async function searchWithSemantic<T>(
       query,
       ...options,
       queryEmbedding: queryVector,
-      lookupEmbedding: (id) => index.get(id),
+      // 语义榜 = vec0 KNN top-k（榜单宽度 k 由 store 侧 semanticTopK 派生）
+      semanticRank: (vector, k) => index.knn(vector as Float32Array, k),
     })
   } catch (error) {
     if (error instanceof EmbeddingUnavailableError) {

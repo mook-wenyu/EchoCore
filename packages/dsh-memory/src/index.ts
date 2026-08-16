@@ -76,10 +76,8 @@ function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig
   return { config: seam.effective, settings: seam.channel, applyChange: seam.applyChange }
 }
 
-/** 嵌入索引文件路径（按维度隔离：本地 384 / 远程配置值——不同维度混用会使余弦失真）。
- * 存储路径经 dsh-home-paths 解析（DSH_HOME 优先、~/.dsh 回退——与 settings.yaml
- * 同源；多实例/CI 隔离，2026-08-16 用户拍板）。 */
-function defaultEmbeddingsFile(dimension: number): string {
+/** 旧 JSON 嵌入索引文件路径（vec0 迁移源：memory-embeddings-<dim>.json；迁移后改名 .bak） */
+function legacyEmbeddingsFile(dimension: number): string {
   return dshHomePath('storages', `memory-embeddings-${dimension}.json`)
 }
 
@@ -102,15 +100,17 @@ const EMBEDDING_MODEL_DIR = defaultEmbeddingModelDir()
 /**
  * 嵌入后端初始化/热换（装配初始 init 与面板保存热换共用一条路径）：
  * 远程配置齐 → 远程优先验证；失败回退本地模型检测；都无 → disabled（正常态）。
- * ready 时按后端维度文件构建 EmbeddingIndex 并加载（维度隔离，不同维度不得混用）。
+ * ready 时在 memory.sqlite 上构建 vec0 索引（2026-08-17 用户拍板
+ * @photostructure/sqlite-vec；维度隔离按表 vec_memory_<dim>）。
  * - epoch 守卫：并发初始化只保留最后一次调用发起的会话（陈旧结果丢弃——防
  *   慢速旧会话覆盖新配置的后端）；
- * - 热换前 flush 旧索引（10s 去抖持久化的待写向量落盘，不丢）；
+ * - 旧 JSON 索引一次性迁移入表（表非空跳过，幂等）；
  * - 初始化失败（EmbeddingUnavailableError）记录并**保留旧后端**（热换失败不
  *   破坏当前可用嵌入；首启时 holder 恒空 → 关键词模式）。
  */
 async function initEmbedding(
   config: ResolvedConfig,
+  db: DatabaseSync,
   holder: EmbeddingHolder,
   store: MemoryStore,
   logger: ReturnType<Context['logger']>,
@@ -143,27 +143,30 @@ async function initEmbedding(
     throw error
   }
   if (epoch !== embeddingEpoch) return
-  // 旧索引待写向量落盘后再替换（10s 去抖——面板保存热换不丢向量）
-  if (holder.index !== undefined) {
-    await holder.index.flush().catch((error: unknown) => {
-      logger.warn(`[dsh-memory] 嵌入索引落盘失败（旧索引丢弃）：${error instanceof Error ? error.message : String(error)}`)
-    })
-  }
-  if (epoch !== embeddingEpoch) return
   if (service.state === 'ready') {
+    // 向量索引 = vec0 虚拟表（与 memory.sqlite 同文件；构造即载入 sqlite-vec
+    // 扩展并建表）。旧 JSON 索引（memory-embeddings-<dim>.json）一次性迁移入
+    // 表（表非空则跳过——幂等），迁移后原文件改名 .bak 保留。
     const index = new EmbeddingIndex({
-      file: defaultEmbeddingsFile(service.dimension),
+      db,
       service,
       listAll: () => store.listRecent(Number.MAX_SAFE_INTEGER),
       logWarn: (message, error) => logger.warn(message, error),
     })
-    await index.load()
+    const legacyFile = legacyEmbeddingsFile(service.dimension)
+    const migrated = await index.loadLegacy(legacyFile)
+    if (migrated > 0) {
+      logger.info(`[dsh-memory] 旧嵌入索引已迁移至 vec0 表（${migrated} 条）`)
+      await rename(legacyFile, `${legacyFile}.bak`).catch(() => {
+        logger.warn('[dsh-memory] 旧嵌入索引改名 .bak 失败（保留原位置）')
+      })
+    }
     if (epoch !== embeddingEpoch) return
     holder.service = service
     holder.index = index
-    // 全量补齐缺失嵌入（后台；~1.2s/1260 条，不阻塞生效完成）
+    // 全量补齐缺失嵌入（后台；仅缺失条目——既有向量已迁移/复用于表内）
     void index.ensureAll()
-    logger.info(`[dsh-memory] 语义嵌入已就绪（后端：${service.backendLabel}，维度：${service.dimension}）`)
+    logger.info(`[dsh-memory] 语义嵌入已就绪（后端：${service.backendLabel}，维度：${service.dimension}，索引 ${index.table}）`)
   } else {
     if (epoch !== embeddingEpoch) return
     holder.service = service
@@ -201,9 +204,11 @@ export async function mountMemory(
 ): Promise<void> {
   // 结构性存储改造（用户拍板）：自建 SQLite（node:sqlite，WAL 追加写 O(1)），
   // 替代宿主 storage-domain + storage-json 的整文件原子写（O(n) 写放大）。
+  // allowExtension：加载 sqlite-vec 扩展（vec0 向量表；2026-08-17 用户拍板
+  // @photostructure/sqlite-vec——同一连接向量检索 O(1) 与条目存储共存）。
   // 首启迁移：memory.json 存在且 SQLite 为空 → 逐条校验导入 → 原文件改名为
   // memory.json.bak 保留（不删除——迁移可追溯；幂等：SQLite 非空即跳过）。
-  const db = new DatabaseSync(overrides.dbFile ?? defaultMemoryDbFile())
+  const db = new DatabaseSync(overrides.dbFile ?? defaultMemoryDbFile(), { allowExtension: true })
   // 句柄生命周期归本插件所有：卸载时关闭数据库（幂等）
   ctx.effect(() => () => {
     if (db.isOpen) db.close()
@@ -220,7 +225,7 @@ export async function mountMemory(
   overrides.seam?.setApplier((next) => {
     const s = storeRef
     if (s === undefined) return Promise.resolve()
-    return initEmbedding(next, holder, s, logger)
+    return initEmbedding(next, db, holder, s, logger)
   })
 
   if (table.size === 0) {
@@ -264,7 +269,7 @@ export async function mountMemory(
   // 语义嵌入初始初始化（远程优先 → 本地回退 → disabled 正常态）。装配用
   // seam 的**当前**生效配置（settings 段若已在注册期生效，此处即合并值）——
   // 与热换共用 initEmbedding 单一路径（epoch 守卫防并发旧会话覆盖）。
-  await initEmbedding(overrides.seam?.effective() ?? config, holder, store, logger)
+  await initEmbedding(overrides.seam?.effective() ?? config, db, holder, store, logger)
 
   // 提取器：双通道（压缩遮蔽 + 轮次增量），纯观察不阻塞主循环
   // （参数已常量化——用户拍板配置面最小化；提取恒启用）

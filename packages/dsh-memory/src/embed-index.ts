@@ -1,105 +1,159 @@
 /**
  * @module @echocore/dsh-memory/embed-index
  *
- * 嵌入索引（OPTIMIZATION_PLAN_3 P4）：记忆 id → 384 维向量，独立 JSON 文件
- * 持久化（`<数据目录>/memory-embeddings.json`）——不污染 memory.json 的
- * 条目 schema 与审计链。
+ * 嵌入索引（sqlite-vec vec0 虚拟表，2026-08-17 用户拍板：
+ * `@photostructure/sqlite-vec` 生产 fork）。
  *
- * 语义（显式，非兜底）：
- * - `get(id)` 返回 undefined = "该条目尚无嵌入"（刚创建未嵌入/嵌入失败），
- *   检索融合时该条目只用关键词分——这是索引的附加层语义，不是吞错；
- * - 维护路径：启动全量补齐（ensureAll，后台） + 新建增量（indexEntry，
- *   fire-and-forget） + 归档移除（remove）；
- * - 嵌入文本 = entry.content（不含 tags：tags 变化无需重建索引，KISS；
- *   关键词路径仍覆盖 tags 命中）。
+ * 原实现把向量存为独立 JSON 数字数组文件（`memory-embeddings-<dim>.json`）：
+ * 2560 维 × 6500 条 ≈ 317MB 文本——10s 去抖整写写放大、启动全量 JSON.parse、
+ * 内存 number[] 膨胀（~16.8M 个 JS number ≈ 134MB+）。实测量化与权威依据
+ * （FAISS 官方选型指南：百万条以下暴力检索即最优；sqlite-vec 官方：
+ * brute-force 到 >1M 高维才慢；BLOB 是 SQLite 向量的生态最佳实践）：
+ *
+ * 重构为 vec0 虚拟表（同一 memory.sqlite 文件，与 SqliteKvTable 共用连接）：
+ * - 向量以 float32 二进制 (X'hex') 存储——每维 4 字节，6500×2560 ≈ 64MB；
+ * - 写入 = 行级 upsert（WAL O(1)），无整文件重写；
+ * - 检索 = SQL KNN（`embedding MATCH ? AND k = ?`，C+SIMD brute-force，
+ *   cosine 度量）——替代进程内全量余弦；
+ * - 检索/写入均不需内存驻留全量向量（vec0 数据即权威态）。
+ *
+ * 维度隔离：表名 `vec_memory_<dim>`（本地 384 / 远程配置值）——换维度自动
+ * 新表，与旧 JSON 文件按维度隔离同构。
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+
+import { getLoadablePath } from '@photostructure/sqlite-vec'
 
 import type { MemoryEntry } from './types.js'
 
-/** R2：持久化去抖窗口（ms）——高频 indexEntry/remove 合并为一次整写 */
-export const PERSIST_DEBOUNCE_MS = 10_000
-
-/**
- * 全量构建批量大小（用户拍板 128/批，2026-08-17）：
- * 与 EmbeddingService.embedMany 的内部批次常量一致——每次调用恰好一批，
- * 批次失败可独立跳过（粒度 = 一次远程请求）。原实现逐条串行远程调用
- * （6569 条 ≈ 30min~2h）且完成才落盘、任一条失败零落盘——性能与健壮性缺陷。
- */
+/** 嵌入批次大小（用户拍板 128/批，2026-08-17；与 EmbeddingService.embedMany 一致） */
 export const EMBED_BATCH_SIZE = 128
 
 /** 嵌入索引依赖 */
 export interface EmbeddingIndexDeps {
-  /** 索引文件绝对路径（JSON：{ [id]: number[] }；装配层按后端维度隔离命名） */
-  file: string
-  /** 嵌入服务（state==='ready' 才调用 embed；dimension = 后端输出维度，动态校验用） */
+  /**
+   * 已打开的 SQLite 连接（须以 `allowExtension: true` 构造方可 loadExtension；
+   * 与 SqliteKvTable 共用 memory.sqlite——单一数据文件）。
+   */
+  db: DatabaseSync
+  /** 嵌入服务（embed/embedMany；dimension = 后端输出维度，表名/建表据此） */
   service: {
     state: string
-    /** 后端输出维度（本地 384 / 远程配置值）——索引校验与持久化按此维度 */
+    /** 后端输出维度（本地 384 / 远程配置值）——vec0 表列 float[dim] 据此 */
     dimension: number
     embed(text: string): Promise<Float32Array>
-    /**
-     * 批量嵌入（可选）：全量构建优先走批量（128/批，用户拍板）——远程后端
-     * 一次请求多条，摊薄 HTTP 往返；缺失时回退逐条（测试注入假后端）。
-     */
+    /** 批量嵌入（可选）：缺失时回退逐条（测试注入假后端） */
     embedMany?(texts: string[]): Promise<Float32Array[]>
   }
   /** 全量构建取数（listRecent(超大 limit) 语义 = 全量 active 列表） */
   listAll(): MemoryEntry[]
-  /** 嵌入/持久化故障记录（装配层注入 logger） */
+  /** 嵌入/迁移故障记录（装配层注入 logger） */
   logWarn: (message: string, error?: unknown) => void
 }
 
+/** 模块级已加载扩展的数据库连接集合（loadExtension 每连接一次，防重复加载报错） */
+const loadedDbs = new WeakSet<object>()
+
+/** 记忆 id 列名（vec0 metadata 列——KNN 结果经此回到条目域） */
+const MID_COL = 'memory_id'
+
+/** Float32Array → vec0 二进制向量字面量（float32 little-endian, X'hex'）：
+ * 全精度（优于 JSON 数字文本的 toFixed 截断）+ 体积最小（4 字节/维）。 */
+function vecLiteral(vector: Float32Array): string {
+  return `X'${Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength).toString('hex')}'`
+}
+
+/** JSON 数字数组 → Float32Array（旧 JSON 索引文件迁移源的读侧换算） */
+function parseJsonVec(list: unknown): Float32Array | undefined {
+  if (!Array.isArray(list) || list.length === 0) return undefined
+  const array = new Float32Array(list.length)
+  for (let i = 0; i < list.length; i++) {
+    const n = list[i]
+    if (typeof n !== 'number' || !Number.isFinite(n)) return undefined
+    array[i] = n
+  }
+  return array
+}
+
 export class EmbeddingIndex {
-  /** id → 向量（进程内权威态；JSON 文件为持久层） */
-  private readonly vectors = new Map<string, number[]>()
-  /** 全量构建串行锁（并发调用合并为一次） */
+  /** vec0 表名（维度隔离：本地 384 / 远程配置值） */
+  readonly table: string
+  /** UPSERT 用：按 memory_id 查找既有 rowid */
+  private readonly findRowStmt
+  /** 按 memory_id 删除 */
+  private readonly deleteStmt
+  /** 全量已有 memory_id（ensureAll 差集） */
+  private readonly listIdsStmt
+  /** 全量构建串行锁（并发 ensureAll 合并为一次） */
   private building: Promise<void> | undefined
-  /** 持久化串行队列（P0-1：并发 persist 互斥，见 persist()） */
-  private persistChain: Promise<void> | undefined
 
-  constructor(private readonly deps: EmbeddingIndexDeps) {}
+  constructor(private readonly deps: EmbeddingIndexDeps) {
+    const { db, service } = deps
+    if (!loadedDbs.has(db)) {
+      // 加载 sqlite-vec 扩展（getLoadablePath → dist/<platform>-<arch>/vec0.dll）
+      db.loadExtension(getLoadablePath())
+      loadedDbs.add(db)
+    }
+    this.table = `vec_memory_${service.dimension}`
+    // vec0 表：embedding float[dim] + cosine 度量 + memory_id metadata 列
+    db.exec(
+      `CREATE VIRTUAL TABLE IF NOT EXISTS "${this.table}" USING vec0(embedding float[${service.dimension}] distance_metric=cosine, ${MID_COL} TEXT);`,
+    )
+    this.findRowStmt = db.prepare(`SELECT rowid FROM "${this.table}" WHERE ${MID_COL} = ? LIMIT 1`)
+    this.deleteStmt = db.prepare(`DELETE FROM "${this.table}" WHERE ${MID_COL} = ?`)
+    this.listIdsStmt = db.prepare(`SELECT ${MID_COL} FROM "${this.table}"`)
+  }
 
-  /** 从 JSON 文件加载（文件不存在 = 空索引，正常首启状态） */
-  async load(): Promise<void> {
-    let raw: string
-    try {
-      raw = await readFile(this.deps.file, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-      throw error
-    }
-    // P0-1：损坏 JSON（并发 rename 竞态/手工编辑产物）降级为空索引 + 告警——
-    // 嵌入层语义本为"可选附加层"（缺失向量仅影响语义召回），损坏文件不应让
-    // 插件整体加载失败；显式降级（logWarn）非静默吞错。
-    let parsed: Record<string, unknown>
-    try {
-      parsed = JSON.parse(raw) as Record<string, unknown>
-    } catch (error) {
-      this.deps.logWarn('[dsh-memory] 嵌入索引文件损坏（解析失败，已按空索引加载；可删除该文件后重启重建）：', error)
-      return
-    }
-    for (const [id, vector] of Object.entries(parsed)) {
-      if (
-        Array.isArray(vector) &&
-        vector.length === this.deps.service.dimension &&
-        vector.every((n) => typeof n === 'number' && Number.isFinite(n))
-      ) {
-        this.vectors.set(id, vector as number[])
-      } else {
-        this.deps.logWarn(`[dsh-memory] 嵌入索引含畸形向量（跳过）：${id}`)
-      }
+  /** SQL 字符串字面量转义（memory_id 拼进动态 SQL——vec0 的 embedding 列绑定参数
+   * 有解析缺陷（实测 "Input does not start with '['"/"Only integers...")，向量一律
+   * 内联字面量；memory_id 为外部输入走标准单引号转义防注入） */
+  private static esc(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`
+  }
+
+  /**
+   * 写一条向量（UPDATE-or-INSERT，动态 SQL 内联向量字面量）：
+   * 实测 vec0 对 embedding 列 prepared 绑定参数整体拒绝（二进制/JSON 文本均
+   * "Input does not start with '['"），内联 X'hex' 字面量则正常——见模块头。
+   */
+  private writeVector(id: string, vector: Float32Array): void {
+    const existing = this.findRowStmt.get(id) as { rowid: number } | undefined
+    const lit = vecLiteral(vector)
+    if (existing !== undefined) {
+      this.deps.db.exec(`UPDATE "${this.table}" SET embedding = ${lit} WHERE rowid = ${existing.rowid}`)
+    } else {
+      this.deps.db.exec(`INSERT INTO "${this.table}"(${MID_COL}, embedding) VALUES (${EmbeddingIndex.esc(id)}, ${lit})`)
     }
   }
 
-  /** 读取向量；undefined = 尚无嵌入（显式语义，见模块头） */
-  get(id: string): number[] | undefined {
-    return this.vectors.get(id)
+  /**
+   * 语义 KNN 检索（甲方案主路径）：查询向量 → top-k 近邻（cosine 降序）→
+   * `{ id, cosine }[]`（store 语义榜消费，SQLite C+SIMD brute-force）。
+   * k 由 store 按榜单宽度派生（semanticTopK，>1M 条前 brute-force 即最优）。
+   * 查询向量经内联字面量（vec0 对 embedding 列绑定参数整体拒绝，见 writeVector）。
+   */
+  knn(queryVector: Float32Array, k: number): Array<{ id: string; cosine: number }> {
+    const rows = this.deps.db
+      .prepare(
+        `SELECT ${MID_COL}, distance FROM "${this.table}" WHERE embedding MATCH ${vecLiteral(queryVector)} AND k = ${k} ORDER BY distance`,
+      )
+      .all() as Array<{ [MID_COL]: string; distance: number }>
+    return rows.map((row) => ({ id: row[MID_COL], cosine: 1 - row.distance }))
   }
 
-  /** 全量补齐缺失条目（后台调用；串行锁防并发重复构建） */
+  /** 新建条目增量嵌入（UPDATE-or-INSERT：同 id 重嵌覆盖不堆积） */
+  async indexEntry(entry: MemoryEntry): Promise<void> {
+    const vector = await this.deps.service.embed(entry.content)
+    this.writeVector(entry.id, vector)
+  }
+
+  /** 归档/覆盖条目移除向量（同步行删；与持久层即时一致） */
+  remove(id: string): void {
+    this.deleteStmt.run(id)
+  }
+
+  /** 全量补齐缺失条目（128/批批量嵌入；失败批跳过——缺失保持关键词检索） */
   ensureAll(): Promise<void> {
     if (this.building !== undefined) return this.building
     this.building = this.buildMissing()
@@ -112,28 +166,42 @@ export class EmbeddingIndex {
     return this.building
   }
 
-  /** 新建条目增量嵌入（fire-and-forget：写入路径不因嵌入变慢；失败仅记录） */
-  indexEntry(entry: MemoryEntry): void {
-    void this.embedOne(entry).catch((error: unknown) => {
-      this.deps.logWarn(`[dsh-memory] 嵌入失败（记忆 ${entry.id}，保持纯关键词检索）：`, error)
-    })
+  /** 旧 JSON 索引文件迁移（首启路径）：表非空（幂等守卫——重启/重复调用不
+   * 重复迁移）时跳过；读 JSON → 全量插入 vec0 → 返回迁移数 */
+  async loadLegacy(jsonFile: string): Promise<number> {
+    const count = (this.listIdsStmt.all() as unknown[]).length
+    if (count > 0) return 0 // 表已有数据：视为已迁移（防同 id 重复行堆积）
+    const { readFile } = await import('node:fs/promises')
+    let raw: string
+    try {
+      raw = await readFile(jsonFile, 'utf8')
+    } catch {
+      return 0 // 无旧文件 = 无迁移
+    }
+    let parsed: Record<string, unknown>
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>
+    } catch (error) {
+      this.deps.logWarn('[dsh-memory] 旧嵌入索引 JSON 损坏（视为无迁移，可删除后重建）：', error)
+      return 0
+    }
+    let migrated = 0
+    for (const [id, value] of Object.entries(parsed)) {
+      const vector = parseJsonVec(value)
+      if (vector === undefined) {
+        this.deps.logWarn(`[dsh-memory] 旧嵌入索引含畸形向量（跳过）：${id}`)
+        continue
+      }
+      this.writeVector(id, vector)
+      migrated++
+    }
+    return migrated
   }
 
-  /** 归档条目移除向量（与持久层同步，防陈旧向量占检索分） */
-  remove(id: string): void {
-    if (this.vectors.delete(id)) this.persist()
-  }
-
-  /**
-   * 逐条嵌入缺失条目并持久化。
-   * 批量能力（embedMany，128/批）优先——远程后端一次请求多条摊薄往返；
-   * 每批完成后去抖增量落盘（失败批跳过继续——缺失条目保持纯关键词检索，
-   * 模块头显式语义）；无批量能力（测试注入假后端）回退逐条，同样逐条增量落盘。
-   * 2026-08-17 修复：原实现逐条串行远程 + 全部完成才落盘 + 任一条失败整体
-   * 中止零落盘——远程模式 6569 条需 30min~2h，中途失败进度全丢。
-   */
+  /** 全量补齐实现（详述见 ensureAll） */
   private async buildMissing(): Promise<void> {
-    const missing = this.deps.listAll().filter((entry) => !this.vectors.has(entry.id))
+    const existing = new Set((this.listIdsStmt.all() as Array<{ [MID_COL]: string }>).map((row) => row[MID_COL]))
+    const missing = this.deps.listAll().filter((entry) => !existing.has(entry.id))
     if (missing.length === 0) return
     const batch = this.deps.service.embedMany
     if (batch !== undefined) {
@@ -141,76 +209,18 @@ export class EmbeddingIndex {
         const chunk = missing.slice(i, i + EMBED_BATCH_SIZE)
         try {
           const vectors = await batch(chunk.map((entry) => entry.content))
-          chunk.forEach((entry, j) => this.vectors.set(entry.id, Array.from(vectors[j]!)))
+          for (let j = 0; j < chunk.length; j++) this.writeVector(chunk[j]!.id, vectors[j]!)
         } catch (error) {
-          // 批次失败显式记录并继续下一批——缺失条目保持纯关键词检索（显式语义，
-          // 非吞错：全部失败时 ensureAll 也通过 warn 透出）
+          // 批次失败显式记录并继续下一批——缺失条目保持纯关键词检索（显式语义）
           this.deps.logWarn(`[dsh-memory] 嵌入批次失败（${chunk.length} 条保持纯关键词检索）：`, error)
         }
-        this.persist() // 增量落盘（去抖 10s 合并；失败批未 set → 不写该批）
       }
-      await this.flushPersist() // 兜底末批落盘
       return
     }
-    // 无批量能力（测试注入假后端）：逐条回退（既有路径）——同样增量落盘
+    // 无批量能力（测试注入假后端）：逐条回退
     for (const entry of missing) {
       const vector = await this.deps.service.embed(entry.content)
-      this.vectors.set(entry.id, Array.from(vector))
-      this.persist()
+      this.writeVector(entry.id, vector)
     }
-    await this.flushPersist()
-  }
-
-  /** 单条嵌入（供 indexEntry 调用；持久化走 R2 去抖） */
-  private async embedOne(entry: MemoryEntry): Promise<void> {
-    const vector = await this.deps.service.embed(entry.content)
-    this.vectors.set(entry.id, Array.from(vector))
-    this.persist()
-  }
-
-  /**
-   * R2（2026-08-15）：去抖持久化——indexEntry/remove 高频调用合并为
-   * PERSIST_DEBOUNCE_MS 窗口一次整写（原实现每条新记忆全量写 7MB JSON，
-   * 与旧 memory.json 的 O(n) 整写同构病）。向量索引是可重建的派生层
-   * （启动 ensureAll 补齐）——进程退出丢最后窗口内的落盘可接受。
-   * 内存 Map 是权威态（检索读内存），持久化仅服务重启恢复。
-   */
-  private persistTimer: ReturnType<typeof setTimeout> | undefined
-  private dirty = false
-
-  private persist(): void {
-    this.dirty = true
-    if (this.persistTimer !== undefined) return
-    this.persistTimer = setTimeout(() => {
-      this.persistTimer = undefined
-      void this.flushPersist()
-    }, PERSIST_DEBOUNCE_MS)
-  }
-
-  /**
-   * 立即持久化（去抖窗口内合并；buildMissing/卸载前调用保证落盘）。
-   * 公开供装配层卸载时 flush + 测试确定性断言。
-   */
-  flush(): Promise<void> {
-    return this.flushPersist()
-  }
-
-  /** 立即持久化（去抖窗口内合并；buildMissing/卸载前调用保证落盘） */
-  private flushPersist(): Promise<void> {
-    if (!this.dirty) return Promise.resolve()
-    this.dirty = false
-    // P0-1：promise 队列串行化——并发 flush 时写同一 tmp 文件会交错，
-    // 队列保证任意时刻至多一个写事务；写的是调用时点 vectors 快照。
-    const next = this.persistChain === undefined ? this.persistNow() : this.persistChain.then(() => this.persistNow(), () => this.persistNow())
-    this.persistChain = next
-    return next
-  }
-
-  /** 实际写事务（仅由 persist 队列调用，保证串行） */
-  private async persistNow(): Promise<void> {
-    await mkdir(dirname(this.deps.file), { recursive: true })
-    const tmp = `${this.deps.file}.tmp`
-    await writeFile(tmp, JSON.stringify(Object.fromEntries(this.vectors)), 'utf8')
-    await rename(tmp, this.deps.file)
   }
 }

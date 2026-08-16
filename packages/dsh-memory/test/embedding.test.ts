@@ -1,15 +1,18 @@
 /**
- * 语义嵌入模块单元测试（OPTIMIZATION_PLAN_3 P4）：
+ * 语义嵌入模块单元测试（OPTIMIZATION_PLAN_3 P4 + 2026-08-17 sqlite-vec 重构）：
  * - cosine 纯函数（正交/同向/零向量/维度不一致）；
  * - EmbeddingService 状态机（disabled/ready/error）与 EmbeddingUnavailableError；
- * - store 语义融合检索（关键词零重合但语义相关可召回；无向量条目只用关键词分）；
- * - EmbeddingIndex 持久化与畸形向量跳过。
- * 单测不加载真实 ONNX 模型（22MB）——用假 pipeline 注入。
+ * - store 语义融合检索（关键词零重合但语义相关可召回；无向量条目只用关键词分；
+ *   KNN 排名器注入分支——sqlite-vec 甲方案）；
+ * - EmbeddingIndex（vec0 虚拟表）：KNN 检索/增量 upsert/移除/全量补齐/旧 JSON 迁移。
+ * 单测不加载真实 ONNX 模型（22MB）——用假 pipeline 注入；vec0 用真实扩展
+ * （:memory: + loadExtension，@photostructure/sqlite-vec 自带 Windows dll）。
  */
 
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -455,263 +458,225 @@ describe('store 语义融合检索', () => {
     })
     expect(both.some((item) => item.entry.id === kw && item.score > 0.7)).toBe(true)
   })
+
+  it('语义榜来自注入的 KNN 排名器（sqlite-vec 甲方案）——榜外条目不占语义分、榜内条目可单榜上榜', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => now)
+    // a：与查询零 token 重合（纯语义命中）；b：与查询零重合且不在语义榜
+    const a = await seed(store, { content: '量子物理中的纠缠态测量' })
+    const b = await seed(store, { content: 'pnpm workspace 规则' })
+    const ranker = vi.fn((_q: ArrayLike<number>, k: number) => {
+      expect(k).toBeGreaterThan(0)
+      return [{ id: a, cosine: 0.5 }]
+    })
+    const results = store.search({
+      query: '怎么管理多包项目',
+      workspace: 'D:/ws',
+      limit: 5,
+      minScore: 0.15,
+      queryEmbedding: vec(0),
+      semanticRank: ranker,
+    })
+    expect(ranker).toHaveBeenCalled()
+    // a 经单榜上榜召回；b 无关键词分且不在语义榜 → 不上榜
+    expect(results.some((entry) => entry.id === a)).toBe(true)
+    expect(results.some((entry) => entry.id === b)).toBe(false)
+  })
 })
 
-describe('EmbeddingIndex', () => {
-  let dir: string
+describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => {
+  /**
+   * 假嵌入服务：384 维"热位 = 文本长度 mod 384"向量（该位为 1，其余 0）——
+   * 同长度 → 同向量（cosine 1）；不同长度 → 正交（cosine 0）——KNN 用 cosine
+   * 可精确断言命中/未命中（KNN 无"零匹配空"语义，命中与否看 cosine 值）。
+   */
+  function fakeService(overrides?: { failOnCall?: number }) {
+    let call = 0
+    const make = (text: string) => {
+      const v = new Float32Array(384)
+      v[text.length % 384] = 1
+      return v
+    }
+    return {
+      state: 'ready',
+      dimension: 384,
+      embed: async (text: string) => make(text),
+      embedMany: async (texts: string[]) => {
+        call++
+        if (overrides?.failOnCall === call) throw new Error('网络错误（模拟批量失败）')
+        return texts.map((text) => make(text))
+      },
+    }
+  }
 
-  afterEach(async () => {
-    if (dir !== undefined) await rm(dir, { recursive: true, force: true })
+  /** 构造 384 维查询向量（热位 = 长度 mod 384） */
+  function queryVec(len: number): Float32Array {
+    const v = new Float32Array(384)
+    v[len % 384] = 1
+    return v
+  }
+
+  it('构造即建表；空表 knn 返回空', () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const warns: string[] = []
+    const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: (m) => warns.push(m) })
+    expect(index.table).toBe('vec_memory_384')
+    expect(index.knn(queryVec(4), 10)).toEqual([])
+    db.close()
   })
 
-  async function setup() {
-    dir = await mkdtemp(join(tmpdir(), 'embed-index-'))
-    const file = join(dir, 'memory-embeddings.json')
+  it('indexEntry 后 KNN 命中（同向量 → cosine≈1；语义榜供 store 消费）', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
     const warns: string[] = []
+    const index = new EmbeddingIndex({
+      db,
+      service: fakeService(),
+      listAll: () => [],
+      logWarn: (m) => warns.push(m),
+    })
+    const entry = { id: 'mem-aaaa', content: '测试内容' } as unknown as MemoryEntry // length 4
+    await index.indexEntry(entry)
+    const hits = index.knn(queryVec(4), 10)
+    expect(hits).toHaveLength(1)
+    expect(hits[0]!.id).toBe('mem-aaaa')
+    expect(hits[0]!.cosine).toBeGreaterThan(0.999)
+    // KNN 无"零匹配空"语义（始终返回最近的 top-k）——正交查询命中该条时
+    // cosine ≈ 0（不相似），以此区分命中/未命中
+    const far = index.knn(queryVec(42), 10).find((h) => h.id === 'mem-aaaa')
+    expect(far === undefined || far.cosine < 0.01).toBe(true)
+    db.close()
+  })
+
+  it('indexEntry 同 id 重嵌覆盖（UPDATE-or-INSERT：不堆积重复行）', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const index = new EmbeddingIndex({
+      db,
+      service: fakeService(),
+      listAll: () => [],
+      logWarn: () => {},
+    })
+    await index.indexEntry({ id: 'mem-a', content: 'AAAAA' } as unknown as MemoryEntry) // len 5
+    await index.indexEntry({ id: 'mem-a', content: 'BB' } as unknown as MemoryEntry) // 同 id 重嵌 len 2
+    const hits = index.knn(queryVec(2), 50)
+    // 表内仅一行 mem-a（被覆盖为 len 2 → 热位 2）
+    expect(hits.filter((h) => h.id === 'mem-a')).toHaveLength(1)
+    expect(hits[0]!.cosine).toBeGreaterThan(0.999)
+    // 旧向量（len 5）已被覆盖：正交查询下 cosine ≈ 0
+    const old = index.knn(queryVec(5), 50).find((h) => h.id === 'mem-a')
+    expect(old === undefined || old.cosine < 0.01).toBe(true)
+    db.close()
+  })
+
+  it('remove 移除向量（KNN 不再召回）', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const index = new EmbeddingIndex({
+      db,
+      service: fakeService(),
+      listAll: () => [],
+      logWarn: () => {},
+    })
+    await index.indexEntry({ id: 'mem-x', content: '记忆内容' } as unknown as MemoryEntry)
+    expect(index.knn(queryVec(4), 10)).toHaveLength(1)
+    index.remove('mem-x')
+    expect(index.knn(queryVec(4), 10)).toEqual([])
+    db.close()
+  })
+
+  it('ensureAll 批量补齐（128/批）+ 幂等（已存在不重复插入）', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const entries = Array.from({ length: 300 }, (_, i) => ({ id: `mem-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+    const index = new EmbeddingIndex({
+      db,
+      service: fakeService(),
+      listAll: () => entries,
+      logWarn: () => {},
+    })
+    await index.ensureAll()
+    // 每条 content（'内容N'）长度 3 → 全表同向量 → KNN 全量召回 300 行
+    expect(index.knn(queryVec(3), 400)).toHaveLength(entries.length)
+    // 幂等：再次 ensureAll 不重复（行数不变）
+    await index.ensureAll()
+    expect(index.knn(queryVec(3), 400)).toHaveLength(entries.length)
+    db.close()
+  })
+
+  it('ensureAll 批次中途失败：logWarn 跳过继续，其余批次已入库', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const warns: string[] = []
+    const entries = Array.from({ length: 300 }, (_, i) => ({ id: `mem-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+    const index = new EmbeddingIndex({
+      db,
+      service: fakeService({ failOnCall: 2 }),
+      listAll: () => entries,
+      logWarn: (m, e) => warns.push(`${m}${e instanceof Error ? e.message : ''}`),
+    })
+    await index.ensureAll()
+    expect(warns.some((m) => m.includes('网络错误'))).toBe(true)
+    // 第 2 批（128..255）失败未入库；第 1/3 批已入库
+    const hits = index.knn(queryVec(3), 400)
+    const ids = new Set(hits.map((h) => h.id))
+    expect(ids.has('mem-0')).toBe(true)
+    expect(ids.has('mem-128')).toBe(false)
+    expect(ids.has('mem-256')).toBe(true)
+    db.close()
+  })
+
+  it('无 embedMany（假后端）→ ensureAll 逐条回退', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
     const service = {
       state: 'ready',
       dimension: 384,
-      // 384 维假向量：首位 = 文本长度（通过维度校验）
       embed: async (text: string) => {
         const v = new Float32Array(384)
         v[0] = text.length
         return v
       },
     }
-    const index = new EmbeddingIndex({
-      file,
-      service,
-      listAll: () => [] as MemoryEntry[],
-      logWarn: (message: string) => warns.push(message),
-    })
-    return { file, index, warns }
-  }
-
-  it('load 缺失文件 = 空索引（正常首启状态）', async () => {
-    const { index } = await setup()
-    await index.load()
-    expect(index.get('任意id')).toBeUndefined()
+    const entries = Array.from({ length: 5 }, (_, i) => ({ id: `mem-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+    const index = new EmbeddingIndex({ db, service, listAll: () => entries, logWarn: () => {} })
+    await index.ensureAll()
+    expect(index.knn(queryVec(3), 10)).toHaveLength(entries.length)
+    db.close()
   })
 
-  it('持久化 round-trip：indexEntry 后可从新实例读回', async () => {
-    const { file, index, warns } = await setup()
-    const entry = {
-      id: 'm-1',
-      content: '测试内容',
-    } as unknown as MemoryEntry
-    index.indexEntry(entry)
-    // R2 去抖持久化：轮询 flush（embedOne 完成置 dirty 后落盘；flush 幂等）
-    const { readFile } = await import('node:fs/promises')
-    let raw: string | undefined
-    for (let i = 0; i < 20; i++) {
-      await index.flush()
-      try {
-        raw = await readFile(file, 'utf8')
-        break
-      } catch {
-        await new Promise((resolve) => setTimeout(resolve, 10))
-      }
+  it('loadLegacy：旧 JSON 索引迁移入表；非空表幂等跳过', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'embed-legacy-'))
+    const file = join(dir, 'memory-embeddings-384.json')
+    const vectors: Record<string, number[]> = {}
+    for (let i = 0; i < 5; i++) {
+      const v = new Array(384).fill(0)
+      v[0] = i // 首位 = 序号（区分）
+      vectors[`legacy-${i}`] = v
     }
-    expect(raw).toBeDefined()
-    const reloaded = new EmbeddingIndex({
-      file,
-      service: { state: 'ready', dimension: 384, embed: async () => new Float32Array(384) },
-      listAll: () => [],
-      logWarn: () => {},
-    })
-    await reloaded.load()
-    const vector = reloaded.get('m-1')
-    // '测试内容'.length = 4 → 首位 4，其余 0
-    expect(vector?.[0]).toBe(4)
-    expect(vector?.slice(1).every((n) => n === 0)).toBe(true)
-  })
-
-  it('畸形向量（维度错误）被跳过并告警', async () => {
-    const { file, index, warns } = await setup()
-    const { writeFile } = await import('node:fs/promises')
-    await writeFile(file, JSON.stringify({ bad: [1, 2, 3] }), 'utf8')
-    await index.load()
-    expect(index.get('bad')).toBeUndefined()
-    expect(warns.some((message) => message.includes('畸形'))).toBe(true)
-  })
-
-  it('损坏 JSON 文件 load 降级为空索引并告警（P0-1：不抛致命错误）', async () => {
-    const { file, index, warns } = await setup()
-    const { writeFile } = await import('node:fs/promises')
-    // 半截写入（并发 rename 竞态的产物）——JSON 无法 parse
-    await writeFile(file, '{"m-1":[0.1,0.2,', 'utf8')
-    await expect(index.load()).resolves.toBeUndefined()
-    expect(index.get('m-1')).toBeUndefined()
-    expect(warns.some((message) => message.includes('损坏') || message.includes('解析'))).toBe(true)
-  })
-
-  it('并发 indexEntry 持久化串行互斥：最终文件完整可解析（P0-1 竞态回归）', async () => {
-    const { file, index } = await setup()
-    // 慢嵌入制造并发窗口：多条 fire-and-forget 同时进入 embedOne → persist
-    // （10ms/条：全量并行跑时留足时序余量，防轮询超时误报）
-    const slow = new EmbeddingIndex({
-      file,
-      service: {
-        state: 'ready',
-        dimension: 384,
-        embed: async (text: string) => {
-          await new Promise((resolve) => setTimeout(resolve, 10))
-          const v = new Float32Array(384)
-          v[0] = text.length
-          return v
-        },
-      },
-      listAll: () => [] as MemoryEntry[],
-      logWarn: () => {},
-    })
-    const entries = Array.from({ length: 8 }, (_, i) => ({
-      id: `m-${i}`,
-      content: `内容${i}`,
-    })) as unknown as MemoryEntry[]
-    for (const entry of entries) slow.indexEntry(entry)
-    // R2 去抖持久化：轮询 flush + 读文件直到全量（flush 幂等；embedOne 完成
-    // 置 dirty 后落盘；连续 3 次读到完整内容判定稳定——防最后一次 rename
-    // 未落盘时的残留竞态）
-    const { readFile } = await import('node:fs/promises')
-    let parsed: Record<string, number[]> | undefined
-    let stable = 0
-    for (let i = 0; i < 300; i++) {
-      await slow.flush()
-      await new Promise((resolve) => setTimeout(resolve, 25))
-      try {
-        parsed = JSON.parse(await readFile(file, 'utf8')) as Record<string, number[]>
-        if (Object.keys(parsed).length === entries.length) {
-          stable++
-          if (stable >= 3) break
-        } else {
-          stable = 0
-        }
-      } catch {
-        // 文件未就绪或写入中——继续等
-        stable = 0
-      }
-    }
-    expect(parsed).toBeDefined()
-    expect(Object.keys(parsed!)).toHaveLength(entries.length)
-    // 每条向量可完整读回且维度正确
-    for (const entry of entries) {
-      expect(parsed![entry.id]).toHaveLength(384)
-    }
-  })
-
-  it('ensureAll 批量构建：优先 embedMany（128/批，用户拍板），全部完成后落盘（2026-08-17 逐条串行性能缺陷修复）', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'embed-index-batch-'))
+    await writeFile(file, JSON.stringify(vectors), 'utf8')
     try {
-      const file = join(dir, 'memory-embeddings.json')
-      let calls = 0
-      const texts: string[][] = []
-      const service = {
-        state: 'ready',
-        dimension: 384,
-        embed: async (text: string) => {
-          const v = new Float32Array(384)
-          v[0] = text.length
-          return v
-        },
-        // 批量能力：记录每批文本并返回同批向量（首位 = 1 便于断言）
-        embedMany: async (input: string[]) => {
-          calls++
-          texts.push(input)
-          return input.map(() => {
-            const v = new Float32Array(384)
-            v[0] = 1
-            return v
-          })
-        },
-      }
-      const entries = Array.from({ length: 200 }, (_, i) => ({ id: `m-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
-      const index = new EmbeddingIndex({ file, service, listAll: () => entries, logWarn: () => {} })
-      await index.load()
-      await index.ensureAll()
-      // 批量路径：200 条 = 128 + 72，两次调用（128/批）
-      expect(calls).toBe(2)
-      expect(texts[0]).toHaveLength(128)
-      expect(texts[1]).toHaveLength(72)
-      // 全部落盘（buildMissing 末尾 flushPersist）
-      const { readFile } = await import('node:fs/promises')
-      const raw = await readFile(file, 'utf8')
-      const parsed = JSON.parse(raw) as Record<string, number[]>
-      expect(Object.keys(parsed)).toHaveLength(200)
-      expect(parsed['m-0']).toHaveLength(384)
-    } finally {
-      await rm(dir, { recursive: true, force: true })
-    }
-  })
-
-  it('ensureAll 批量中途失败：logWarn 跳过继续，成功批已增量落盘（不整体中止零落盘）', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'embed-index-batchfail-'))
-    try {
-      const file = join(dir, 'memory-embeddings.json')
+      const db = new DatabaseSync(':memory:', { allowExtension: true })
       const warns: string[] = []
-      let calls = 0
-      const service = {
-        state: 'ready',
-        dimension: 384,
-        embed: async (text: string) => {
-          const v = new Float32Array(384)
-          return v
-        },
-        embedMany: async (input: string[]) => {
-          calls++
-          if (calls === 2) throw new Error('网络错误（模拟第二批失败）')
-          return input.map(() => {
-            const v = new Float32Array(384)
-            v[0] = 1
-            return v
-          })
-        },
-      }
-      // 258 条 = 128（成功）+ 128（失败）+ 2（继续成功）——验证失败后不中止
-      const entries = Array.from({ length: 258 }, (_, i) => ({ id: `m-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
-      const index = new EmbeddingIndex({ file, service, listAll: () => entries, logWarn: (message, error) => warns.push(`${message}${error instanceof Error ? error.message : String(error)}`) })
-      await index.load()
-      await index.ensureAll()
-      // 失败批次被显式记录（logWarn），不静默
-      expect(warns.some((message) => message.includes('网络错误'))).toBe(true)
-      // 成功批（第 1/3 批）已落盘；第二批失败未写入
-      const { readFile } = await import('node:fs/promises')
-      await index.flush() // 兜底落盘（含末批成功后 persist 的去抖窗口）
-      const raw = await readFile(file, 'utf8')
-      const parsed = JSON.parse(raw) as Record<string, number[]>
-      expect(parsed['m-0']).toBeDefined()
-      expect(parsed['m-128']).toBeUndefined() // 第二批失败
-      expect(parsed['m-256']).toBeDefined() // 第三批继续成功
-      expect(Object.keys(parsed)).toHaveLength(130)
+      const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: (m) => warns.push(m) })
+      const migrated = await index.loadLegacy(file)
+      expect(migrated).toBe(5)
+      // knn 命中（查询首位=3）
+      const hits = index.knn(queryVec(3), 10)
+      expect(hits.some((h) => h.id === 'legacy-3')).toBe(true)
+      // 幂等：表非空 → 再次 loadLegacy 返回 0（不重复迁移）
+      expect(await index.loadLegacy(file)).toBe(0)
+      db.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
   })
 
-  it('ensureAll 无 embedMany（测试注入/本地假后端）→ 回退逐条路径（既有行为不被破坏）', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'embed-index-single-'))
+  it('loadLegacy：损坏 JSON 降级为 0（不致命）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'embed-legacy-bad-'))
+    const file = join(dir, 'memory-embeddings-384.json')
+    await writeFile(file, '{"mem-1":[0.1,0.2,', 'utf8')
     try {
-      const file = join(dir, 'memory-embeddings.json')
-      let embedCalls = 0
-      const service = {
-        state: 'ready',
-        dimension: 384,
-        embed: async (text: string) => {
-          embedCalls++
-          const v = new Float32Array(384)
-          v[0] = text.length
-          return v
-        },
-      }
-      const entries = Array.from({ length: 5 }, (_, i) => ({ id: `m-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
-      const index = new EmbeddingIndex({ file, service, listAll: () => entries, logWarn: () => {} })
-      await index.load()
-      await index.ensureAll()
-      expect(embedCalls).toBe(5)
-      const { readFile } = await import('node:fs/promises')
-      await index.flush()
-      const raw = await readFile(file, 'utf8')
-      const parsed = JSON.parse(raw) as Record<string, number[]>
-      expect(Object.keys(parsed)).toHaveLength(5)
+      const db = new DatabaseSync(':memory:', { allowExtension: true })
+      const warns: string[] = []
+      const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: (m) => warns.push(m) })
+      expect(await index.loadLegacy(file)).toBe(0)
+      expect(warns.some((m) => m.includes('损坏') || m.includes('解析'))).toBe(true)
+      db.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

@@ -62,6 +62,13 @@ export interface SearchOptions {
   withScore?: boolean
   /** 条目向量查找（id → 384 维向量；undefined = 尚无嵌入，该条目只用关键词分） */
   lookupEmbedding?: (id: string) => number[] | undefined
+  /**
+   * 语义榜来源（甲方案，2026-08-17 用户拍板 sqlite-vec）：注入的 KNN 排名器
+   * （vec0 虚拟表 top-k，cosine 降序）——替代老的全量内存余弦榜。提供时语义榜
+   * = 该排名器返回的 top-k（k 由 store 按榜单宽度派生）；缺省走
+   * queryEmbedding+lookupEmbedding 全量路径（兼容既有调用/测试）。
+   */
+  semanticRank?: (queryEmbedding: ArrayLike<number>, k: number) => Array<{ id: string; cosine: number }>
 }
 
 /**
@@ -84,6 +91,15 @@ const SUPERSEDE_WINDOW_MS = 30 * 86_400_000
  * 避免高频检索反复回写 lastAccessAt/accessCount（O6 性能）。
  */
 const ACCESS_TRACK_WINDOW_MS = 60_000
+
+/**
+ * 语义榜宽度（KNN top-k 的 k）：语义榜需要"足够宽"以覆盖 RRF 与关键词榜的
+ * 有效融合区间——k 过小会漏掉语义命中的长尾。按返回条数 limit 放大（×8），
+ * 下限 50（检索 limit=5 时仍取 50 名——榜首融合区间不受限）。
+ */
+function semanticTopK(limit: number | undefined): number {
+  return Math.max((limit ?? 50) * 8, 50)
+}
 
 /** 创建时去重合并的合并结果描述（供审计 detail 使用） */
 export interface MergeOutcome {
@@ -485,10 +501,12 @@ export class MemoryStore {
       matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
       top = matches.slice(0, limit)
     } else {
-      // P4+B1 语义融合：提供查询向量与条目向量查找时，两路排名（关键词
+      // P4+B1 语义融合：提供查询向量与语义榜来源时，两路排名（关键词
       // relevance / 语义 cosine）经 RRF 融合——排名融合免疫两路分数尺度差异，
       // 零重合高语义相关条目可单榜上榜（P4 意图保持）。
-      const semantic = options.queryEmbedding !== undefined && options.lookupEmbedding !== undefined
+      const semantic =
+        options.semanticRank !== undefined ||
+        (options.queryEmbedding !== undefined && options.lookupEmbedding !== undefined)
       const queryTokenList = tokenize(query)
       if (semantic) {
         // 关键词榜：relevance > 0 的条目降序（同分按 id 稳定；relevance=0 不上榜）
@@ -499,19 +517,29 @@ export class MemoryStore {
           .sort((a, b) => b.rel - a.rel || a.entry.id.localeCompare(b.entry.id))
         const kwRank = new Map<string, number>()
         kwRanked.forEach((item, index) => kwRank.set(item.entry.id, index + 1))
-        // 语义榜：cosine > 0 的条目降序（同分按 id 稳定；无向量/负相似不上榜）
-        const semRanked = matches
-          .map((entry) => ({
-            entry,
-            cos: (() => {
-              const vector = options.lookupEmbedding?.(entry.id)
-              return vector === undefined ? 0 : cosine(options.queryEmbedding!, vector)
-            })(),
-          }))
-          .filter((item) => item.cos > 0)
-          .sort((a, b) => b.cos - a.cos || a.entry.id.localeCompare(b.entry.id))
+        // 语义榜：注入 KNN 排名器（sqlite-vec top-k）或全量余弦（老路径）——
+        // 均按 cosine 降序（同分按 id 稳定）；无向量/负相似不占榜
+        let semList: Array<{ id: string; cosine: number }>
+        if (options.semanticRank !== undefined && options.queryEmbedding !== undefined) {
+          // KNN 榜：vec0 返回 top-k（始终有结果——无"零匹配空"语义），
+          // 过滤 cosine≤0 的负相似条目（与全量路径的 cos>0 上榜语义对齐）
+          semList = options
+            .semanticRank(options.queryEmbedding, semanticTopK(options.limit))
+            .filter((item) => item.cosine > 0)
+        } else {
+          semList = matches
+            .map((entry) => ({
+              id: entry.id,
+              cosine: (() => {
+                const vector = options.lookupEmbedding?.(entry.id)
+                return vector === undefined ? 0 : cosine(options.queryEmbedding!, vector)
+              })(),
+            }))
+            .filter((item) => item.cosine > 0)
+            .sort((a, b) => b.cosine - a.cosine || a.id.localeCompare(b.id))
+        }
         const semRank = new Map<string, number>()
-        semRanked.forEach((item, index) => semRank.set(item.entry.id, index + 1))
+        semList.forEach((item, index) => semRank.set(item.id, index + 1))
         for (const { entry } of withRel) {
           const score = rrfScore(kwRank.get(entry.id), semRank.get(entry.id)) * timeImportanceFactor(entry, now)
           if (score >= minScore) scored.push({ entry, score })
