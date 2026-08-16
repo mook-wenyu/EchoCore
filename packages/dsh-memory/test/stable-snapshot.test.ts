@@ -129,8 +129,11 @@ describe('快照取数与预算', () => {
   it('预算截断：超限条目不入快照，且被截断条目的 id 不进 ids 集合', async () => {
     const { store, snapshot } = setup()
     const shortId = await seed(store, { content: '短记忆' })
-    // 内容远超 SNAPSHOT_BUDGET_CHARS（8192）→ 单条即超预算，被跳过
-    const longId = await seed(store, { content: 'x'.repeat(SNAPSHOT_BUDGET_CHARS + 1000) })
+    // 内容远超 SNAPSHOT_BUDGET_CHARS（8192）→ 单条即超预算，被跳过。
+    // P2 写端门适配：连续相同字符（'x'/'长' 重复）tokenize 去重后仅 1 个 token
+    // （<2 被写端门当噪声拒绝——语义正确）；用多样短语重复构造合法超长记忆
+    const longContentText = '长记忆内容短语'.repeat(Math.ceil((SNAPSHOT_BUDGET_CHARS + 1000) / 7))
+    const longId = await seed(store, { content: longContentText })
     const ids = snapshot.snapshotIds('D:/ws-a')
     // 同 importance（7）按创建倒序：长记忆在前；预算放不下超长单条 → 只渲染短记忆
     expect(ids.has(shortId)).toBe(true)
@@ -138,7 +141,7 @@ describe('快照取数与预算', () => {
     const text = textOf(snapshot, 'D:/ws-a')
     expect(text).toContain('短记忆')
     expect(text).toContain('另有 1 条')
-    expect(text).not.toContain('x'.repeat(20))
+    expect(text).not.toContain('长记忆内容短语'.repeat(2))
   })
 
   it('空库返回空串（空文本不贡献段）', async () => {

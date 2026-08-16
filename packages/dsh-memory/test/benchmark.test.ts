@@ -79,10 +79,8 @@ describe('O3 性能基准（数量级回归防护）', () => {
   it('注入渲染：renderBudgetedPack 100 条 < 200ms', () => {
     const entries = Array.from({ length: 100 }, (_, i) => ({
       id: `mem-${i}`,
-      kind: 'fact',
-      content: `记忆内容 ${i}：` + '项目采用评分检索与跨会话聚合'.repeat(3),
-      importance: 5,
-      sessionId: `session-bench-${i % 8}`,
+      // 适配 P1：renderBudgetedPack 接收预渲染行（{ id, line }）
+      line: `- [fact] 记忆内容 ${i}：` + '项目采用评分检索与跨会话聚合'.repeat(3) + '（重要度 5，记忆 #mem-…）',
     }))
     const elapsed = time(() => {
       renderBudgetedPack(entries, 4096, '[参考记忆]', (skipped) => `…还有 ${skipped} 条被跳过`)

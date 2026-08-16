@@ -44,13 +44,18 @@ describe('formatMemoryLine（渲染单源）', () => {
 
 describe('renderBudgetedPack 预算边界（P1-2 补盲）', () => {
   const note = (skipped: number) => `（另有 ${skipped} 条未展示）`
+  /** 适配 P1：renderBudgetedPack 接收预渲染行（{ id, line }）——调用方选渲染格式 */
+  const asLine = (entry: MemoryLineView): { id: string; line: string } => ({
+    id: entry.id,
+    line: formatMemoryLine(entry),
+  })
 
   it('预算恰好容纳 header + 一条：渲染该条并提示 1 条被跳过', () => {
     const first = view({ id: 'a0000001', content: '短' })
     const second = view({ id: 'b0000002', content: '另一条' })
     const oneLine = formatMemoryLine(first)
     const budget = MEMORY_INJECTION_HEADER.length + 1 + oneLine.length + 1
-    const pack = renderBudgetedPack([first, second], budget, MEMORY_INJECTION_HEADER, note)
+    const pack = renderBudgetedPack([asLine(first), asLine(second)], budget, MEMORY_INJECTION_HEADER, note)
     expect(pack).toBeDefined()
     expect(pack?.renderedIds).toEqual([first.id])
     // 第二条放不下 → 跳过并提示（跳过不截断尾部）
@@ -58,7 +63,7 @@ describe('renderBudgetedPack 预算边界（P1-2 补盲）', () => {
   })
 
   it('预算小于 header + 最短行：返回 undefined（不注入空包）', () => {
-    const pack = renderBudgetedPack([view()], MEMORY_INJECTION_HEADER.length, MEMORY_INJECTION_HEADER, note)
+    const pack = renderBudgetedPack([asLine(view())], MEMORY_INJECTION_HEADER.length, MEMORY_INJECTION_HEADER, note)
     expect(pack).toBeUndefined()
   })
 
@@ -67,7 +72,7 @@ describe('renderBudgetedPack 预算边界（P1-2 补盲）', () => {
     const short = view({ id: 's0000002', content: '短条目' })
     const shortLine = formatMemoryLine(short)
     const budget = MEMORY_INJECTION_HEADER.length + 1 + shortLine.length + 1
-    const pack = renderBudgetedPack([long, short], budget, MEMORY_INJECTION_HEADER, note)
+    const pack = renderBudgetedPack([asLine(long), asLine(short)], budget, MEMORY_INJECTION_HEADER, note)
     expect(pack).toBeDefined()
     expect(pack?.renderedIds).toEqual([short.id])
     expect(pack?.text).toContain(shortLine)

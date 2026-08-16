@@ -34,6 +34,19 @@ export function formatMemoryLine(entry: MemoryLineView): string {
   return `- [${entry.kind}] ${entry.content}（重要度 ${entry.importance}，记忆 #${memoryId}，来自会话 ${sourceSession}${created}）`
 }
 
+/**
+ * 中置信摘要行（P1 三档注入：0.4-0.7 档）——压缩 metadata 减少注入体积：
+ * 仅保留分类、content 前 N 字符（截断带省略号）与短记忆 id（可追溯），
+ * 不渲染重要度/来源会话/创建日期。语义：中档记忆相关但置信不足，
+ * 模型只需知道"存在这样一条记忆"，细节需要时经 memory_recall 查全。
+ */
+export function formatMemoryLineCondensed(entry: MemoryLineView, contentChars: number): string {
+  const memoryId = entry.id.slice(0, 8)
+  const content =
+    entry.content.length > contentChars ? `${entry.content.slice(0, contentChars)}…` : entry.content
+  return `- [${entry.kind}] ${content}（记忆 #${memoryId}）`
+}
+
 /** 预算渲染结果：文本 + 实际渲染条目的 id 列表（跳过制下不能按前 N 条推断） */
 export interface BudgetedPack {
   text: string
@@ -41,9 +54,11 @@ export interface BudgetedPack {
 }
 
 /**
- * 预算内逐条渲染共享实现（DRY：injector 实时包与 stable-snapshot 稳定快照
+ * 预算内渲染共享实现（DRY：injector 实时包与 stable-snapshot 稳定快照
  * 共用同一"声明头 + 逐行 bullet + 预算截断 + 超限提示"拼装逻辑，避免两处
  * 各自实现导致格式漂移）。
+ * - 输入为**已渲染行**（{ id, line }）——渲染格式由调用方选择（完整行/
+ *   P1 中置信摘要行），本函数只负责预算拼装；
  * - header：注入声明头（MEMORY_INJECTION_HEADER）；
  * - 预算按字符硬截断：放不下的条目**跳过并继续后续**（而非整体截断尾部）——
  *   排序在前但超长的单条不应饿死后续较短的记忆（快照按重要度、实时包按
@@ -52,7 +67,7 @@ export interface BudgetedPack {
  * 返回 undefined 表示一条都放不下（不注入，避免空消息）。
  */
 export function renderBudgetedPack(
-  entries: MemoryLineView[],
+  entries: Array<{ id: string; line: string }>,
   budgetChars: number,
   header: string,
   truncatedNote: (skipped: number) => string,
@@ -62,14 +77,13 @@ export function renderBudgetedPack(
   let used = header.length + 1
   let skipped = 0
   for (const entry of entries) {
-    const line = formatMemoryLine(entry)
-    if (used + line.length + 1 > budgetChars) {
+    if (used + entry.line.length + 1 > budgetChars) {
       skipped++
       continue
     }
-    lines.push(line)
+    lines.push(entry.line)
     renderedIds.push(entry.id)
-    used += line.length + 1
+    used += entry.line.length + 1
   }
   if (lines.length === 0) return undefined
   let text = `${header}\n${lines.join('\n')}`

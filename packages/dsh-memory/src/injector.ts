@@ -23,8 +23,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { DEFAULT_WORKSPACE, MEMORY_INJECTION_HEADER, MEMORY_PLUGIN_ID } from './constants.js'
 import { searchWithSemantic, type EmbeddingService } from './embedding.js'
 import type { EmbeddingIndex } from './embed-index.js'
-import { renderBudgetedPack } from './render.js'
-import { MIN_RELEVANCE_SCORE } from './scoring.js'
+import { renderBudgetedPack, formatMemoryLine, formatMemoryLineCondensed } from './render.js'
 import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
@@ -39,15 +38,28 @@ const INJECT_BUDGET_CHARS = 16384
 /** 每次注入最多召回的相关记忆条数 */
 const TOP_K = 8
 /**
- * 注入最低综合分（relevance × 时间 × 重要性）。
- * F2（防上下文污染）：0.15 → 0.3。旧 0.15 形同虚设——relevance 是单边召回率
- * （query token 命中比例），1-2 个 token 重合即放行；门槛抬高依据见
- * scoring.MIN_RELEVANCE_SCORE 注释（mem0/magic-context 门槛实践 +
- * noisy 检索摧毁已知答案 51-64%）。与 store.search 的 minScore 采用同一
- * 门槛常量，本处显式传入以表达注入阈值语义；语义融合（RRF）路径也走同一
- * minScore，单榜靠前语义条目依旧可召回（门槛只筛双榜皆弱杂音）。
+ * P1（2026-08-16 三档注入）：综合分置信度分档（替代单一门槛——Mixpeek
+ * abstain band + agent-evolution-kit confidence-gated：分数是相对信号，
+ * 单阈值误杀中段相关记忆；三档保留防污染底线同时减少误杀）：
+ * - ≥0.7 高置信：完整渲染（含重要度/来源会话/创建日期）；
+ * - 0.4-0.7 中置信：摘要渲染（仅 content 前 80 字符 + 记忆 id——压缩 metadata）；
+ * - <0.4 低置信：跳过（防污染底线，minScore 即此值）。
+ * 档位依据：agent-evolution-kit 的 Confidence-Gated Dynamic Injection
+ * （≥0.7 全量 / 0.4-0.7 摘要 / <0.4 跳过）——2026 社区落地实践。
  */
-const MIN_SCORE = MIN_RELEVANCE_SCORE
+const INJECT_HIGH_CONFIDENCE_SCORE = 0.7
+/** P1：中置信档摘要渲染的 content 截断长度（字符） */
+const INJECT_MID_SUMMARY_CHARS = 80
+/** P1：注入最低综合分（<0.4 跳过——防污染底线；语义融合 RRF 单榜靠前条目依旧可召回） */
+const MIN_SCORE = 0.4
+/**
+ * P3（2026-08-16 会话上下文派生查询）：每会话保留最近 N 条真实用户消息文本，
+ * pre-step 检索时拼接近期消息（openclaw-hybrid-memory #156 的轻量近似——
+ * 当前消息 + 近期主题词共同决定召回面，避免"当前消息换话题即丢历史上下文"）。
+ */
+const RECENT_QUERY_WINDOW = 3
+/** P3：拼接查询中单条消息的截断长度（字符——防查询过长稀释 relevance 分母） */
+const QUERY_SEGMENT_CHARS = 100
 
 /** 注入器依赖（store 可注入，便于单测） */
 export interface InjectorDeps {
@@ -84,6 +96,8 @@ export class MemoryInjector {
   private readonly pendingIds = new Map<string, string[]>()
   /** 会话 → 记忆 id → 注入消息序号（仍在表层则不再注入） */
   private readonly injectedSeqs = new Map<string, Map<string, number>>()
+  /** P3：会话 → 最近 RECENT_QUERY_WINDOW 条真实用户消息文本（滚动窗口） */
+  private readonly recentQueries = new Map<string, string[]>()
 
   constructor(private readonly deps: InjectorDeps) {}
 
@@ -103,11 +117,13 @@ export class MemoryInjector {
    * 会话结束（O2-4）：清理该会话的 pendingIds 与 injectedSeqs。
    * 会话已死，其注入去重状态与待回填队列不再有意义；不清理会造成跨会话
    * 记忆 id 残留（下一个会话若复用该 id 会被误判"已注入而不注入"）。
+   * P3：近期查询窗口一并清理（防跨会话主题串扰）。
    */
   private onDisposed(payload: { agent: { id: string; session: Session } }): void {
     const agentId = payload.agent.id
     this.pendingIds.delete(agentId)
     this.injectedSeqs.delete(agentId)
+    this.recentQueries.delete(agentId)
   }
 
   /** pre-step waterfall：下游决定为 enter 且批次非空时才注入（注入恒启用） */
@@ -118,31 +134,67 @@ export class MemoryInjector {
     const decision = await next()
     if (decision.kind !== 'enter' || decision.messages.length === 0) return decision
 
-    const query = textOfBatch(payload.messages)
-    if (query.trim() === '') return decision
+    const current = textOfBatch(payload.messages)
+    if (current.trim() === '') return decision
 
     const session = payload.agent.session
     const workspace = session.header.cwd ?? DEFAULT_WORKSPACE
+    // P3：会话上下文派生查询——当前消息 + 最近 RECENT_QUERY_WINDOW-1 条历史
+    // （各截断防稀释；"当前消息换话题"时历史主题词仍参与召回）
+    const recent = this.recentQueries.get(session.id) ?? []
+    const segments = [current, ...recent].map((segment) => segment.slice(0, QUERY_SEGMENT_CHARS))
+    const query = segments.join(' ')
+    // 滚动窗口：记录当前消息（最新在前；窗口满时丢最旧）
+    this.recentQueries.set(session.id, [current.slice(0, QUERY_SEGMENT_CHARS), ...recent].slice(0, RECENT_QUERY_WINDOW))
+
     // P4：语义增强检索（状态门控 + 显式降级；未启用时纯关键词，行为与 P3 前一致）
+    // P1：withScore 返回带综合分条目——按置信度分档渲染。
+    // 双重断言理由：searchWithSemantic 的泛型从 store 形参签名推断（单签名
+    // `search(options): T[]`），可选 withScore 走重载 0 → T=MemoryEntry；运行时
+    // 实际走 store.search 重载 1（withScore: true）返回带分数组——断言只收窄
+    // 类型不改变行为。
     const candidates = (await searchWithSemantic(
       this.deps.store,
       this.deps.embedding,
       this.deps.embedIndex,
       query,
-      { workspace, limit: TOP_K, minScore: MIN_SCORE },
+      { workspace, limit: TOP_K, minScore: MIN_SCORE, withScore: true },
       (message, error) => this.deps.logger.warn(message, error),
-    )) as MemoryEntry[]
+    )) as unknown as Array<{ entry: MemoryEntry; score: number }>
     const fresh = candidates.filter(
-      (entry) =>
+      (item) =>
         // 表层去重：已注入且未被压缩遮蔽的不再注入
-        !this.isCurrentlyInjected(payload.agent.id, entry.id) &&
+        !this.isCurrentlyInjected(payload.agent.id, item.entry.id) &&
         // P2 快照去重：稳定快照已含的记忆不再进实时包（避免同一记忆
         // 同时出现在 system 快照段与实时包，重复占预算）
-        !this.deps.snapshot.snapshotIds(workspace).has(entry.id),
+        !this.deps.snapshot.snapshotIds(workspace).has(item.entry.id),
     )
     if (fresh.length === 0) return decision
 
-    const pack = renderPack(fresh, INJECT_BUDGET_CHARS)
+    // P1 三档渲染：高置信（≥0.7）完整行；中置信（0.4-0.7）摘要行（仅 content
+    // 前 80 字符 + 记忆 id——压缩 metadata 减少注入体积）；低置信已被 minScore 排除
+    const lines: Array<{ id: string; line: string }> = []
+    for (const { entry, score } of fresh) {
+      const view = {
+        id: entry.id,
+        kind: entry.kind,
+        content: entry.content,
+        importance: entry.importance,
+        sessionId: entry.sessionId,
+        createdAt: entry.createdAt,
+      }
+      const line =
+        score >= INJECT_HIGH_CONFIDENCE_SCORE
+          ? formatMemoryLine(view)
+          : formatMemoryLineCondensed(view, INJECT_MID_SUMMARY_CHARS)
+      lines.push({ id: entry.id, line })
+    }
+    const pack = renderBudgetedPack(
+      lines.map((item) => ({ id: item.id, line: item.line })),
+      INJECT_BUDGET_CHARS,
+      MEMORY_INJECTION_HEADER,
+      (skipped) => `…另有 ${skipped} 条相关记忆未展示（可用 memory_recall 查看）`,
+    )
     if (pack === undefined) return decision
 
     const message = createUserMessage({
@@ -152,7 +204,7 @@ export class MemoryInjector {
 
     // 记录待回填 id：下一次看到本插件来源的 user/message 时关联其序号
     const pending = this.pendingIds.get(payload.agent.id) ?? []
-    pending.push(...pack.ids)
+    pending.push(...pack.renderedIds)
     this.pendingIds.set(payload.agent.id, pending)
 
     return { kind: 'enter', messages: [...decision.messages, message] }
@@ -205,19 +257,23 @@ export function textOfBatch(messages: PreStepPayload['messages']): string {
 }
 
 /**
- * 渲染记忆包：共享预算渲染（renderBudgetedPack）+ 实时注入专属的截断提示。
+ * 渲染记忆包：完整行渲染（formatMemoryLine）+ 共享预算拼装（renderBudgetedPack）。
+ * 实时注入的完整行入口（P1 三档的摘要档走 handlePreStep 内的分档路径）。
  * 返回 undefined 表示一条都放不下（不注入，避免空消息）。
  */
 export function renderPack(entries: MemoryEntry[], budgetChars: number): RenderedPack | undefined {
   const pack = renderBudgetedPack(
     entries.map((entry) => ({
       id: entry.id,
-      kind: entry.kind,
-      content: entry.content,
-      importance: entry.importance,
-      sessionId: entry.source.sessionId,
-      // F3：渲染创建日期——模型可判断记忆新旧（防把过时记忆当现行事实）
-      createdAt: entry.createdAt,
+      line: formatMemoryLine({
+        id: entry.id,
+        kind: entry.kind,
+        content: entry.content,
+        importance: entry.importance,
+        sessionId: entry.source.sessionId,
+        // F3：渲染创建日期——模型可判断记忆新旧（防把过时记忆当现行事实）
+        createdAt: entry.createdAt,
+      }),
     })),
     budgetChars,
     MEMORY_INJECTION_HEADER,

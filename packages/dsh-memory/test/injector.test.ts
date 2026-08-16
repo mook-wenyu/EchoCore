@@ -113,7 +113,9 @@ describe('MemoryInjector pre-step 注入', () => {
   it('命中记忆时追加注入消息并保留下游消息', async () => {
     const { preStep, store } = setup()
     await seed(store, { content: longContent('pnpm workspace 项目规则') })
-    const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么管理'), async () => enterDecision())
+    // P1 档位（≥0.7 全量/0.4-0.7 摘要）：查询聚焦 'pnpm workspace' 双 token 全命中
+    // → relevance 1.0 × timeImportance ≈0.9 ≥0.7 全量档（避免弱相关 seed 被 0.4 底线过滤）
+    const decision = await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision())
     expect(decision.kind).toBe('enter')
     if (decision.kind !== 'enter') return
     expect(decision.messages).toHaveLength(2) // 下游 1 条 + 注入 1 条
@@ -130,8 +132,10 @@ describe('MemoryInjector pre-step 注入', () => {
   // 与用户指令消息分离，绝不与指令同块（Injection-Execution Dissociation 防线）
   it('注入消息与用户指令分离（独立 recall 消息，不混入指令块）', async () => {
     const { preStep, store } = setup()
-    await seed(store, { content: longContent('pnpm workspace 项目规则') })
-    const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么管理'), async () => enterDecision())
+    await seed(store, { content: longContent('pnpm workspace 项目规则'), importance: 10 })
+    // 查询含记忆没有的独有词 '怎么'（分离断言用）；importance 10 抬高 timeImportance
+    // → 分数稳过 0.4 底线（P1 档位：relevance 2/3 × factor 1.0 ≈0.67 摘要档）
+    const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么'), async () => enterDecision())
     expect(decision.kind).toBe('enter')
     if (decision.kind !== 'enter') return
     // 下游消息保留原样（无注入污染）
@@ -139,9 +143,9 @@ describe('MemoryInjector pre-step 注入', () => {
     // 注入消息独立成条：plugin 来源 + recall 形态
     const injected = decision.messages[1]
     expect(injected.source).toMatchObject({ kind: 'plugin', plugin: '@echocore/dsh-memory', form: 'recall' })
-    // 注入消息的 content 不含用户指令文本（内容隔离）
+    // 注入消息的 content 不含用户指令的独有词（内容隔离；记忆内容本身不含 '怎么'）
     const injectedText = (injected.content[0] as { type: string; text: string }).text
-    expect(injectedText).not.toContain('怎么管理')
+    expect(injectedText).not.toContain('怎么')
   })
 
   it('下游为 reject 时不注入', async () => {
@@ -372,7 +376,8 @@ describe('MemoryInjector 快照去重（P2）', () => {
     await seed(store, { content: 'pnpm workspace 高重要规则', importance: 9 })
     // 超预算长尾记忆（内容 > SNAPSHOT_BUDGET_CHARS）→ 快照跳过 → 可实时注入
     await seed(store, { content: longContent('pnpm workspace 一次性备注'), importance: 3 })
-    const decision = await preStep(makePayload('s1', 'pnpm workspace 怎么用'), async () => enterDecision())
+    // P1 档位：查询聚焦 'pnpm workspace'（双 token 全命中 → relevance 1.0，过 0.4 底线）
+    const decision = await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision())
     const text = injectedText(decision)
     expect(text).toContain('一次性备注')
     expect(text).not.toContain('高重要规则')
@@ -392,6 +397,75 @@ describe('MemoryInjector 快照去重（P2）', () => {
     clock.advance(SNAPSHOT_MIN_REBUILD_INTERVAL_MS + 1)
     const second = await preStep(makePayload('s1', 'pnpm workspace 旧备注怎么用'), async () => enterDecision())
     expect(injectedText(second)).toContain('旧备注')
+  })
+})
+
+// P1（2026-08-16 三档注入）：≥0.7 全量完整行 / 0.4-0.7 摘要行 / <0.4 跳过。
+// 注意：记忆内容均超快照预算（长尾不进快照）——排除快照排除对分档验证的干扰。
+describe('MemoryInjector 置信度分档（P1）', () => {
+  function injectedText(decision: PreStepDecision): string {
+    if (decision.kind !== 'enter') throw new Error('应注入')
+    const injected = decision.messages[decision.messages.length - 1]
+    const text = (injected?.content ?? []).find((block) => block.type === 'text')?.text ?? ''
+    return text
+  }
+
+  it('高置信（≥0.7）：完整行渲染（含重要度与来源会话）', async () => {
+    const { preStep, store } = setup()
+    // 长尾内容（> 快照预算不进快照）+ importance 10 → timeImportance 1.0
+    await seed(store, { content: `pnpm workspace ${'长记忆内容短语'.repeat(2000)}`, importance: 10 })
+    // 查询双 token 全命中 → relevance 1.0 × 1.0 = 1.0 ≥0.7 全量档
+    const text = injectedText(await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision()))
+    expect(text).toContain('重要度 10')
+    expect(text).toContain('来自会话')
+  })
+
+  it('中置信（0.4-0.7）：摘要行渲染（无重要度/来源会话，content 截断）', async () => {
+    const { preStep, store } = setup()
+    // importance 3 → timeImportance 0.65 → relevance 1.0 × 0.65 = 0.65（0.4-0.7 摘要档）
+    await seed(store, { content: `pnpm workspace ${'长记忆内容短语'.repeat(2000)}`, importance: 3 })
+    const text = injectedText(await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision()))
+    expect(text).toContain('记忆 #')
+    expect(text).not.toContain('重要度')
+    expect(text).not.toContain('来自会话')
+    expect(text).toContain('…') // 摘要截断省略号
+  })
+
+  it('低置信（<0.4）：不注入', async () => {
+    const { preStep, store } = setup()
+    await seed(store, { content: `pnpm workspace ${'长记忆内容短语'.repeat(2000)}`, importance: 1 })
+    // 查询零重合 → relevance 0 → 分数 0 <0.4 → 跳过（不注入）
+    const decision = await preStep(makePayload('s1', '环境 完全无关话题词'), async () => enterDecision())
+    expect(decision.kind).toBe('enter')
+    if (decision.kind !== 'enter') return
+    expect(decision.messages).toHaveLength(1) // 仅下游消息，无注入
+  })
+})
+
+// P3（2026-08-16 会话上下文派生查询）：近期消息主题词参与召回（openclaw 轻量近似）
+describe('MemoryInjector 会话上下文派生查询（P3）', () => {
+  function injectedText(decision: PreStepDecision): string {
+    if (decision.kind !== 'enter') throw new Error('应注入')
+    const injected = decision.messages[decision.messages.length - 1]
+    const text = (injected?.content ?? []).find((block) => block.type === 'text')?.text ?? ''
+    return text
+  }
+
+  it('当前消息换话题时，近期消息的主题词仍参与召回', async () => {
+    const { preStep, store } = setup()
+    // 31 条高重要度填充：挤占快照 Top-30 → 被测记忆（imp 8）不进快照（P2 排除不干扰）
+    for (let i = 0; i < 31; i++) {
+      await seed(store, { content: `无关填充词 ${i}`, importance: 10 })
+    }
+    // 记忆只与"近期话题"（pnpm/workspace/编译器/环境/配置）相关，与当前消息（环境怎么配置）弱相关
+    await seed(store, { content: 'pnpm workspace 编译器环境配置', importance: 8 })
+    // 第一轮：查询 'pnpm workspace' → 全命中（relevance 1.0 × 0.9 = 0.9）→ 注入
+    const first = await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision())
+    expect(injectedText(first)).toContain('编译器')
+    // 第二轮：当前消息 '环境怎么配置'——无拼接时 A 命中 环境/配置 = 2/5 = 0.4 × 0.9 = 0.36
+    // <0.4 不注入；P3 拼接近期窗口（'pnpm workspace'）→ 命中 4/7 ≈0.57 × 0.9 = 0.51 ≥0.4 注入
+    const second = await preStep(makePayload('s1', '环境怎么配置'), async () => enterDecision())
+    expect(injectedText(second)).toContain('编译器')
   })
 })
 

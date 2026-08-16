@@ -23,7 +23,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 
 import { DEFAULT_WORKSPACE, MEMORY_INJECTION_HEADER } from './constants.js'
-import { renderBudgetedPack } from './render.js'
+import { formatMemoryLine, renderBudgetedPack } from './render.js'
 import type { MemoryStore } from './store.js'
 
 /**
@@ -143,12 +143,15 @@ export class MemoryStableSnapshot {
     const pack = renderBudgetedPack(
       balanced.map((entry) => ({
         id: entry.id,
-        kind: entry.kind,
-        content: entry.content,
-        importance: entry.importance,
-        sessionId: entry.source.sessionId,
-        // F3：渲染创建日期——模型可判断记忆新旧（防把过时记忆当现行事实）
-        createdAt: entry.createdAt,
+        line: formatMemoryLine({
+          id: entry.id,
+          kind: entry.kind,
+          content: entry.content,
+          importance: entry.importance,
+          sessionId: entry.source.sessionId,
+          // F3：渲染创建日期——模型可判断记忆新旧（防把过时记忆当现行事实）
+          createdAt: entry.createdAt,
+        }),
       })),
       SNAPSHOT_BUDGET_CHARS,
       MEMORY_INJECTION_HEADER,
