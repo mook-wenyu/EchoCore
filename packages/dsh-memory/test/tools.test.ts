@@ -336,6 +336,34 @@ describe('memory_status', () => {
     expect(withRuntime.embeddingState).toBe('ready')
     expect(withRuntime.lastMaintenanceAt).toBe('2026-08-16T00:00:00.000Z')
   })
+
+  it('R2：P2 写端门拒绝计数进 memory_status（rejectedCount 直读 store）', async () => {
+    const { tools, store } = setup()
+    // 触发写端门：extractor 通道 importance=0（零价值被拒）
+    await store.create({
+      workspace: 'D:/workspace',
+      sessionId: 's1',
+      by: 'extractor',
+      kind: 'fact',
+      content: '正常内容足够长',
+      importance: 0,
+      source: { sessionId: 's1', eventSeqs: [1], excerpt: '原文' },
+    })
+    const result = (await toolOf(tools, 'memory_status').execute({}, fakeExec() as never)) as { rejectedCount: number }
+    expect(result.rejectedCount).toBe(1)
+    // 再次拒绝（纯噪声单字）→ 计数递增（单调不归零）
+    await store.create({
+      workspace: 'D:/workspace',
+      sessionId: 's1',
+      by: 'extractor',
+      kind: 'fact',
+      content: '甲',
+      importance: 1,
+      source: { sessionId: 's1', eventSeqs: [2], excerpt: '原文' },
+    })
+    const again = (await toolOf(tools, 'memory_status').execute({}, fakeExec() as never)) as { rejectedCount: number }
+    expect(again.rejectedCount).toBe(2)
+  })
 })
 
 // R2-5/B5：sessionId 解析——agent 缺失即抛错，禁止用 workspace 键伪造（改动前返回 DEFAULT_WORKSPACE，本测试失败）

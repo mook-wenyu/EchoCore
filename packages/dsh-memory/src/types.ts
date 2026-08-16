@@ -124,6 +124,8 @@ export interface MemoryStats {
   embeddingState: string
   /** O1：上次维护运行时刻（ISO；未运行过 null） */
   lastMaintenanceAt: string | null
+  /** R2：P2 写端门累计拒绝次数（extractor 通道被拦的噪声条目数——观测门是否生效） */
+  rejectedCount: number
 }
 
 /**

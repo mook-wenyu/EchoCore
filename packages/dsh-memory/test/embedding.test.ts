@@ -264,6 +264,42 @@ describe('store 语义融合检索', () => {
     const results = store.search({ query: 'pnpm workspace', workspace: 'D:/ws', limit: 5, minScore: 0.15 })
     expect(results).toHaveLength(1)
   })
+
+  it('R1a：RRF+withScore 组合路径——语义单榜条目分数落 0.4-0.7 摘要档（标定钉住）', async () => {
+    // P1×P4 标定契约（2026-08-16 审计）：RRF 归一化单榜第一=0.5 × timeImportance ≤1.0
+    // → 语义单榜条目最高 0.5——永远低于 0.7 高置信档（摘要档 0.4-0.7 是设计语义：
+    // 单榜=半权=中置信）。本测试钉住该标定防漂移（若未来改阈值需同步改此契约）。
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => now)
+    // 关键词零重合但语义相关（cosine 高）——P4 的召回目标
+    await seed(store, { content: '量子物理中的纠缠态测量', importance: 10 })
+    const scored = store.search({
+      query: '怎么管理多包项目',
+      workspace: 'D:/ws',
+      limit: 5,
+      minScore: 0.4,
+      withScore: true,
+      queryEmbedding: vec(0),
+      lookupEmbedding: () => Array.from(vec(0)),
+    })
+    expect(scored).toHaveLength(1)
+    // 单榜第一 0.5 × timeImportance(imp10)=1.0 = 0.5——落入摘要档（0.4-0.7）
+    const score = scored[0]!.score
+    expect(score).toBeGreaterThanOrEqual(0.4)
+    expect(score).toBeLessThanOrEqual(0.7)
+    // 双榜（关键词也命中）可达 1.0——同一记忆不同路径的档位差异被钉住
+    const kw = await seed(store, { content: 'pnpm workspace 规则', importance: 10 })
+    const both = store.search({
+      query: 'pnpm workspace',
+      workspace: 'D:/ws',
+      limit: 5,
+      minScore: 0.4,
+      withScore: true,
+      queryEmbedding: vec(0),
+      lookupEmbedding: () => Array.from(vec(0)),
+    })
+    expect(both.some((item) => item.entry.id === kw && item.score > 0.7)).toBe(true)
+  })
 })
 
 describe('EmbeddingIndex', () => {

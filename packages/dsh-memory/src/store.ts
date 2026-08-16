@@ -315,6 +315,9 @@ export class MemoryStore {
    * 调用方必须以 outcome.rejected 为权威判定"未落库"，绝不可把该占位当作真实条目。
    */
   private rejectedOutcome(input: NewMemoryInput, reason: string): { entry: MemoryEntry; outcome: MergeOutcome } {
+    // R2（2026-08-16 观测闭环）：拒绝计数（memory_status/RPC status 可观测——
+    // P2 门"拦了多少/门是否生效"不再黑洞）
+    this.rejectedCountValue++
     const nowIso = this.iso()
     const placeholder: MemoryEntry = {
       id: newMemoryId(),
@@ -335,6 +338,13 @@ export class MemoryStore {
     }
     return { entry: placeholder, outcome: { merged: false, rejected: true, reason } }
   }
+
+  /** R2：P2 写端门累计拒绝次数（计数单调不归零——memory_status 观测） */
+  get rejectedCount(): number {
+    return this.rejectedCountValue
+  }
+
+  private rejectedCountValue = 0
 
   /**
    * 扫描被本次新建表述覆盖的旧条目（D-A 后向引用候选）。
@@ -631,7 +641,8 @@ export class MemoryStore {
       else archived++
     }
     // O1：健康字段占位（store 不感知写链/嵌入/维护——装配层经 runtime 覆盖）
-    return { total, active, archived, byKind, writeFailures: 0, embeddingState: 'unknown', lastMaintenanceAt: null }
+    // R2：P2 写端门拒绝计数由 store 自身可观测（rejectedCount getter 直读）
+    return { total, active, archived, byKind, writeFailures: 0, embeddingState: 'unknown', lastMaintenanceAt: null, rejectedCount: this.rejectedCount }
   }
 }
 

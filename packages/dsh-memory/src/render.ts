@@ -39,12 +39,16 @@ export function formatMemoryLine(entry: MemoryLineView): string {
  * 仅保留分类、content 前 N 字符（截断带省略号）与短记忆 id（可追溯），
  * 不渲染重要度/来源会话/创建日期。语义：中档记忆相关但置信不足，
  * 模型只需知道"存在这样一条记忆"，细节需要时经 memory_recall 查全。
+ * R1b（2026-08-16）：截断时附"（原文 N 字符）"标记——精确节点截断可能在
+ * 词中间切断（中文 CJK 二元组/英文单词），标记让模型可判断损失量
+ * （与 extractor/snapshot 的摘录截断标记同语义）。
  */
 export function formatMemoryLineCondensed(entry: MemoryLineView, contentChars: number): string {
   const memoryId = entry.id.slice(0, 8)
-  const content =
-    entry.content.length > contentChars ? `${entry.content.slice(0, contentChars)}…` : entry.content
-  return `- [${entry.kind}] ${content}（记忆 #${memoryId}）`
+  if (entry.content.length > contentChars) {
+    return `- [${entry.kind}] ${entry.content.slice(0, contentChars)}…（原文 ${entry.content.length} 字符，记忆 #${memoryId}）`
+  }
+  return `- [${entry.kind}] ${entry.content}（记忆 #${memoryId}）`
 }
 
 /** 预算渲染结果：文本 + 实际渲染条目的 id 列表（跳过制下不能按前 N 条推断） */

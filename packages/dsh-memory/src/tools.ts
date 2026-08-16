@@ -528,6 +528,7 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
             embeddingState: { type: 'string', required: true },
             // O1：string|null 形态——ValueSchemaSpec 无联合 type，用 'json' 声明
             lastMaintenanceAt: { type: 'json', required: true },
+            rejectedCount: { type: 'integer', required: true },
           },
           additionalProperties: false,
         },
@@ -538,6 +539,7 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
               `记忆库统计：共 ${value.total} 条（active ${value.active} / archived ${value.archived}）`,
               `fact ${value.byKind.fact} · preference ${value.byKind.preference} · decision ${value.byKind.decision} · todo ${value.byKind.todo} · insight ${value.byKind.insight}`,
               `运行健康：写失败 ${value.writeFailures} 次 · 嵌入 ${value.embeddingState} · 上次维护 ${value.lastMaintenanceAt ?? '未运行'}`,
+              `写端门：已拦截 ${value.rejectedCount} 条噪声（extractor 通道）`,
             ].join('\n'),
           },
         ],
@@ -554,6 +556,8 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
           writeFailures: runtime?.writeFailures ?? stats.writeFailures,
           embeddingState: runtime?.embeddingState ?? stats.embeddingState,
           lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
+          // R2：P2 写端门拒绝计数（store 自身可观测，直读 stats）
+          rejectedCount: stats.rejectedCount,
         }
       },
     }),
