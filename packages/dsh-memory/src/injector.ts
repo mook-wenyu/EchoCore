@@ -21,8 +21,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { DEFAULT_WORKSPACE, MEMORY_INJECTION_HEADER, MEMORY_PLUGIN_ID } from './constants.js'
-import { searchWithSemantic, type EmbeddingService } from './embedding.js'
-import type { EmbeddingIndex } from './embed-index.js'
+import { searchWithSemantic, type EmbeddingHolder } from './embedding.js'
 import { renderBudgetedPack, formatMemoryLine, formatMemoryLineCondensed } from './render.js'
 import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
@@ -73,10 +72,8 @@ export interface InjectorDeps {
   store: MemoryStore
   /** 稳定快照服务（P2：实时注入排除快照已含记忆，避免重复注入） */
   snapshot: MemoryStableSnapshot
-  /** P4 语义嵌入（未启用/未就绪时纯关键词路径；undefined = 配置关闭） */
-  embedding?: EmbeddingService
-  /** P4 嵌入索引（条目向量查找；与 embedding 成对出现） */
-  embedIndex?: EmbeddingIndex
+  /** P4 语义嵌入持有者（调用时读 service/index——面板保存热换后即生效，无需重启） */
+  embedding?: EmbeddingHolder
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
 }
 
@@ -162,8 +159,8 @@ export class MemoryInjector {
     // 类型不改变行为。
     const candidates = (await searchWithSemantic(
       this.deps.store,
-      this.deps.embedding,
-      this.deps.embedIndex,
+      this.deps.embedding?.service,
+      this.deps.embedding?.index,
       query,
       { workspace, limit: TOP_K, minScore: MIN_SCORE, withScore: true },
       (message, error) => this.deps.logger.warn(message, error),

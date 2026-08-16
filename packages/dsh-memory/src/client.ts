@@ -409,8 +409,9 @@ function ConfigPane(props: { api: MemoryPanelApi }): React.ReactElement {
       const config = await props.api.setConfig(partial)
       // 保存成功 = 宿主已校验、已持久化到 settings.yaml（~/.dsh/settings.yaml——
       // 原写回 cordis.patch.yml 的链路在重启后被 prepareProfile 重置清空，
-      // 2026-08-16 实测根因）并重启插件生效
-      setNotice('已保存并生效（已持久化到 settings.yaml，插件已重启；注入/提取/嵌入按新配置运行）')
+      // 2026-08-16 实测根因）并实时热换嵌入后端生效（不重启插件——重启与
+      // apply 秒级异步段竞态，二次实测 fatal load failure 根因）
+      setNotice('已保存并生效（已持久化到 settings.yaml，嵌入后端已热切换；注入/提取/嵌入按新配置运行）')
       setResolved(config.embeddingApiKeyResolved)
     } catch (err) {
       setNotice(err instanceof Error ? err.message : String(err))

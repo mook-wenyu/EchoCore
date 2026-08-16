@@ -1,11 +1,13 @@
 /**
- * settings seam 单元测试（2026-08-16 配置持久化修复——"保存成功但重启丢失"根因）。
+ * settings seam 单元测试（2026-08-16 配置持久化修复——"保存成功但重启丢失"根因
+ * + 二次实测"保存即 fatal load failure"根因）。
  *
- * 覆盖本插件与宿主 settings 服务的接线契约：
- * - 注册期初始 onChange：合并配置 ≠ entry 配置 → 内存重启一次（noSave=true）；
- * - 防环守卫：重启后再次安装（模拟 apply 重跑）不再触发重启；
- * - 合并配置 = entry 配置（空设置段）→ 不重启；
- * - applyChange 幂等：watcher 重复触发与面板显式调用共用同一重启；
+ * 覆盖本插件与宿主 settings 服务的接线契约（终版：实时生效，去掉插件重启）：
+ * - 注册期初始 onChange：合并配置 ≠ entry 配置 → 委托实时生效器一次（无重启）；
+ * - 防环守卫：再次安装（模拟 apply 重跑）不再生效（active 缓存幂等基线）；
+ * - 合并配置 = entry 配置（空设置段）→ 不生效；
+ * - applyChange 幂等：watcher 重复触发与面板显式调用不重复生效；
+ * - setApplier 挂接：装配层注入实时生效器（嵌入后端热换）；
  * - settings 服务未挂载：effective = entry 配置，channel.update 明确拒绝（不静默降级）；
  * - channel.update 转发到命名空间 memory。
  *
@@ -21,7 +23,6 @@ import {
   installSettingsSeam,
   NS,
   resetSeamForTest,
-  type FiberLike,
   type SettingsSeam,
 } from '../src/settings.js'
 
@@ -30,17 +31,15 @@ function mergedConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
   return { ...DEFAULTS, embeddingApiBaseUrl: 'http://embed.example/v1', ...overrides }
 }
 
-/** 组装假宿主：settings 服务（scope 假件）+ 插件 ctx（fiber 假件 + inject 捕获） */
+/** 组装假宿主：settings 服务（scope 假件）+ 插件 ctx（inject 捕获）+ 实时生效器假件 */
 function setup(options: { section?: Partial<ResolvedConfig> | undefined } = {}) {
   const { section } = options
   const entry: ResolvedConfig = { ...DEFAULTS }
   const merged = section === undefined ? { ...entry } : mergedConfig(section)
-  const fiberUpdates: Array<{ config: Record<string, unknown>; noSave?: boolean }> = []
-  const fiber: FiberLike = {
-    update: async (config, noSave) => {
-      fiberUpdates.push({ config, noSave })
-    },
-  }
+  const applied: ResolvedConfig[] = []
+  const applier = vi.fn(async (next: ResolvedConfig) => {
+    applied.push(next)
+  })
   const injectCallbacks: Array<(sctx: unknown) => void> = []
   const scope = {
     get: () => merged,
@@ -49,7 +48,6 @@ function setup(options: { section?: Partial<ResolvedConfig> | undefined } = {}) 
   const settings = { register: vi.fn(() => scope), update: vi.fn(async () => {}) }
   const sctx = { settings, effect: vi.fn() }
   const ctx = {
-    fiber,
     inject: vi.fn((_services: string[], callback: (sctx: unknown) => void) => {
       injectCallbacks.push(callback)
     }),
@@ -59,7 +57,8 @@ function setup(options: { section?: Partial<ResolvedConfig> | undefined } = {}) 
     ctx,
     entry,
     merged,
-    fiberUpdates,
+    applier,
+    applied,
     settings,
     scope,
     /** 模拟 settings 服务就绪：触发注入回调（注册 + 初始 onChange） */
@@ -69,57 +68,60 @@ function setup(options: { section?: Partial<ResolvedConfig> | undefined } = {}) 
   }
 }
 
-describe('settings seam（配置持久化 settings.yaml）', () => {
+describe('settings seam（配置持久化 settings.yaml + 实时生效）', () => {
   beforeEach(() => {
     resetSeamForTest()
   })
 
-  it('注册期初始 onChange：合并配置 ≠ entry → 内存重启一次（noSave=true，目标为合并配置）', () => {
-    const { ctx, entry, merged, fiberUpdates, fireInject } = setup({ section: { embeddingModel: 'BAAI/bge-m3' } })
+  it('注册期初始 onChange：合并配置 ≠ entry → 实时生效器调用一次（目标为合并配置）', () => {
+    const { ctx, entry, merged, applier, fireInject } = setup({ section: { embeddingModel: 'BAAI/bge-m3' } })
     const seam = installSettingsSeam(ctx, entry)
+    seam.setApplier(applier)
     fireInject()
-    expect(fiberUpdates).toHaveLength(1)
-    expect(fiberUpdates[0]?.noSave).toBe(true)
-    expect(fiberUpdates[0]?.config).toEqual(merged)
+    expect(applier).toHaveBeenCalledTimes(1)
+    expect(applier).toHaveBeenCalledWith(merged)
     expect(seam.effective()).toEqual(merged)
   })
 
-  it('防环守卫：重启后再次安装（模拟 apply 重跑）不再触发重启', () => {
-    const { ctx, entry, fiberUpdates, fireInject } = setup({ section: { embeddingModel: 'BAAI/bge-m3' } })
+  it('防环守卫：再次安装（模拟 apply 重跑）不再生效（active 缓存幂等基线）', () => {
+    const { ctx, entry, applier, fireInject } = setup({ section: { embeddingModel: 'BAAI/bge-m3' } })
+    const seam = installSettingsSeam(ctx, entry)
+    seam.setApplier(applier)
+    fireInject()
+    expect(applier).toHaveBeenCalledTimes(1)
+    // 第二次安装：active 缓存上次生效配置 → 注册期 onChange 幂等跳过（防"重启环"）
     installSettingsSeam(ctx, entry)
     fireInject()
-    expect(fiberUpdates).toHaveLength(1)
-    // 第二次安装 = 重启后的新 apply：active 缓存上次生效配置 → 注册期 onChange 幂等跳过
-    installSettingsSeam(ctx, entry)
-    fireInject()
-    expect(fiberUpdates).toHaveLength(1)
+    expect(applier).toHaveBeenCalledTimes(1)
   })
 
-  it('合并配置 = entry 配置（空设置段）→ 不重启', () => {
-    const { ctx, entry, fiberUpdates, fireInject } = setup({ section: undefined })
-    installSettingsSeam(ctx, entry)
+  it('合并配置 = entry 配置（空设置段）→ 不生效', () => {
+    const { ctx, entry, applier, fireInject } = setup({ section: undefined })
+    const seam = installSettingsSeam(ctx, entry)
+    seam.setApplier(applier)
     fireInject()
-    expect(fiberUpdates).toHaveLength(0)
+    expect(applier).not.toHaveBeenCalled()
   })
 
-  it('applyChange 幂等：同一配置的重复调用共用一次重启（watcher 与显式保存并发安全）', async () => {
-    const { ctx, entry, merged, fiberUpdates, fireInject } = setup({ section: { embeddingModel: 'm1' } })
+  it('applyChange 幂等：同一配置的重复调用不重复生效（watcher 与显式保存并发安全）', async () => {
+    const { ctx, entry, merged, applier, fireInject } = setup({ section: { embeddingModel: 'm1' } })
     const seam: SettingsSeam = installSettingsSeam(ctx, entry)
+    seam.setApplier(applier)
     fireInject()
-    // 注册期初始 onChange 已启动一次重启（合并配置已生效）；后续重复调用全部复用/跳过
+    // 注册期初始 onChange 已生效一次；后续重复调用全部幂等跳过
     await Promise.all([seam.applyChange(merged), seam.applyChange(merged)])
-    expect(fiberUpdates).toHaveLength(1)
+    expect(applier).toHaveBeenCalledTimes(1)
   })
 
-  it('applyChange：新配置触发重启并更新生效配置', async () => {
-    const { ctx, entry, fiberUpdates, fireInject } = setup({ section: undefined })
+  it('applyChange：新配置委托实时生效器并更新生效配置', async () => {
+    const { ctx, entry, applier, fireInject } = setup({ section: undefined })
     const seam: SettingsSeam = installSettingsSeam(ctx, entry)
+    seam.setApplier(applier)
     fireInject()
     const next = mergedConfig({ embeddingApiBaseUrl: '', embeddingModel: 'BAAI/bge-m3' })
     await seam.applyChange(next)
-    expect(fiberUpdates).toHaveLength(1)
-    expect(fiberUpdates[0]?.noSave).toBe(true)
-    expect(fiberUpdates[0]?.config).toEqual(next)
+    expect(applier).toHaveBeenCalledTimes(1)
+    expect(applier).toHaveBeenCalledWith(next)
     expect(seam.effective()).toEqual(next)
   })
 
@@ -138,8 +140,20 @@ describe('settings seam（配置持久化 settings.yaml）', () => {
     expect(settings.update).toHaveBeenCalledWith(NS, { embeddingModel: 'BAAI/bge-m3' })
   })
 
-  it('applyConfigChange：fiber 未就绪（settings 未接线）时静默空操作', async () => {
+  it('applyConfigChange：未挂接生效器（setApplier 未调用）时静默空操作', async () => {
     const next = mergedConfig({ embeddingModel: 'm' })
     await expect(applyConfigChange(next)).resolves.toBeUndefined()
+    // active 基线已更新（幂等门仍工作）
+    await expect(applyConfigChange(next)).resolves.toBeUndefined()
+  })
+
+  it('setApplier 挂接后：applyConfigChange 委托生效器且幂等门不变', async () => {
+    const { ctx, entry, applier } = setup({ section: undefined })
+    const seam = installSettingsSeam(ctx, entry)
+    seam.setApplier(applier)
+    const next = mergedConfig({ embeddingModel: 'BAAI/bge-m3' })
+    await applyConfigChange(next)
+    expect(applier).toHaveBeenCalledTimes(1)
+    expect(applier).toHaveBeenCalledWith(next)
   })
 })

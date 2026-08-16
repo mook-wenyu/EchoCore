@@ -19,7 +19,7 @@ import type { Context } from '@deepseek-ai/cordis'
 
 import { Config, DEFAULTS, type Config as ConfigType, type ResolvedConfig } from './config.js'
 import { EmbeddingIndex } from './embed-index.js'
-import { EmbeddingService, EmbeddingUnavailableError, resolveApiKey } from './embedding.js'
+import { EmbeddingService, EmbeddingUnavailableError, resolveApiKey, type EmbeddingHolder } from './embedding.js'
 import { MemoryExtractor } from './extractor.js'
 import { registerMemoryRpc, type MemoryRpcContext } from './host-rpc.js'
 import { MemoryInjector } from './injector.js'
@@ -87,6 +87,90 @@ function defaultEmbeddingModelDir(): string {
   return join(homedir(), '.dsh', 'storages', 'embedding-model')
 }
 
+// ── 嵌入后端实时热换（配置保存后原位生效，不重启插件） ──────────────────────
+// 2026-08-16 二次实测根因：重启式生效与 apply 的秒级异步段（加载本地 ONNX
+// 模型）竞态——陈旧续体要么撞 inactive 窗口崩溃，要么二次注册 memory:snapshot/
+// memory_recall 触发 NamedEntries 严格重复检测（fatal load failure）。终版方案
+// （用户拍板）：settings 变更 → 重建 EmbeddingService/EmbeddingIndex 写入
+// holder；store 钩子/注入器/工具/状态展示在**调用时**读 holder，热换零竞态。
+
+/** 嵌入初始化并发纪元（epoch 守卫：并发初始化只保留最后一次发起的会话） */
+let embeddingEpoch = 0
+const EMBEDDING_MODEL_DIR = defaultEmbeddingModelDir()
+
+/**
+ * 嵌入后端初始化/热换（装配初始 init 与面板保存热换共用一条路径）：
+ * 远程配置齐 → 远程优先验证；失败回退本地模型检测；都无 → disabled（正常态）。
+ * ready 时按后端维度文件构建 EmbeddingIndex 并加载（维度隔离，不同维度不得混用）。
+ * - epoch 守卫：并发初始化只保留最后一次调用发起的会话（陈旧结果丢弃——防
+ *   慢速旧会话覆盖新配置的后端）；
+ * - 热换前 flush 旧索引（10s 去抖持久化的待写向量落盘，不丢）；
+ * - 初始化失败（EmbeddingUnavailableError）记录并**保留旧后端**（热换失败不
+ *   破坏当前可用嵌入；首启时 holder 恒空 → 关键词模式）。
+ */
+async function initEmbedding(
+  config: ResolvedConfig,
+  holder: EmbeddingHolder,
+  store: MemoryStore,
+  logger: ReturnType<Context['logger']>,
+): Promise<void> {
+  const epoch = ++embeddingEpoch
+  // 远程配置齐判定：baseUrl/model/apiKey 非空（apiKey 经 resolveApiKey 解析——
+  // 字面 key 或 env:NAME 环境变量引用；解析为空视为未配置）
+  const remoteConfigured =
+    config.embeddingApiBaseUrl !== '' &&
+    config.embeddingModel !== '' &&
+    resolveApiKey(config.embeddingApiKey) !== undefined
+  const service = new EmbeddingService({
+    modelDir: EMBEDDING_MODEL_DIR,
+    remote: remoteConfigured
+      ? {
+          baseUrl: config.embeddingApiBaseUrl,
+          model: config.embeddingModel,
+          dimension: config.embeddingDimension,
+          apiKey: config.embeddingApiKey,
+        }
+      : undefined,
+  })
+  try {
+    await service.init()
+  } catch (error) {
+    if (error instanceof EmbeddingUnavailableError) {
+      logger.error(`[dsh-memory] ${error.message}（检索保持关键词模式）`)
+      return
+    }
+    throw error
+  }
+  if (epoch !== embeddingEpoch) return
+  // 旧索引待写向量落盘后再替换（10s 去抖——面板保存热换不丢向量）
+  if (holder.index !== undefined) {
+    await holder.index.flush().catch((error: unknown) => {
+      logger.warn(`[dsh-memory] 嵌入索引落盘失败（旧索引丢弃）：${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
+  if (epoch !== embeddingEpoch) return
+  if (service.state === 'ready') {
+    const index = new EmbeddingIndex({
+      file: defaultEmbeddingsFile(service.dimension),
+      service,
+      listAll: () => store.listRecent(Number.MAX_SAFE_INTEGER),
+      logWarn: (message, error) => logger.warn(message, error),
+    })
+    await index.load()
+    if (epoch !== embeddingEpoch) return
+    holder.service = service
+    holder.index = index
+    // 全量补齐缺失嵌入（后台；~1.2s/1260 条，不阻塞生效完成）
+    void index.ensureAll()
+    logger.info(`[dsh-memory] 语义嵌入已就绪（后端：${service.backendLabel}，维度：${service.dimension}）`)
+  } else {
+    if (epoch !== embeddingEpoch) return
+    holder.service = service
+    holder.index = undefined
+    logger.info('[dsh-memory] 语义嵌入未启用：无远程配置且无本地模型（关键词检索）')
+  }
+}
+
 /** 记忆库 SQLite 文件路径（替代旧 memory.json；WAL O(1) 写，见 sqlite-kv.ts） */
 function defaultMemoryDbFile(): string {
   return join(homedir(), '.dsh', 'storages', 'memory.sqlite')
@@ -124,6 +208,20 @@ export async function mountMemory(
     if (db.isOpen) db.close()
   })
   const table = new SqliteKvTable<MemoryEntry>(db, MEMORY_TABLE, (entry) => jiebaWords(entry.content).join(' '))
+
+  // 嵌入后端持有者 + 实时生效器接线（面板保存热换嵌入后端，不重启插件——
+  // 重启与 apply 秒级异步段竞态，2026-08-16 实测 fatal load failure，见上方
+  // initEmbedding 注释）。store 经 storeRef 延迟引用：applier 在迁移前挂接，
+  // 若 settings 变更恰在迁移窗口内触发，则跳过（后续初始 init 读 seam.effective()
+  // 已含合并配置——同一生效门，不丢变更）。
+  const holder: EmbeddingHolder = { service: undefined, index: undefined }
+  let storeRef: MemoryStore | undefined
+  overrides.seam?.setApplier((next) => {
+    const s = storeRef
+    if (s === undefined) return Promise.resolve()
+    return initEmbedding(next, holder, s, logger)
+  })
+
   if (table.size === 0) {
     const legacyFile = overrides.legacyJsonFile ?? legacyMemoryJsonFile()
     const { migrated, skipped, corrupt } = await migrateMemoryJson(legacyFile, table, (raw) =>
@@ -146,9 +244,8 @@ export async function mountMemory(
   }
 
   // R4-1：畸形 source（手工篡改 memory.json）被检索过滤时告警一次，可观测性由装配层提供
-  // P4 hooks：onCreate/onArchive 闭包引用后赋值的 embedIndex（let，延迟求值——
-  // 嵌入启用时索引在下方初始化；未启用时恒 undefined，hook 空操作）
-  const store = new MemoryStore(
+  // P4 hooks：闭包读 holder.index（调用时求值——热换后新索引即生效，无需重启）
+  const store = (storeRef = new MemoryStore(
     table,
     undefined,
     (id) => {
@@ -156,62 +253,17 @@ export async function mountMemory(
     },
     {
       // 新建记忆增量嵌入（fire-and-forget，嵌入失败仅记录，检索保持关键词）
-      onCreate: (entry) => embedIndex?.indexEntry(entry),
-      onArchive: (id) => embedIndex?.remove(id),
+      onCreate: (entry) => holder.index?.indexEntry(entry),
+      onArchive: (id) => holder.index?.remove(id),
       // P2-1：被覆盖条目联动移除向量（检索已隐藏，向量不再有语义召回价值）
-      onSupersede: (id) => embedIndex?.remove(id),
+      onSupersede: (id) => holder.index?.remove(id),
     },
-  )
+  ))
 
-  // 语义嵌入（默认启用：远程配置齐 → 远程优先；否则本地模型检测 → 本地；
-  // 都无 → disabled 正常禁用态）。初始化失败（后端存在但加载异常）记录并
-  // 保持关键词检索——嵌入是一等状态（EmbeddingService.state），非静默兜底。
-  // 本地模型目录固定全局默认（用户拍板：模型是共享资产，目录不配置——
-  // ~/.dsh/storages/embedding-model）。
-  let embeddingService: EmbeddingService | undefined
-  let embedIndex: EmbeddingIndex | undefined
-  const modelDir = defaultEmbeddingModelDir()
-  // 远程配置齐判定：baseUrl/model/apiKey 非空（apiKey 经 resolveApiKey 解析——
-  // 字面 key 或 env:NAME 环境变量引用；解析为空视为未配置）
-  const remoteConfigured =
-    config.embeddingApiBaseUrl !== '' &&
-    config.embeddingModel !== '' &&
-    resolveApiKey(config.embeddingApiKey) !== undefined
-  embeddingService = new EmbeddingService({
-    modelDir,
-    remote: remoteConfigured
-      ? {
-          baseUrl: config.embeddingApiBaseUrl,
-          model: config.embeddingModel,
-          dimension: config.embeddingDimension,
-          apiKey: config.embeddingApiKey,
-        }
-      : undefined,
-  })
-  try {
-    await embeddingService.init()
-    if (embeddingService.state === 'ready') {
-      // 索引文件按后端维度隔离（本地 384 / 远程配置值）——不同维度不得混用
-      embedIndex = new EmbeddingIndex({
-        file: defaultEmbeddingsFile(embeddingService.dimension),
-        service: embeddingService,
-        listAll: () => store.listRecent(Number.MAX_SAFE_INTEGER),
-        logWarn: (message, error) => logger.warn(message, error),
-      })
-      await embedIndex.load()
-      // 全量补齐缺失嵌入（后台；~1.2s/1260 条，不阻塞装配完成）
-      void embedIndex.ensureAll()
-      logger.info(`[dsh-memory] 语义嵌入已就绪（后端：${embeddingService.backendLabel}，维度：${embeddingService.dimension}）`)
-    } else {
-      logger.info('[dsh-memory] 语义嵌入未启用：无远程配置且无本地模型（关键词检索）')
-    }
-  } catch (error) {
-    if (error instanceof EmbeddingUnavailableError) {
-      logger.error(`[dsh-memory] ${error.message}（检索保持关键词模式）`)
-    } else {
-      throw error
-    }
-  }
+  // 语义嵌入初始初始化（远程优先 → 本地回退 → disabled 正常态）。装配用
+  // seam 的**当前**生效配置（settings 段若已在注册期生效，此处即合并值）——
+  // 与热换共用 initEmbedding 单一路径（epoch 守卫防并发旧会话覆盖）。
+  await initEmbedding(overrides.seam?.effective() ?? config, holder, store, logger)
 
   // 提取器：双通道（压缩遮蔽 + 轮次增量），纯观察不阻塞主循环
   // （参数已常量化——用户拍板配置面最小化；提取恒启用）
@@ -223,7 +275,8 @@ export async function mountMemory(
     now: () => Date.now(),
   })
   snapshotService.install(ctx)
-  new MemoryInjector({ store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger }).install(ctx)
+  // embedding 传 holder（调用时读 service/index——面板保存热换后即生效，无需重启）
+  new MemoryInjector({ store, snapshot: snapshotService, embedding: holder, logger }).install(ctx)
 
   // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）
   const maintenance = new MemoryMaintenance({ store, logger, now: () => Date.now() })
@@ -232,20 +285,23 @@ export async function mountMemory(
   // O1：运行健康指标组装（写链失败/嵌入状态/上次维护——tools status 与 RPC status 共用）
   const runtime = {
     writeFailures: table.writeFailures,
-    embeddingState: embeddingService.state,
+    // 动态读 holder（热换后状态即时刷新；getter 惰性求值）
+    get embeddingState() {
+      return holder.service?.state ?? 'disabled'
+    },
     lastMaintenanceAt: maintenance.lastRunAt,
   }
 
   // 模型工具：recall / search / note / forget / audit / status
   // （G3：snapshot 传入供工具回路去重——快照已注入的记忆不再由工具重复输出）
-  registerMemoryTools(ctx, { store, snapshot: snapshotService, embedding: embeddingService, embedIndex, logger, runtime })
+  registerMemoryTools(ctx, { store, snapshot: snapshotService, embedding: holder, logger, runtime })
 
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
   registerSnapshot(ctx, { store, logger })
 
   // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面；
   // 配置端点由 settings seam 供数（getConfig 读生效配置 / setConfig 持久化到
-  // settings.yaml 并经内存重启生效——根因修复见 settings.ts 文件头）
+  // settings.yaml 并经实时生效器热换嵌入后端——根因修复见 settings.ts 文件头）
   registerMemoryRpc(ctx, store, rpcContextFrom(overrides.seam, config), runtime)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)

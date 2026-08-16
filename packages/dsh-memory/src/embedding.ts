@@ -339,6 +339,18 @@ export type SemanticSearchExtra = Omit<
 >
 
 /**
+ * 实时嵌入后端持有者（装配层单例对象——面板保存后原位热换，不重启插件）。
+ * 消费方（store 钩子/注入器/工具/状态展示）在**调用时**读 holder 字段：
+ * 热换只改 holder 内容，引用不变，无陈旧对象竞态。
+ */
+export interface EmbeddingHolder {
+  /** 当前嵌入服务（未就绪 = undefined） */
+  service: EmbeddingService | undefined
+  /** 当前嵌入索引（与 service 成对；维度变更时按新维度文件重建） */
+  index: import('./embed-index.js').EmbeddingIndex | undefined
+}
+
+/**
  * 语义增强检索（P4，注入器与工具共用）：
  * - 嵌入未启用/未就绪 → 纯关键词路径（状态门控，无异常路径）；
  * - 就绪 → 计算查询向量 + 提供条目向量查找，走 store 融合评分；

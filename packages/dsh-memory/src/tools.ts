@@ -13,8 +13,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
 import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS } from './constants.js'
-import { searchWithSemantic, type EmbeddingService } from './embedding.js'
-import type { EmbeddingIndex } from './embed-index.js'
+import { searchWithSemantic, type EmbeddingHolder } from './embedding.js'
 import { formatMemoryLine } from './render.js'
 import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
@@ -29,10 +28,8 @@ export interface MemoryToolsDeps {
    * 防同一记忆被「快照段 + 实时注入包 + 工具输出」三处重复消化（上下文腐化）。
    */
   snapshot: MemoryStableSnapshot
-  /** P4 语义嵌入（可选；未启用时工具检索为纯关键词路径） */
-  embedding?: EmbeddingService
-  /** P4 嵌入索引（与 embedding 成对出现） */
-  embedIndex?: EmbeddingIndex
+  /** P4 语义嵌入持有者（可选；调用时读 service/index——热换后即生效，无需重启） */
+  embedding?: EmbeddingHolder
   /** 语义降级/嵌入故障记录（可选；装配层注入 logger） */
   logger?: Pick<ReturnType<Context['logger']>, 'warn'>
   /** O1 运行健康指标（装配层组装；测试环境不传 → 占位） */
@@ -183,8 +180,8 @@ function registerRecall(ctx: Context, deps: MemoryToolsDeps): void {
         // P4：语义增强检索（未启用时纯关键词，行为与之前一致）
         const results = (await searchWithSemantic(
           deps.store,
-          deps.embedding,
-          deps.embedIndex,
+          deps.embedding?.service,
+          deps.embedding?.index,
           args.query,
           { workspace: workspaceOf(exec), limit: args.limit ?? 8 },
           (message) => deps.logger?.warn(message),
@@ -283,8 +280,8 @@ function registerSearch(ctx: Context, deps: MemoryToolsDeps): void {
         } else {
           results = (await searchWithSemantic(
             deps.store,
-            deps.embedding,
-            deps.embedIndex,
+            deps.embedding?.service,
+            deps.embedding?.index,
             args.query,
             {
               workspace,

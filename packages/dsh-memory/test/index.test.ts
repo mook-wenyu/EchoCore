@@ -16,21 +16,35 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { apply, inject, mountMemory } from '../src/index.js'
 import { DEFAULTS } from '../src/config.js'
+import { EmbeddingService } from '../src/embedding.js'
 import { FakeCtx } from './helpers.js'
+
+/** 访问 mock EmbeddingService 的构造记录（静态计数——断言实时生效器重建后端） */
+function embeddingConstructed(): Array<{ remote?: { model?: string } }> {
+  return (EmbeddingService as unknown as { constructed: Array<{ remote?: { model?: string } }> }).constructed
+}
 
 /**
  * mock 嵌入服务为"禁用态"（无模型无远程的正常态）——装配测试关注组合根
  * 接线与失败传播，不加载真实 ONNX 模型（22MB，环境依赖）；ready 分支的
  * 索引构建由 embedding.test.ts 的 EmbeddingIndex 测试独立覆盖。
+ * `constructed` 静态计数：断言实时生效器触发后重建了嵌入后端（每次
+ * EmbeddingService 构造记录其远程配置——验证新配置到达后端重建路径）。
  */
 vi.mock('../src/embedding.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/embedding.js')>()
   return {
     ...actual,
     EmbeddingService: class {
+      static constructed: Array<{ remote?: { model?: string } }> = []
       state = 'disabled'
       dimension = 384
       backendLabel = 'local'
+      constructor(deps: { remote?: { model?: string } }) {
+        ;(this.constructor as { constructed: Array<{ remote?: { model?: string } }> }).constructed.push({
+          remote: deps.remote,
+        })
+      }
       async init(): Promise<void> {}
       async embed(): Promise<Float32Array> {
         throw new Error('mock 嵌入未就绪（index.test 不测 ready 路径）')
@@ -231,6 +245,40 @@ describe('插件组合根（index.ts）', () => {
     })
     expect(ctx.toolDefs.has('memory_recall')).toBe(true)
     expect(ctx.toolDefs.has('memory_status')).toBe(true)
+    await cleanup(ctx, store.dir)
+  })
+
+  it('面板保存实时生效：setApplier 挂接 + 触发重建嵌入后端（无插件重启）', async () => {
+    const store = tmpStore()
+    const { ctx, connection } = setup()
+    // 假 seam：仅捕获装配挂接的实时生效器（真实 seam 见 settings.test.ts）
+    let applier: ((next: never) => Promise<void>) | undefined
+    const seam = {
+      effective: () => ({ ...DEFAULTS }),
+      setApplier: (fn: never) => {
+        applier = fn
+      },
+    }
+    await mountMemory(ctx as never, { ...DEFAULTS } as never, { warn: () => {}, info: () => {} } as never, {
+      dbFile: store.dbFile,
+      legacyJsonFile: store.jsonFile,
+      seam: seam as never,
+    })
+    const before = embeddingConstructed().length
+    expect(applier).toBeDefined()
+    // 触发实时生效（模拟 settings 变更）：重建嵌入后端——新配置到达构造路径
+    await applier!({
+      ...DEFAULTS,
+      embeddingApiBaseUrl: 'http://verify.local/v1',
+      embeddingApiKey: 'sk-verify', // 字面 key（env:NAME 引用在测试环境无对应变量 → 判定未配置）
+      embeddingModel: 'BAAI/bge-m3',
+      embeddingDimension: 512,
+    } as never)
+    const constructed = embeddingConstructed()
+    expect(constructed.length).toBe(before + 1)
+    expect(constructed.at(-1)?.remote?.model).toBe('BAAI/bge-m3')
+    // 无插件重启：RPC 保持单次注册（实时生效不重跑 apply）
+    expect(connection.rpc.handle).toHaveBeenCalledTimes(1)
     await cleanup(ctx, store.dir)
   })
 })

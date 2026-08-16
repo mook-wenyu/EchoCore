@@ -3,7 +3,7 @@
  *
  * 配置持久化 seam（DSH 官方用户设置通道：`ctx.settings` → `~/.dsh/settings.yaml`）。
  *
- * 根因（2026-08-16 用户实测"面板保存提示成功，重启 dsh 后配置丢失"）：
+ * 根因一（2026-08-16 用户实测"面板保存提示成功，重启 dsh 后配置丢失"）：
  * 保存原走 `fiber.update(config, noSave=false)` → cordis-plugin-loader 的
  * `internal/update` 处理器把配置写进 `entry.options.config` 并调
  * `entry.parent.tree.write()` —— 写回目标是 profile 根 Include 树文件
@@ -12,14 +12,23 @@
  * 下次启动被清空。DSH 文档明确：用户可编辑设置属于 `settings.yaml` 命名空间
  * （内建插件配置页同款通道，官方 e2e 测试为契约）。
  *
- * 修复：面板保存改经 settings 命名空间 `memory` 持久化到 settings.yaml；
- * 生效仍用内存重启插件（`fiber.update(next, true)`：noSave=true 不触发 loader
- * 写回 cordis.yml）。settings 变更（面板保存 / 手工编辑 settings.yaml）经
- * `scope.watch → onChange` 走同一重启路径。
+ * 根因二（同日二次实测"保存即 fatal load failure"）：初版修复用内存重启
+ * （fiber.update noSave=true）生效——但插件 apply 含秒级异步段（加载本地
+ * ONNX 模型），进程内重启会让**陈旧续体竞态**：被中断的 apply 续体在重启后
+ * 恢复，要么撞进 inactive 窗口抛 "cannot get required service"（harness 实测
+ * 可杀进程），要么在 fiber 重新激活后二次注册 memory:snapshot / memory_recall
+ * ——dsh-system-prompt 与 dsh-tools 都是 NamedEntries 严格重复检测，二次注册
+ * 即抛 "already registered"（用户实测 fatal load failure）。
  *
- * 跨重启状态：模块级单例（宿主级插件每进程仅一个实例）。`active` 缓存上次
- * 生效的合并配置：插件重启后装配直接沿用，避免 settings 注册期初始 onChange
- * （合并配置 ≠ entry 配置时）触发"重启 → 再注册 → 再重启"环。
+ * 终版方案（用户拍板：实时生效，去掉插件重启）：配置变更经
+ * `scope.watch → onChange → applier` **原位热换嵌入后端**（重建
+ * EmbeddingService/EmbeddingIndex，注入器/工具改动态读持有者）——零重启、
+ * 零陈旧续体、零重复注册。DSH 原生模式（dsh-base patch 注释：settings 段
+ * 变更 "without a restart"，llm-pi-ai 同款）。
+ *
+ * 跨 apply 状态：模块级单例（宿主级插件每进程仅一个实例）。`active` 缓存
+ * 上次生效的合并配置；applier 由装配层注入（index.ts mountMemory 挂接——
+ * seam 不关心生效方式，只负责持久化与变更通知）。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -35,10 +44,8 @@ import { Config, DEFAULTS, sameConfig, type Config as ConfigType, type ResolvedC
 /** settings 命名空间（settings.yaml 的 memory 段；kebab-case 短名） */
 export const NS = settingsNamespace('memory')
 
-/** 插件 fiber 配置更新面（内存重启；noSave=true 不触碰配置源） */
-export interface FiberLike {
-  update(config: Record<string, unknown>, noSave?: boolean): Promise<void>
-}
+/** 实时生效器（配置变更的应用方式——装配层注入：嵌入后端热换，不重启插件） */
+export type LiveApplier = (next: ResolvedConfig) => Promise<void>
 
 /** settings 持久化通道（setConfig 落盘 settings.yaml；未接线时 update 拒绝） */
 export interface SettingsChannel {
@@ -58,16 +65,16 @@ export interface SettingsSeam {
   channel: SettingsChannel
   /** 应用新配置并等待生效（幂等：与当前生效配置一致则跳过） */
   applyChange: (next: ResolvedConfig) => Promise<void>
+  /** 注入实时生效器（装配层挂接；未挂接时空操作——配置只落盘不生效，用于测试直连） */
+  setApplier: (applier: LiveApplier) => void
 }
 
 // ── 模块级单例状态（进程内一个宿主实例；resetSeamForTest 供测试隔离） ────
 
-/** 上次生效的合并配置（跨重启缓存——防注册期重启环，见文件头） */
+/** 上次生效的合并配置（幂等守卫基线——防注册期初始 onChange 与面板保存重复生效） */
 let active: ResolvedConfig | undefined
-/** 进行中的内存重启（并发变更共用同一重启，防双重启竞争） */
-let restarting: Promise<void> | undefined
-/** 当前插件 fiber（apply 时刷新；内存重启用） */
-let fiber: FiberLike | undefined
+/** 实时生效器（index.ts mountMemory 挂接；默认空操作） */
+let applier: LiveApplier = () => Promise.resolve()
 /** settings 权威配置源（setSource 注入：注册后 = scope.get()，注销后 = entry 配置） */
 let currentSource: () => ResolvedConfig = () => ({ ...DEFAULTS }) as ResolvedConfig
 /** settings 服务引用（inject 后置；面板持久化通道） */
@@ -81,9 +88,8 @@ let settingsService: SettingsServiceLike | undefined
  */
 export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSeam {
   const entryConfig: ResolvedConfig = { ...DEFAULTS, ...entry }
-  fiber = (ctx as unknown as { fiber: FiberLike }).fiber
   currentSource = () => entryConfig
-  // 跨重启沿用上次生效配置（settings 层合并结果）；进程首启用 entry 配置
+  // 幂等守卫基线：进程首启用 entry 配置（后续变更与之比较）
   active = active ?? entryConfig
 
   const hooks: SettingsSectionHooks<ConfigType> = {
@@ -91,6 +97,8 @@ export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSe
       currentSource = () => source() as ResolvedConfig
     },
     onChange: () => {
+      // 注册期初始值 / settings.yaml 热重载 / 面板保存后 commit——统一走
+      // 幂等生效门（同配置跳过），生效方式由装配层 applier 决定（实时热换）
       void applyConfigChange(currentSource())
     },
   }
@@ -117,34 +125,29 @@ export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSe
       },
     },
     applyChange: applyConfigChange,
+    setApplier: (next) => {
+      applier = next
+    },
   }
 }
 
 /**
- * 应用一次配置变更（幂等）：
- * - 与当前生效配置相同 → 返回进行中的重启（若有），否则空（无变更即无动作）；
- * - 不同 → 记录新生效配置并以 noSave=true 内存重启插件（不写 cordis.yml——
- *   该文件每次启动被 prepareProfile 重置，写回即丢失）。
- * 并发/重复调用共享同一重启：settings 注册期初始 onChange 与面板 setConfig
- * 显式调用都走此门，先到者启动重启，后到者复用其 promise。
+ * 应用一次配置变更（幂等生效门）：
+ * - 与当前生效配置相同 → 无动作（防注册期初始 onChange 与面板保存重复生效）；
+ * - 不同 → 记录新生效配置并委托装配层 applier 实时生效（不重启插件——
+ *   重启与 apply 的秒级异步段竞态，2026-08-16 实测 fatal load failure 根因）。
+ * 并发调用各自进入 applier（装配层以 epoch 守卫丢弃过期结果）。
  */
 export function applyConfigChange(next: ResolvedConfig): Promise<void> {
-  if (active !== undefined && sameConfig(next, active)) return restarting ?? Promise.resolve()
+  if (active !== undefined && sameConfig(next, active)) return Promise.resolve()
   active = next
-  if (fiber === undefined) return Promise.resolve()
-  restarting = fiber.update(next, true).finally(() => {
-    restarting = undefined
-  })
-  return restarting
+  return applier(next)
 }
 
 /** 测试隔离：重置进程级单例（仅测试调用；运行期不导出语义变化） */
 export function resetSeamForTest(): void {
   active = undefined
-  restarting = undefined
-  fiber = undefined
+  applier = () => Promise.resolve()
   settingsService = undefined
   currentSource = () => ({ ...DEFAULTS }) as ResolvedConfig
 }
-
-
