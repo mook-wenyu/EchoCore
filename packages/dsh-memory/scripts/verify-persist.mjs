@@ -138,9 +138,10 @@ async function bootVerify(root) {
 
 /**
  * 等待记忆插件 RPC 注册。
- * 插件 apply 的嵌入 init 会加载真实 ~/.dsh/storages/embedding-model 本地模型
- * （插件路径硬编码 homedir()，忽略 DSH_HOME——既有设计，本脚本只读触碰），
- * 耗时数秒；boot 可能在 apply 完成前返回，故轮询而非立即断言。
+ * 插件存储/模型路径经 dsh-home-paths 解析（DSH_HOME 优先、~/.dsh 回退）——
+ * 本脚本已设 DSH_HOME=临时 home，嵌入 init 在临时目录检测模型（无 → disabled
+ * 快速返回），不触碰真实 ~/.dsh（B1 后完全隔离）。
+ * boot 可能在 apply 完成前返回，故轮询而非立即断言。
  */
 async function waitForRpc(captured, timeoutMs = 60000, minCount = 1) {
   const deadline = Date.now() + timeoutMs

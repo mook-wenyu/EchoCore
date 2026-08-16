@@ -11,7 +11,7 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 | 能力 | 说明 |
 |------|------|
 | 双通道提取 | 压缩遮蔽跨度（`compaction/summary` 的 `shadowedSeqs`）即时提取 + 轮次结束增量提取（累计超阈值才调 LLM，摘录上限 12K 字符截尾保最新），共享事件序号水位防重 |
-| 跨会话记忆 | 记忆按 workspace（规范化 cwd）持久化于 `~/.dsh/storages/memory.sqlite`（SQLite WAL），新会话可检索历史会话记忆；项目间隔离 |
+| 跨会话记忆 | 记忆按 workspace（规范化 cwd）持久化于 `$DSH_HOME/storages/memory.sqlite`（未设 DSH_HOME 时 `~/.dsh/storages/memory.sqlite`；SQLite WAL），新会话可检索历史会话记忆；项目间隔离 |
 | 自动注入 | 每个 `agent/pre-step` 检索 Top-K 相关记忆（查询文本仅取真实用户消息，排除插件注入与工具噪声），预算内（默认 16384 字符 ≈ 4K token）注入为带来源标记的 `user/message`（source: plugin + form: recall）；已注入且仍可见的记忆不重复注入，被压缩遮蔽后允许重注入 |
 | 矛盾裁决（D-A） | 新事实写入时与同 workspace 同分类旧记忆做 token 重合度比对（Jaccard ≥ 0.7），命中即标记旧条目 `supersededBy`——检索/注入默认排除被覆盖条目（`memory_search` 可 `includeSuperseded` 审计），审计记录 supersede 链 |
 | 后台整理（O8-M） | 有会话活动后每 1 小时运行：重复合并（Jaccard ≥ 0.85）、过期降级（90 天无访问且重要度 ≤5）、标签小写化整理；全部纯规则、批预算 200 |
@@ -40,8 +40,9 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 ```
 
 不发布服务（工具/监听/RPC 均为消费方形态），组合行可松散挂载（宿主组合行即全局生效）。
-**存储自建 SQLite**（`~/.dsh/storages/memory.sqlite`，node:sqlite WAL 追加写——
+**存储自建 SQLite**（`$DSH_HOME/storages/memory.sqlite`，未设 DSH_HOME 时 `~/.dsh/storages/memory.sqlite`，node:sqlite WAL 追加写——
 结构性解决 storage-json 整文件原子写的 O(n) 写放大，用户拍板 2026-08-15）；
+存储路径经 dsh-home-paths 解析（与 settings.yaml 同源；多实例/CI 隔离）。
 不依赖宿主 `storageDomain`（inject 无此服务）。首启自动从旧 `memory.json` 迁移
 （逐条校验、坏记录跳过、原文件改名 `.bak` 保留、幂等；损坏文件降级空库启动）。
 
@@ -51,7 +52,7 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 其余行为参数（注入预算/TopK/最低分、提取三参、快照三参、维护间隔、四个
 enable 开关）已固化为各模块内代码常量——依据 12-Factor（仅"随部署变化"的
 才是配置）与 FSE'15 "Too Many Knobs"（多数参数无人设置）；本地模型目录固定
-`~/.dsh/storages/embedding-model`（模型是全局共享资产）。想调整常量值需改
+`$DSH_HOME/storages/embedding-model`（未设 DSH_HOME 时 `~/.dsh/storages/embedding-model`；模型是全局共享资产）。想调整常量值需改
 `src/` 下对应模块顶部常量。
 
 | 键 | 默认 | 含义 |
@@ -125,7 +126,8 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 5. **salience floor 90 天活跃窗口**：高重要度仅"最近创建/访问"保活——防
    991 条 imp≥8 长期霸榜压制新知识。
 
-- 嵌入索引按**后端维度隔离**持久化（`~/.dsh/storages/memory-embeddings-<dim>.json`，
+- 嵌入索引按**后端维度隔离**持久化（`$DSH_HOME/storages/memory-embeddings-<dim>.json`，
+  未设 DSH_HOME 时 `~/.dsh/storages/…`）——远程维度切换不与本地索引混用；
   本地 384 / 远程配置值）——不同维度不得混用（余弦失真），切换后端自动换索引文件；
   启动全量补齐 + 新建增量 + 归档/supersede 移除；
   **损坏索引文件自动降级为空索引并告警**（P0-1：嵌入层可选，损坏不致命）；持久化串行互斥防并发半截文件
@@ -151,8 +153,11 @@ jieba 中文单字过滤（防稀释相关性分母）+ 输出去重。引擎 @n
 
 ## 运维：记忆库备份
 
-记忆库存储为 **SQLite**（`~/.dsh/storages/memory.sqlite`，WAL 模式——结构性解决
-storage-json 整文件原子写的 O(n) 写放大，用户拍板 2026-08-15）。首启自动从旧
+记忆库存储为 **SQLite**（`$DSH_HOME/storages/memory.sqlite`，未设 DSH_HOME 时
+`~/.dsh/storages/memory.sqlite`，WAL 模式——结构性解决
+storage-json 整文件原子写的 O(n) 写放大，用户拍板 2026-08-15）。存储路径经
+dsh-home-paths 解析（与 settings.yaml 同源；多实例/CI 隔离，2026-08-16 拍板）。
+首启自动从旧
 `memory.json` 迁移（逐条校验、坏记录跳过、原文件改名 `.bak` 保留、幂等）。
 
 备份须用 SQLite backup API（WAL 活跃期文件复制会丢未 checkpoint 数据），
@@ -160,7 +165,7 @@ storage-json 整文件原子写的 O(n) 写放大，用户拍板 2026-08-15）�
 
 ```bash
 node packages/dsh-memory/scripts/backup-memory.mjs [备份目录] [保留份数]
-# 默认备份到 ~/.dsh/storages/backups/，保留最近 10 份（时间戳命名）
+# 默认备份到 $DSH_HOME/storages/backups/（未设 DSH_HOME 时 ~/.dsh/storages/backups/），保留最近 10 份（时间戳命名）
 # 建议配合系统计划任务每日运行；源文件缺失/保留 0 份会显式报错（不静默）
 ```
 
