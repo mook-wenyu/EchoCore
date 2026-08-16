@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { MemoryInjector, renderPack, textOfBatch } from '../src/injector.js'
+import { MemoryInjector, renderCatalog, renderPack, textOfBatch } from '../src/injector.js'
 import { MemoryStableSnapshot, SNAPSHOT_MIN_REBUILD_INTERVAL_MS } from '../src/stable-snapshot.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
@@ -466,6 +466,131 @@ describe('MemoryInjector 会话上下文派生查询（P3）', () => {
     // <0.4 不注入；P3 拼接近期窗口（'pnpm workspace'）→ 命中 4/7 ≈0.57 × 0.9 = 0.51 ≥0.4 注入
     const second = await preStep(makePayload('s1', '环境怎么配置'), async () => enterDecision())
     expect(injectedText(second)).toContain('编译器')
+  })
+
+  // R3a：P3 窗口滚动边界——窗口满 3 条后最旧话题被丢。
+  // 记忆仅靠专属词 W 命中（其余内容为长尾填充，不与后续查询重叠）——因此召回
+  // 完全由「拼接查询里是否含 W」决定：q1 若仍在窗口，第 5 步（查询与 q1 主题相关
+  // 但当前消息不含 W）仍会召回；q1 被挤出窗口则 W 缺席、不再召回。
+  it('P3 窗口满 3 条后最旧被丢（q1 专属词不再参与召回）', async () => {
+    const { preStep, store } = setup()
+    const W = 'scribblequark'
+    await seed(store, { content: longContent(W), importance: 10 })
+    // 第 1 步查询含 W → 命中注入（证明 W 在场可召回）
+    const first = await preStep(makePayload('s1', `${W} protocol`), async () => enterDecision())
+    expect(injectedText(first)).toContain(W)
+    // 第 2-4 步：不同话题（均不与记忆词重叠）只推进窗口 → 第 4 步后窗口=[q4,q3,q2]，q1 被丢
+    const tailQueries = ['nitrogen maintenance', 'hydraulic pipeline', 'seal ring replacement']
+    for (const q of tailQueries) {
+      const d = await preStep(makePayload('s1', q), async () => enterDecision())
+      expect(d.kind).toBe('enter')
+    }
+    // 第 5 步：查询与 q1 主题相关（quark）但当前消息不含 W → 若 W 仍在窗口则召回，不在则不召回
+    const fifth = await preStep(makePayload('s1', 'quark orbital station'), async () => enterDecision())
+    expect(fifth.kind).toBe('enter')
+    if (fifth.kind !== 'enter') throw new Error('应 enter')
+    expect(fifth.messages).toHaveLength(1) // 仅下游，无注入：q1 已被挤出窗口
+  })
+
+  // R3a：P3 窗口有界——连续 20 次 pre-step 后窗口不随会话无限增长（恒 ≤3）。
+  // 同一会话积累 20 个不同话题，W 早已被挤出；第 21 步查询与 W 相关但当前消息
+  // 不含 W → 不召回，反证窗口长度被上限 3 掐住（未随步数线性膨胀保留 W）。
+  it('P3 窗口有界：连续 20 步后最旧 q 被丢（q1 专属词不召回，Map 不无限增长）', async () => {
+    const { preStep, store } = setup()
+    const W = 'quasiparticle'
+    await seed(store, { content: longContent(W), importance: 10 })
+    // 第 1 步含 W → 命中（证明 W 在场可召回）
+    const first = await preStep(makePayload('s1', W), async () => enterDecision())
+    expect(injectedText(first)).toContain(W)
+    // 连续 19 个不同话题推进窗口（累计到第 20 步）：窗口恒 ≤3，W 早已被挤出
+    for (let i = 0; i < 19; i++) {
+      const d = await preStep(makePayload('s1', `independent-topic-${i}`), async () => enterDecision())
+      expect(d.kind).toBe('enter')
+    }
+    // 第 21 步：查询与 W 相关（quasi）但当前消息不含 W → W 已不在窗口 → 不召回
+    const after = await preStep(makePayload('s1', 'quasi stellar'), async () => enterDecision())
+    expect(after.kind).toBe('enter')
+    if (after.kind !== 'enter') throw new Error('应 enter')
+    expect(after.messages).toHaveLength(1)
+  })
+})
+
+// N2（2026-08-16 目录注入）：预算截断跳过的条目标题目录——防 known-information
+// forgetting（被预算截断的关键事实模型无从发现，标题作导航供主动 memory_recall 取全文）。
+describe('MemoryInjector 目录注入（N2）', () => {
+  function injectedText(decision: PreStepDecision): string {
+    if (decision.kind !== 'enter') throw new Error('应注入')
+    const injected = decision.messages[decision.messages.length - 1]
+    const text = (injected?.content ?? []).find((block) => block.type === 'text')?.text ?? ''
+    return text
+  }
+
+  // 预算极小（16384 只放得下第一条完整行超长记忆）→ 其余条目标题进目录段
+  // （含计数提示 + 目录头 + 标题 + 记忆 #短id）。两条内容不同 → 不合并、id 各异。
+  it('预算放不下多条完整行时，其余条目标题进目录段（保留计数提示）', async () => {
+    const { preStep, store } = setup()
+    // 两条都是超快照预算的长尾（>8192 → 不进快照 → 可实时注入）；单条完整行
+    // ≈8300 字符，两条合计超 16384 → 第一条渲染、第二条被跳过进目录。
+    const first = await seed(store, { content: longContent('pnpm workspace 甲规则', 8230), importance: 10 })
+    const second = await seed(store, { content: longContent('pnpm workspace 乙备注', 8230), importance: 10 })
+    const text = injectedText(await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision()))
+    // 保留原计数提示（一行）
+    expect(text).toContain('另有 1 条相关记忆未展示')
+    // 目录段：标题（content 前 24 字符）+ 记忆 #短id
+    expect(text).toContain('## 未展示的记忆目录（可 memory_recall 检索）')
+    expect(text).toContain('pnpm workspace')
+    // 恰好一条进目录（跳过条目的短 id），另一条是完整行渲染不重复列目录
+    const catalogSection = text.split('## 未展示的记忆目录')[1] ?? ''
+    const shortsInCatalog = [first, second].filter((entry) => catalogSection.includes(`记忆 #${entry.id.slice(0, 8)}`))
+    expect(shortsInCatalog).toHaveLength(1)
+    void second
+  })
+
+  // 无跳过（预算内全部放下）→ 不追加目录段
+  it('预算内全部放下（无跳过）时不追加目录段', async () => {
+    const { preStep, store } = setup()
+    // 单条长尾完整行 ≈8300 < 16384 → 全渲染，零跳过
+    await seed(store, { content: longContent('pnpm workspace 唯一规则', 8230), importance: 10 })
+    const text = injectedText(await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision()))
+    expect(text).toContain('pnpm workspace 唯一规则')
+    expect(text).not.toContain('未展示的记忆目录')
+  })
+})
+
+// N2：renderCatalog 目录段预算（CATALOG_BUDGET_CHARS=1500）截断行为。
+// 自动注入 TOP_K=8 上限下同批次最多 7 条跳过（合计 ≈350 字符 <1500，永不超）
+// ——目录超预算只能由"大量手动跳过条目"触发，故以纯函数方式单测截断路径。
+describe('renderCatalog（N2 目录段预算截断）', () => {
+  /** 构造带长标题的跳过条目（kind/content 便于断言） */
+  function skippedEntryWith(kind: string, title: string): { entry: MemoryEntry; line: string } {
+    return {
+      entry: {
+        id: `${'aaaaaaaa-1111-1111-1111-'}${title.replace(/\W/g, '').slice(0, 12).padEnd(12, '0')}`.slice(0, 36),
+        kind,
+        content: `${title} 补充细节 ${'x'.repeat(30)}`,
+        importance: 8,
+      } as MemoryEntry,
+      line: '',
+    }
+  }
+
+  it('大量跳过条目超目录预算时截断并追加截断提示', () => {
+    const many = Array.from({ length: 200 }, (_, i) =>
+      skippedEntryWith('fact', `pnpm workspace 超预算条目 ${i} 区分标题`),
+    )
+    const text = renderCatalog(many)
+    expect(text).toContain('未展示的记忆目录')
+    expect(text).toContain('目录截断，可用 memory_recall 检索更多')
+    // 目录段整体不超预算上限（截断发生在 1500 字符处，截断提示叠加其后）
+    expect(text.length).toBeLessThanOrEqual(1500 + '（目录截断，可用 memory_recall 检索更多）'.length + 4)
+  })
+
+  it('预算内的少量条目正常罗列、不截断', () => {
+    const few = Array.from({ length: 3 }, (_, i) => skippedEntryWith('decision', `pnpm workspace 决策条目 ${i}`))
+    const text = renderCatalog(few)
+    expect(text).toContain('未展示的记忆目录')
+    expect(text).not.toContain('目录截断')
+    expect(text).toContain('- [decision] pnpm workspace 决策条目 0')
   })
 })
 

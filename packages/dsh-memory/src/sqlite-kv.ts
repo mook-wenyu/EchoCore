@@ -118,6 +118,11 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
     // SQLITE_BUSY 无重试窗口（SQLite 官方论坛确认 fair 默认 20 年未改）。
     // 显式 5s 等待窗口：单实例不触发（无竞争），多实例/维护撞车时有重试余地。
     this.db.exec('PRAGMA busy_timeout = 5000')
+    // R5（2026-08-16 WAL 显式 checkpoint）：默认 wal_autocheckpoint=1000 页
+    // （≈4MB）才触发内部 AUTO_CHECKPOINT，WAL 可在两次 checkpoint 间增长到
+    // 数 MB。显式压到 256 页（256×4KB≈1MB）——更频繁自动 checkpoint 控 WAL
+    // 增长；仍由 SQLite 自行调度，非阻塞（发生写才推进）。
+    this.db.exec('PRAGMA wal_autocheckpoint = 256')
     this.db.exec(
       `CREATE TABLE IF NOT EXISTS "${tableName}" (id TEXT PRIMARY KEY, value TEXT NOT NULL, content_tokens TEXT)`,
     )
@@ -167,6 +172,17 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
     return this.enqueue(() => {
       this.deleteStmt.run(key)
     }).then(() => existed)
+  }
+
+  /**
+   * R5：显式 WAL checkpoint（TRUNCATE 模式）——把 WAL 中已完成事务的帧回写
+   * 主库并回截 WAL 文件至 0 字节。供卸载/维护周期在空闲时主动调（控 WAL 增长，
+   * 不依赖 wal_autocheckpoint=256 的内部自动调度）。TRUNCATE 返回
+   * { busy, log, checkpointed } 行——busy=0 表示无其他写者挤压、全部完成；
+   * 本方法只触发（返回 void），busy 语义交由调用方在需要时用 PRAGMA 自读。
+   */
+  checkpoint(): void {
+    this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get()
   }
 
   /**

@@ -76,6 +76,27 @@ describe('O3 性能基准（数量级回归防护）', () => {
     expect(elapsed).toBeLessThan(1000)
   })
 
+  it('检索：1000 条假条目 3 段拼接查询（withScore）< 2000ms', async () => {
+    const store = new MemoryStore(new FakeTable())
+    for (let i = 0; i < 1000; i++) {
+      await store.create(makeInput(i, `session-bench-${i % 8}`, `D:/ws-${i % 4}`))
+    }
+    // 3 段拼接查询，各段 100 字符（对齐 injector P3 的拼接形态，含近 3 个百字符段）
+    const seg = '项目采用评分检索与跨会话聚合的记忆架构，pnpm workspace 管理多包并沉淀决策。'.repeat(10)
+    const hundred = seg.slice(0, 100)
+    const query = [hundred, hundred, hundred].join(' ')
+    // withScore 返回 Array<{ entry, score }>——P1 三档注入的分档依据，须单独覆盖其热路径
+    const elapsed = await timeAsync(async () => {
+      const rows = store.search({ query, limit: 8, withScore: true })
+      // withScore 形态断言：带条目的行是 { entry, score }（复合对象而非 MemoryEntry）
+      expect(rows.length).toBeGreaterThan(0)
+      expect(rows[0]?.entry).toBeDefined()
+      expect(typeof rows[0]?.score).toBe('number')
+    })
+    // 宽松阈值：只防拼接+评分路径被意外改成二次方/引入磁盘 IO 的数量级退化
+    expect(elapsed).toBeLessThan(2000)
+  })
+
   it('注入渲染：renderBudgetedPack 100 条 < 200ms', () => {
     const entries = Array.from({ length: 100 }, (_, i) => ({
       id: `mem-${i}`,

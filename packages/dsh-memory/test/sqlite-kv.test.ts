@@ -7,7 +7,7 @@
  * - 写链串行（update 原子读改写不交错）。
  */
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -161,6 +161,38 @@ describe('SqliteKvTable', () => {
     const { db } = setup(path)
     const timeout = (db.prepare('PRAGMA busy_timeout').get() as { timeout: number }).timeout
     expect(timeout).toBe(5000)
+    db.close()
+    rmSync(join(path, '..'), { recursive: true, force: true })
+  })
+
+  it('R5 wal_autocheckpoint 显式 256（256 页≈1MB，更频繁控 WAL 增长）', () => {
+    const path = tmpDbPath()
+    const { db } = setup(path)
+    const pages = (db.prepare('PRAGMA wal_autocheckpoint').get() as { wal_autocheckpoint: number }).wal_autocheckpoint
+    expect(pages).toBe(256)
+    db.close()
+    rmSync(join(path, '..'), { recursive: true, force: true })
+  })
+
+  it('R5 checkpoint()：显式 TRUNCATE 回截 WAL 文件（busy=0 全部完成）', async () => {
+    const path = tmpDbPath()
+    const { table, db } = setup(path)
+    // 产生 WAL 帧（当前只有两次小写，远低于自动阈值——WAL 文件应非空未截断）
+    await table.put('a', { id: 'a', n: 1 })
+    await table.put('b', { id: 'b', n: 2 })
+    const walPath = `${path}-wal`
+    expect(existsSync(walPath)).toBe(true)
+    const before = statSync(walPath).size
+    expect(before).toBeGreaterThan(0) // 尚未被自动 checkpoint 回截
+    // 显式 TRUNCATE checkpoint：WAL 帧回写主库并回截文件
+    table.checkpoint()
+    const after = statSync(walPath).size
+    expect(after).toBeLessThanOrEqual(before)
+    // 数据完好（checkpoint 只是落盘，不回退内存态）
+    expect(table.get('b')).toEqual({ id: 'b', n: 2 })
+    // 方法发出 TRUNCATE：随后 PRAGMA 复查 busy=0（无写者挤压，全部完成）
+    const r = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy: number; log: number; checkpointed: number }
+    expect(r.busy).toBe(0)
     db.close()
     rmSync(join(path, '..'), { recursive: true, force: true })
   })
