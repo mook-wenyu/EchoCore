@@ -369,7 +369,9 @@ export class EmbeddingService {
       throw new EmbeddingUnavailableError(`语义嵌入不可用（state=${this.stateValue}）`)
     }
     const results: Float32Array[] = []
-    const BATCH = 64
+    // 内部批次 128（用户拍板 2026-08-17，与 embed-index 的 EMBED_BATCH_SIZE 一致：
+    // 全量构建每批恰好一次请求；90s + 2 重试——瞬断不杀整批）
+    const BATCH = 128
     for (let i = 0; i < texts.length; i += BATCH) {
       const chunk = texts.slice(i, i + BATCH)
       results.push(...(await this.embedWithFallback(chunk, BATCH_FETCH_OPTS)))

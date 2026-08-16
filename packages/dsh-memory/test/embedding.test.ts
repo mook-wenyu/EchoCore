@@ -598,4 +598,122 @@ describe('EmbeddingIndex', () => {
       expect(parsed![entry.id]).toHaveLength(384)
     }
   })
+
+  it('ensureAll 批量构建：优先 embedMany（128/批，用户拍板），全部完成后落盘（2026-08-17 逐条串行性能缺陷修复）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'embed-index-batch-'))
+    try {
+      const file = join(dir, 'memory-embeddings.json')
+      let calls = 0
+      const texts: string[][] = []
+      const service = {
+        state: 'ready',
+        dimension: 384,
+        embed: async (text: string) => {
+          const v = new Float32Array(384)
+          v[0] = text.length
+          return v
+        },
+        // 批量能力：记录每批文本并返回同批向量（首位 = 1 便于断言）
+        embedMany: async (input: string[]) => {
+          calls++
+          texts.push(input)
+          return input.map(() => {
+            const v = new Float32Array(384)
+            v[0] = 1
+            return v
+          })
+        },
+      }
+      const entries = Array.from({ length: 200 }, (_, i) => ({ id: `m-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+      const index = new EmbeddingIndex({ file, service, listAll: () => entries, logWarn: () => {} })
+      await index.load()
+      await index.ensureAll()
+      // 批量路径：200 条 = 128 + 72，两次调用（128/批）
+      expect(calls).toBe(2)
+      expect(texts[0]).toHaveLength(128)
+      expect(texts[1]).toHaveLength(72)
+      // 全部落盘（buildMissing 末尾 flushPersist）
+      const { readFile } = await import('node:fs/promises')
+      const raw = await readFile(file, 'utf8')
+      const parsed = JSON.parse(raw) as Record<string, number[]>
+      expect(Object.keys(parsed)).toHaveLength(200)
+      expect(parsed['m-0']).toHaveLength(384)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('ensureAll 批量中途失败：logWarn 跳过继续，成功批已增量落盘（不整体中止零落盘）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'embed-index-batchfail-'))
+    try {
+      const file = join(dir, 'memory-embeddings.json')
+      const warns: string[] = []
+      let calls = 0
+      const service = {
+        state: 'ready',
+        dimension: 384,
+        embed: async (text: string) => {
+          const v = new Float32Array(384)
+          return v
+        },
+        embedMany: async (input: string[]) => {
+          calls++
+          if (calls === 2) throw new Error('网络错误（模拟第二批失败）')
+          return input.map(() => {
+            const v = new Float32Array(384)
+            v[0] = 1
+            return v
+          })
+        },
+      }
+      // 258 条 = 128（成功）+ 128（失败）+ 2（继续成功）——验证失败后不中止
+      const entries = Array.from({ length: 258 }, (_, i) => ({ id: `m-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+      const index = new EmbeddingIndex({ file, service, listAll: () => entries, logWarn: (message, error) => warns.push(`${message}${error instanceof Error ? error.message : String(error)}`) })
+      await index.load()
+      await index.ensureAll()
+      // 失败批次被显式记录（logWarn），不静默
+      expect(warns.some((message) => message.includes('网络错误'))).toBe(true)
+      // 成功批（第 1/3 批）已落盘；第二批失败未写入
+      const { readFile } = await import('node:fs/promises')
+      await index.flush() // 兜底落盘（含末批成功后 persist 的去抖窗口）
+      const raw = await readFile(file, 'utf8')
+      const parsed = JSON.parse(raw) as Record<string, number[]>
+      expect(parsed['m-0']).toBeDefined()
+      expect(parsed['m-128']).toBeUndefined() // 第二批失败
+      expect(parsed['m-256']).toBeDefined() // 第三批继续成功
+      expect(Object.keys(parsed)).toHaveLength(130)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('ensureAll 无 embedMany（测试注入/本地假后端）→ 回退逐条路径（既有行为不被破坏）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'embed-index-single-'))
+    try {
+      const file = join(dir, 'memory-embeddings.json')
+      let embedCalls = 0
+      const service = {
+        state: 'ready',
+        dimension: 384,
+        embed: async (text: string) => {
+          embedCalls++
+          const v = new Float32Array(384)
+          v[0] = text.length
+          return v
+        },
+      }
+      const entries = Array.from({ length: 5 }, (_, i) => ({ id: `m-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+      const index = new EmbeddingIndex({ file, service, listAll: () => entries, logWarn: () => {} })
+      await index.load()
+      await index.ensureAll()
+      expect(embedCalls).toBe(5)
+      const { readFile } = await import('node:fs/promises')
+      await index.flush()
+      const raw = await readFile(file, 'utf8')
+      const parsed = JSON.parse(raw) as Record<string, number[]>
+      expect(Object.keys(parsed)).toHaveLength(5)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

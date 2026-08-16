@@ -22,6 +22,14 @@ import type { MemoryEntry } from './types.js'
 /** R2：持久化去抖窗口（ms）——高频 indexEntry/remove 合并为一次整写 */
 export const PERSIST_DEBOUNCE_MS = 10_000
 
+/**
+ * 全量构建批量大小（用户拍板 128/批，2026-08-17）：
+ * 与 EmbeddingService.embedMany 的内部批次常量一致——每次调用恰好一批，
+ * 批次失败可独立跳过（粒度 = 一次远程请求）。原实现逐条串行远程调用
+ * （6569 条 ≈ 30min~2h）且完成才落盘、任一条失败零落盘——性能与健壮性缺陷。
+ */
+export const EMBED_BATCH_SIZE = 128
+
 /** 嵌入索引依赖 */
 export interface EmbeddingIndexDeps {
   /** 索引文件绝对路径（JSON：{ [id]: number[] }；装配层按后端维度隔离命名） */
@@ -32,6 +40,11 @@ export interface EmbeddingIndexDeps {
     /** 后端输出维度（本地 384 / 远程配置值）——索引校验与持久化按此维度 */
     dimension: number
     embed(text: string): Promise<Float32Array>
+    /**
+     * 批量嵌入（可选）：全量构建优先走批量（128/批，用户拍板）——远程后端
+     * 一次请求多条，摊薄 HTTP 往返；缺失时回退逐条（测试注入假后端）。
+     */
+    embedMany?(texts: string[]): Promise<Float32Array[]>
   }
   /** 全量构建取数（listRecent(超大 limit) 语义 = 全量 active 列表） */
   listAll(): MemoryEntry[]
@@ -111,13 +124,39 @@ export class EmbeddingIndex {
     if (this.vectors.delete(id)) this.persist()
   }
 
-  /** 逐条嵌入缺失条目并持久化（全量补齐后立即落盘——不等去抖窗口） */
+  /**
+   * 逐条嵌入缺失条目并持久化。
+   * 批量能力（embedMany，128/批）优先——远程后端一次请求多条摊薄往返；
+   * 每批完成后去抖增量落盘（失败批跳过继续——缺失条目保持纯关键词检索，
+   * 模块头显式语义）；无批量能力（测试注入假后端）回退逐条，同样逐条增量落盘。
+   * 2026-08-17 修复：原实现逐条串行远程 + 全部完成才落盘 + 任一条失败整体
+   * 中止零落盘——远程模式 6569 条需 30min~2h，中途失败进度全丢。
+   */
   private async buildMissing(): Promise<void> {
     const missing = this.deps.listAll().filter((entry) => !this.vectors.has(entry.id))
     if (missing.length === 0) return
+    const batch = this.deps.service.embedMany
+    if (batch !== undefined) {
+      for (let i = 0; i < missing.length; i += EMBED_BATCH_SIZE) {
+        const chunk = missing.slice(i, i + EMBED_BATCH_SIZE)
+        try {
+          const vectors = await batch(chunk.map((entry) => entry.content))
+          chunk.forEach((entry, j) => this.vectors.set(entry.id, Array.from(vectors[j]!)))
+        } catch (error) {
+          // 批次失败显式记录并继续下一批——缺失条目保持纯关键词检索（显式语义，
+          // 非吞错：全部失败时 ensureAll 也通过 warn 透出）
+          this.deps.logWarn(`[dsh-memory] 嵌入批次失败（${chunk.length} 条保持纯关键词检索）：`, error)
+        }
+        this.persist() // 增量落盘（去抖 10s 合并；失败批未 set → 不写该批）
+      }
+      await this.flushPersist() // 兜底末批落盘
+      return
+    }
+    // 无批量能力（测试注入假后端）：逐条回退（既有路径）——同样增量落盘
     for (const entry of missing) {
       const vector = await this.deps.service.embed(entry.content)
       this.vectors.set(entry.id, Array.from(vector))
+      this.persist()
     }
     await this.flushPersist()
   }
