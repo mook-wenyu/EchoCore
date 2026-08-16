@@ -74,3 +74,11 @@ export const Config = z.object({
 // 类型断言理由：schemastery 的 object 返回 Schema<ObjectS, ObjectT>（输入形态含
 // null），与 z<Config> 的 meta.default 结构不兼容——输出在运行时经 default 填充，
 // 断言只收窄类型不改变行为（与 R2-4/B4 的显式解析同语义）。
+// 宿主契约修复（2026-08-16，用户实测"保存配置报 Cannot read properties of
+// undefined (reading 'meta')"）：cordis-plugin-loader 的 internal/update 写回路径
+// 以裸引用调用 `Config["simplify"](config)`——schemastery 的 simplify 是原型方法
+// 依赖 this，裸调用 this=undefined → `this.meta` 崩。导出时绑定 this（KISS：
+// 一处修复满足宿主调用契约；宿主行为不变——正常调用与裸调用等价）。
+;(Config as unknown as { simplify: (value: unknown) => unknown }).simplify = (
+  Config as unknown as { simplify: (value: unknown) => unknown }
+).simplify.bind(Config)
