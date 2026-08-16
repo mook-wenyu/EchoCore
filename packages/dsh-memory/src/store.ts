@@ -20,6 +20,7 @@ import { relevanceScore, rrfScore, timeImportanceFactor, tokenize } from './scor
 import {
   dedupKeyOf,
   newMemoryId,
+  normalizeContent,
   type AuditActor,
   type MemoryEntry,
   type MemoryKind,
@@ -27,6 +28,7 @@ import {
   type MemoryStatus,
   type NewMemoryInput,
 } from './types.js'
+import { EXTRACTOR_IMPORTANCE_FLOOR, EXTRACTOR_MIN_TOKENS } from './constants.js'
 
 /** 检索选项 */
 export interface SearchOptions {
@@ -55,6 +57,9 @@ export interface SearchOptions {
    * 任一项缺失则退回纯关键词路径。
    */
   queryEmbedding?: ArrayLike<number>
+  /** P1（2026-08-16 三档注入）：置真时返回带综合分的条目（`{ entry, score }[]`）——
+   * 注入器需要按分数分档（≥0.7 全量 / 0.4-0.7 摘要 / <0.4 跳过） */
+  withScore?: boolean
   /** 条目向量查找（id → 384 维向量；undefined = 尚无嵌入，该条目只用关键词分） */
   lookupEmbedding?: (id: string) => number[] | undefined
 }
@@ -86,6 +91,10 @@ export interface MergeOutcome {
   merged: boolean
   /** 命中的既有条目 id */
   existingId?: string
+  /** P2 写端门：extractor 通道的输入被质量门拒绝（未落库、无审计记录）。 */
+  rejected?: boolean
+  /** P2 写端门拒绝原因（rejected 为 true 时存在，供观测方计数/诊断） */
+  reason?: string
 }
 
 /** 时间戳生成（集中管理，便于测试注入固定时间） */
@@ -208,6 +217,27 @@ export class MemoryStore {
    * 若未来引入并发写入，需先加写入互斥。
    */
   async create(input: NewMemoryInput): Promise<{ entry: MemoryEntry; outcome: MergeOutcome }> {
+    // P2 写端门（Selective Memory arXiv:2603.15994：写时质量门结构性优于读时过滤）。
+    // 只拦 extractor 通道（LLM 提取）的明显噪声——它是唯一可能产生噪声的写入通道；
+    // note/tool、snapshot/system 等显式意图通道不设门。被拒不抛错（提取失败不应
+    // 中断提取链路），由 outcome.rejected 向调用方暴露。被拒不是记忆生命周期事件：
+    // 不落库、不建去重索引、不写审计、不递增 revision——观测仅来自该 outcome 标记。
+    if (input.by === 'extractor') {
+      const importance = input.importance ?? 5
+      if (importance < EXTRACTOR_IMPORTANCE_FLOOR) {
+        return this.rejectedOutcome(
+          input,
+          `写端门：零价值（importance=${importance} < ${EXTRACTOR_IMPORTANCE_FLOOR}，LLM 明确判无价值）`,
+        )
+      }
+      if (tokenize(normalizeContent(input.content)).length < EXTRACTOR_MIN_TOKENS) {
+        return this.rejectedOutcome(
+          input,
+          `写端门：纯噪声（规范化后 token 数 < ${EXTRACTOR_MIN_TOKENS}）`,
+        )
+      }
+    }
+
     const dedupKey = dedupKeyOf(input.content)
     // 归并索引粒度含 kind：跨分类的同内容不合并（O3）
     const indexKey = dedupIndexKey(input.workspace, input.kind, dedupKey)
@@ -275,6 +305,35 @@ export class MemoryStore {
     // P4：嵌入索引联动（新建内容已落库；合并路径内容不变不触发）
     this.hooks?.onCreate?.(entry)
     return { entry, outcome: { merged: false } }
+  }
+
+  /**
+   * P2 写端门拒绝结果：返回带 `rejected: true` 的 outcome，且**不持久化**——
+   * 不调 table.put、不建 byDedupKey 索引、不写 audit、不递增 revision、不触发任何
+   * hooks（onCreate/onSupersede）。返回的 `entry` 仅为满足 create 返回类型契约
+   * （extractor 忽略返回值；note/snapshot 为显式意图通道永不触门，不会读到该占位）；
+   * 调用方必须以 outcome.rejected 为权威判定"未落库"，绝不可把该占位当作真实条目。
+   */
+  private rejectedOutcome(input: NewMemoryInput, reason: string): { entry: MemoryEntry; outcome: MergeOutcome } {
+    const nowIso = this.iso()
+    const placeholder: MemoryEntry = {
+      id: newMemoryId(),
+      workspace: input.workspace,
+      sessionId: input.sessionId,
+      kind: input.kind,
+      content: input.content,
+      importance: input.importance ?? 5,
+      tags: input.tags ?? [],
+      source: input.source,
+      dedupKey: dedupKeyOf(input.content),
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      lastAccessAt: nowIso,
+      accessCount: 0,
+      status: 'active',
+      audit: [],
+    }
+    return { entry: placeholder, outcome: { merged: false, rejected: true, reason } }
   }
 
   /**
@@ -368,14 +427,18 @@ export class MemoryStore {
   }
 
   /**
-   * 检索（同步返回）。
+   * 检索（同步返回）。withScore 置真时返回 `Array<{ entry, score }>`（P1 三档
+   * 注入分档用）——排序后 Top-K 保留综合分；其余语义与无分数路径完全一致
+   * （含访问追踪回写）。
    * - 有查询文本：综合评分降序（最低分过滤）；
-   * - 无查询文本但有过滤条件：按创建时间倒序（工具浏览场景）；
+   * - 无查询文本但有过滤条件：按创建时间倒序（工具浏览场景；withScore 时分数恒 0）；
    * - 两者皆无：空结果。
    * 默认排除被覆盖条目（D-A）；includeSuperseded 置真时可见。
    * 命中条目节流回写 lastAccessAt/accessCount（O6，60s 窗口内同会话+记忆至多落盘一次）。
    */
-  search(options: SearchOptions): MemoryEntry[] {
+  search(options: SearchOptions & { withScore: true }): Array<{ entry: MemoryEntry; score: number }>
+  search(options: SearchOptions): MemoryEntry[]
+  search(options: SearchOptions): MemoryEntry[] | Array<{ entry: MemoryEntry; score: number }> {
     const query = options.query.trim()
     const limit = options.limit ?? 8
     const minScore = options.minScore ?? 0.15
@@ -402,6 +465,8 @@ export class MemoryStore {
     }
 
     let top: MemoryEntry[]
+    // P1：评分数组（withScore 时与 top 同序同截取——分数与条目一一对应）
+    let scored: Array<{ entry: MemoryEntry; score: number }> = []
     if (query === '') {
       if (options.kind === undefined && options.tag === undefined && options.status === undefined && options.workspace === undefined) {
         return [] // 无查询也无过滤：不返回无差别结果
@@ -410,7 +475,6 @@ export class MemoryStore {
       matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
       top = matches.slice(0, limit)
     } else {
-      const scored: Array<{ entry: MemoryEntry; score: number }> = []
       // P4+B1 语义融合：提供查询向量与条目向量查找时，两路排名（关键词
       // relevance / 语义 cosine）经 RRF 融合——排名融合免疫两路分数尺度差异，
       // 零重合高语义相关条目可单榜上榜（P4 意图保持）。
@@ -474,6 +538,11 @@ export class MemoryStore {
         .catch((error: unknown) => {
           console.warn(`[dsh-memory] 访问追踪回写失败（记忆 ${entry.id}）：`, error)
         })
+    }
+    // P1：withScore 返回带分条目（top 与 scored 同序同截取——分数一一对应）
+    if (options.withScore === true) {
+      const topScored = scored.slice(0, limit)
+      return top.map((entry, index) => ({ entry, score: topScored[index]?.score ?? 0 }))
     }
     return top
   }

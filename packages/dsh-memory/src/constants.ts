@@ -23,6 +23,23 @@ export const MEMORY_INJECTION_HEADER =
   '记忆可能过时或被覆盖，以当前对话与代码库为准；可用 memory_audit 追问依据）'
 
 /**
+ * P2 写端门：extractor 通道的零下游重要度下限（Selective Memory arXiv:2603.15994
+ * 理念——写时质量门结构性优于读时过滤）。
+ * importance ≥ 1 才通过；importance 0 是 LLM 某条提取输出的下限，代表"明确判无
+ * 价值"——不写入。门只作用于 extractor（LLM 提取是唯一可能产生噪声的通道）；
+ * note/tool、snapshot/system 等显式意图通道不设门。
+ */
+export const EXTRACTOR_IMPORTANCE_FLOOR = 1
+
+/**
+ * P2 写端门：extractor 通道的纯噪声阈值——规范化后（normalizeContent）token 数
+ * 少于该值即拒绝。token 数用 tokenize(normalizeContent(content)) 计算：
+ * 空串 / 纯标点 / 单字会被拦截，但"N 字符但合法短事实"仍通过（保守防误杀——
+ * 短但合法的事实如"用户用中文"有真实写入价值，不误拦）。
+ */
+export const EXTRACTOR_MIN_TOKENS = 2
+
+/**
  * 会话短 id：去 `session-` 前缀后取前 8 位。
  * 会话 id 形如 `session-63bbf845-9e8d-…`——直接 slice(0,8) 只截到前缀本身，
  * 渲染出的"来自会话 session-"毫无区分度（用户报告 bug）。本函数取 uuid 主体

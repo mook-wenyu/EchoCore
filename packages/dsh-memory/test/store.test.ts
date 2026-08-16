@@ -98,6 +98,58 @@ describe('MemoryStore.create', () => {
   })
 })
 
+/**
+ * P2 写端门（Selective Memory arXiv:2603.15994：写时质量门结构性优于读时过滤）。
+ * 只拦 extractor 通道（LLM 提取，唯一可能产生噪声的通道）的明显噪声；
+ * 被拒不抛错、不落库、无审计——outcome.rejected + reason 是唯一观测面。
+ */
+describe('MemoryStore P2 写端门（extractor 通道）', () => {
+  it('零价值：extractor importance=0 → rejected 且不落库（含 reason）', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    const res = await store.create(input({ importance: 0 }))
+    expect(res.outcome.rejected).toBe(true)
+    expect(res.outcome.reason).toMatch(/写端门：零价值/)
+    // 未落库：表内无条目、dedup 不占位
+    expect(store.stats().total).toBe(0)
+    expect(store.getById(res.entry.id)).toBeUndefined()
+  })
+
+  it('纯噪声：extractor 规范化后 token 数 < 2 → rejected（单字被拦）', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    const res = await store.create(input({ content: '好' }))
+    expect(res.outcome.rejected).toBe(true)
+    expect(res.outcome.reason).toMatch(/写端门：纯噪声/)
+    expect(store.stats().total).toBe(0)
+  })
+
+  it('纯噪声：空串 / 纯标点同样被拦', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    const res = await store.create(input({ content: '……' }))
+    expect(res.outcome.rejected).toBe(true)
+    expect(res.outcome.reason).toMatch(/写端门：纯噪声/)
+    expect(store.stats().total).toBe(0)
+  })
+
+  it('合法短事实不误杀：importance≥1 且 token 数≥2 正常入库', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    // importance=1 但内容是合法短事实（≥2 token：「用户」「中文」）——门只拦明显噪声
+    const res = await store.create(input({ content: '用户用中文', importance: 1 }))
+    expect(res.outcome.rejected).toBeUndefined()
+    expect(res.outcome.merged).toBe(false)
+    expect(store.stats().total).toBe(1)
+    expect(store.getById(res.entry.id)).toBeDefined()
+  })
+
+  it('note 通道不受门影响：importance=0 显式意图照常入库', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    // by='tool'（memory_note）——写端门只作用于 extractor，显式意图不设限
+    const res = await store.create(input({ by: 'tool', importance: 0, content: '临时占位标记' }))
+    expect(res.outcome.rejected).toBeUndefined()
+    expect(store.stats().total).toBe(1)
+    expect(store.getById(res.entry.id)?.importance).toBe(0)
+  })
+})
+
 describe('MemoryStore 状态流转', () => {
   it('update 修改字段并追加审计；不存在返回 undefined', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
@@ -207,6 +259,34 @@ describe('MemoryStore.search', () => {
     expect(results[0]?.content).toBe('pnpm workspace 管理多包')
   })
 
+  it('P1 withScore：返回带综合分条目（与 Top-K 同序同截取，分数降序）', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    await store.create(input({ content: 'pnpm workspace 管理多包', importance: 9 }))
+    await store.create(input({ content: 'pnpm 版本管理', importance: 1 }))
+    await store.create(input({ content: 'vite 构建', importance: 5 }))
+
+    const scored = store.search({ query: 'pnpm workspace', limit: 3, withScore: true })
+    // 'vite 构建' 与查询零重合 → relevance 0 → 被默认 minScore 过滤（语义正确）
+    expect(scored).toHaveLength(2)
+    // 分数与条目一一对应且降序（与无分数路径的 top 顺序一致）
+    expect(scored[0]?.entry.content).toBe('pnpm workspace 管理多包')
+    expect(scored[0]!.score).toBeGreaterThanOrEqual(scored[1]!.score)
+    // 分数 = relevance × timeImportance：全命中条目分数 > 部分命中
+    expect(scored[0]!.score).toBeGreaterThan(scored[1]!.score)
+    // 与无分数路径的 Top-K 一致（同一排序）
+    const plain = store.search({ query: 'pnpm workspace', limit: 3 })
+    expect(plain.map((e) => e.id)).toEqual(scored.map((item) => item.entry.id))
+  })
+
+  it('P1 withScore 浏览路径（空查询）：分数恒 0 但条目正常返回', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    await store.create(input({ content: 'pnpm workspace 管理多包' }))
+    const scored = store.search({ query: '', kind: 'fact', withScore: true })
+    expect(scored).toHaveLength(1)
+    expect(scored[0]?.entry.content).toBe('pnpm workspace 管理多包')
+    expect(scored[0]?.score).toBe(0)
+  })
+
   it('kind 过滤生效', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
     await store.create(input({ kind: 'todo', content: '待办：重构评分模块' }))
@@ -237,7 +317,9 @@ describe('MemoryStore.search', () => {
 
   it('低于最低分的弱命中被过滤', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
-    await store.create(input({ content: 'pnpm workspace', importance: 0 }))
+    // importance=1 而非 0：0 会被 P2 写端门拒绝而不落库（见写端门用例），
+    // 此处需真实入库再验证 minScore 过滤逻辑本身
+    await store.create(input({ content: 'pnpm workspace', importance: 1 }))
     const results = store.search({ query: 'pnpm workspace 完全不相关的词', minScore: 0.5 })
     expect(results).toEqual([])
   })
@@ -262,12 +344,13 @@ describe('MemoryStore 统计与列表', () => {
   it('listBySession 按会话过滤并按创建时间升序', async () => {
     let clock = FIXED_NOW
     const store = new MemoryStore(new FakeTable(), () => clock)
-    await store.create(input({ sessionId: 's1', content: '甲' }))
-    clock += 1000 // 推进时钟：'甲' 严格早于 '丙'，验证「创建时间升序」而非依赖 id 排序
-    await store.create(input({ sessionId: 's2', content: '乙' }))
-    await store.create(input({ sessionId: 's1', content: '丙' }))
+    // 内容用 ≥2 token 的合法短事实（P2 写端门不拒；单字如「甲」会被拒而不落库）
+    await store.create(input({ sessionId: 's1', content: '甲状态' }))
+    clock += 1000 // 推进时钟：'甲状态' 严格早于 '丙状态'，验证「创建时间升序」而非依赖 id 排序
+    await store.create(input({ sessionId: 's2', content: '乙状态' }))
+    await store.create(input({ sessionId: 's1', content: '丙状态' }))
     const list = store.listBySession('s1')
-    expect(list.map((e) => e.content)).toEqual(['甲', '丙'])
+    expect(list.map((e) => e.content)).toEqual(['甲状态', '丙状态'])
   })
 })
 
@@ -407,9 +490,10 @@ describe('MemoryStore 排序 tie-breaker（O3）', () => {
   it('createdAt 相同时按 id 稳定排序（search 空查询 / listBySession / listRecent）', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
     idSeq = ['mem-c', 'mem-a', 'mem-b']
-    const a = (await store.create(input({ content: '甲' }))).entry
-    const b = (await store.create(input({ content: '乙' }))).entry
-    const c = (await store.create(input({ content: '丙' }))).entry
+    // 内容用合法短事实（≥2 token：P2 写端门不拒；单字如「甲」会被拒而不落库）
+    const a = (await store.create(input({ content: '甲乙丙' }))).entry
+    const b = (await store.create(input({ content: '丁戊己' }))).entry
+    const c = (await store.create(input({ content: '庚辛壬' }))).entry
     // 固定时钟 → 三者 createdAt 相同
     expect(a.createdAt).toBe(b.createdAt)
     expect(b.createdAt).toBe(c.createdAt)
