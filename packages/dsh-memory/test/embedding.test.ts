@@ -164,6 +164,33 @@ describe('EmbeddingService 状态机（远程优先回退本地）', () => {
     expect(service.state).toBe('disabled')
   })
 
+  it('远程验证失败回退本地时记录 lastInitError（2026-08-17 面板"已解析可用但远程未生效"静默根因——状态可见化）', async () => {
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      remote: remoteConfig,
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: async () => {
+        throw new Error('远程嵌入返回维度 1024 ≠ 配置维度 2048（请核对 embeddingDimension 并删除旧嵌入索引重建）')
+      },
+    })
+    await service.init()
+    expect(service.state).toBe('ready')
+    expect(service.dimension).toBe(384)
+    // 回退原因必须可读（面板据此展示"远程未生效"），不允许静默
+    expect(service.lastInitError).toContain('维度')
+    // 下一次 init 重置（配置修正后热换不再携带陈旧原因）
+    const service2 = new EmbeddingService({
+      modelDir: '/models',
+      remote: remoteConfig,
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: fakeRemote,
+    })
+    await service2.init()
+    expect(service2.lastInitError).toBeUndefined()
+  })
+
   it('本地模型存在但加载失败 → error（模型损坏是异常，区别于无模型）', async () => {
     const service = new EmbeddingService({
       modelDir: '/models',
@@ -248,6 +275,25 @@ describe('remoteEmbedFetch 超时与重试', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     const [, init] = fetchMock.mock.calls[0]!
     expect((init as { signal?: AbortSignal }).signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('请求体携带 dimensions=配置维度（2026-08-17 实测根因：不带时端点回默认维度，与配置不匹配被强校验拦截并静默回退本地）', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    // 2048 维假响应（与配置维度一致，先通过维度校验再断言请求体）
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      async text() {
+        return ''
+      },
+      async json() {
+        return { data: [{ embedding: new Array(2048).fill(1) }] }
+      },
+    } as never)
+    await remoteEmbedFetch(['测试'], { ...remoteConfig, dimension: 2048 }, { retries: 0 })
+    const [, init] = fetchMock.mock.calls[0]!
+    const body = JSON.parse((init as { body?: string }).body ?? '{}') as { dimensions?: number }
+    expect(body.dimensions).toBe(2048)
   })
 
   it('网络层失败（TypeError fetch failed）→ 指数退避重试后成功', async () => {

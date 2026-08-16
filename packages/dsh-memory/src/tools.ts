@@ -41,6 +41,10 @@ export interface RuntimeHealth {
   writeFailures: number
   embeddingState: string
   lastMaintenanceAt: string | null
+  /** 当前嵌入后端标签（'remote' | 'local'；未就绪缺席）——面板展示真实后端（2026-08-17 状态可见化） */
+  embeddingBackend?: string
+  /** 最近一次初始化期远程验证失败原因（远程未生效时展示，杜绝静默回退） */
+  embeddingInitError?: string
 }
 
 /** 记忆条目的最小规范形态（工具输出与 RPC 共用） */

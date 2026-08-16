@@ -205,7 +205,17 @@ export async function remoteEmbedFetch(
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify({ model: config.model, input, encoding_format: 'float' }),
+        body: JSON.stringify({
+          model: config.model,
+          input,
+          encoding_format: 'float',
+          // 显式声明输出维度（2026-08-17 实测根因：不带 dimensions 时端点回
+          // 默认维度（qwen3.7-text-embedding=1024），与配置维度不符被下方强校验
+          // 拦截并静默回退本地——面板显示 ready 但远程从未生效）。OpenAI
+          // text-embedding-3 与阿里云百炼 qwen3 系列 OpenAI 兼容端点均支持；
+          // 老端点若不支持会报 400 → 走既有回退链（明确失败而非静默降级）。
+          dimensions: config.dimension,
+        }),
         // 显式超时：Node fetch 默认无整体超时，挂起端点会把保存/检索/启动无限卡死
         signal: AbortSignal.timeout(timeoutMs),
       })
@@ -253,6 +263,12 @@ export class EmbeddingService {
   private dimensionValue: number = LOCAL_EMBEDDING_DIMENSION
   /** 初始化 promise（并发 init 去重；失败后重置以便重试） */
   private initPromise: Promise<void> | undefined
+  /**
+   * 最近一次初始化期远程验证失败原因（状态可见化，2026-08-17 用户拍板）：
+   * bootstrap 远程验证失败回退本地/禁用时记录——面板据此展示"远程未生效"，
+   * 不静默降级。每次 init 开始重置（配置修正后热换不携带陈旧原因）。
+   */
+  lastInitError: string | undefined
 
   private readonly hasLocalModel: () => Promise<boolean>
   private readonly loadLocalBackend: () => Promise<LocalEmbeddingBackend>
@@ -294,6 +310,8 @@ export class EmbeddingService {
    */
   async init(): Promise<void> {
     if (this.initPromise !== undefined) return this.initPromise
+    // 每次初始化重置陈旧失败原因（配置修正后热换不携带上次的降级原因）
+    this.lastInitError = undefined
     this.stateValue = 'loading'
     this.initPromise = this.bootstrap().catch((error: unknown) => {
       this.stateValue = 'error'
@@ -319,8 +337,10 @@ export class EmbeddingService {
         this.dimensionValue = remote.dimension
         this.stateValue = 'ready'
         return
-      } catch {
-        // 远程验证失败 → 回退本地（若本地模型存在）
+      } catch (error) {
+        // 远程验证失败 → 记录原因（状态可见化：面板展示"远程未生效"而非
+        // 静默回退本地）→ 按既有优先级回退本地模型（若存在）
+        this.lastInitError = error instanceof Error ? error.message : String(error)
       }
     }
     if (await this.hasLocalModel()) {

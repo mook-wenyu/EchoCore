@@ -54,6 +54,10 @@ export interface MemoryStatsView {
    */
   writeFailures?: number
   embeddingState?: string
+  /** 当前嵌入后端标签（'remote' | 'local'；状态可见化——区分 ready(remote) 与 ready(local) 顶班） */
+  embeddingBackend?: string
+  /** 最近一次远程验证失败原因（远程未生效时展示，杜绝静默回退） */
+  embeddingInitError?: string
   lastMaintenanceAt?: string | null
 }
 
@@ -233,13 +237,20 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
     [props.api, deriveWorkspaces],
   )
 
+  const refreshStats = React.useCallback((): void => {
+    void props.api
+      .status()
+      .then(setStats)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+  }, [props.api])
+
   React.useEffect(() => {
     void refresh('', '', '')
-    void props.api.status().then(setStats).catch((err) => setError(err instanceof Error ? err.message : String(err)))
+    refreshStats()
     return () => {
       requestSeq.current++ // 卸载清理：作废未决请求
     }
-  }, [refresh, props.api])
+  }, [refresh, refreshStats, props.api])
 
   const openDetail = async (id: string): Promise<void> => {
     const seq = ++requestSeq.current
@@ -298,7 +309,19 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
             ? React.createElement('div', { style: { ...statsStyle, ...warnStyle } }, `写失败 ${stats.writeFailures} 次`)
             : null,
           stats.embeddingState !== undefined
-            ? React.createElement('div', { style: metaStyle }, `嵌入状态：${stats.embeddingState}`)
+            ? // 状态可见化（2026-08-17 实测根因）：ready 不等于"远程已生效"——
+              // 远程验证失败会静默回退本地。有后端标签则展示真实后端；有失败
+              // 原因则加警告行，不再让用户对着 ready 困惑"配置写了为何没生效"
+              React.createElement(
+                'div',
+                { style: metaStyle },
+                `嵌入状态：${stats.embeddingState}${stats.embeddingBackend !== undefined ? `（后端：${stats.embeddingBackend}）` : ''}`,
+              )
+            : null,
+          stats.embeddingInitError !== undefined
+            ? // 远程验证曾失败（回退本地/禁用）——原因必须可见（lastInitError 仅在
+              // 远程失败时存在，与 state 无关：ready=本地顶班、disabled=远程失败且无本地）
+              React.createElement('div', { style: { ...metaStyle, ...warnStyle } }, `远程嵌入未生效：${stats.embeddingInitError}`)
             : null,
           stats.lastMaintenanceAt !== undefined && stats.lastMaintenanceAt !== null
             ? React.createElement('div', { style: metaStyle }, `上次维护：${stats.lastMaintenanceAt}`)
@@ -335,8 +358,8 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
     error !== '' ? React.createElement('div', { style: errorStyle }, error) : null,
     React.createElement('div', { style: listStyle }, rows.length > 0 ? rows : React.createElement('div', null, '（暂无记忆）')),
     selected !== undefined ? React.createElement(DetailPane, { entry: selected, onArchive: () => void doArchive(selected.id) }) : null,
-    // 配置区块（面板底部）：当前生效配置表单 + 保存（持久化到 settings.yaml 并重启插件生效）
-    React.createElement(ConfigPane, { api: props.api }),
+    // 配置区块（面板底部）：当前生效配置表单 + 保存（持久化到 settings.yaml 并实时热换生效）
+    React.createElement(ConfigPane, { api: props.api, onSaved: refreshStats }),
   )
 }
 
@@ -366,7 +389,7 @@ const CONFIG_FIELDS: ConfigFieldDef[] = [
 ]
 
 /** 配置区块：草稿表单 + 保存（仅提交变更项） + 生效提示 */
-function ConfigPane(props: { api: MemoryPanelApi }): React.ReactElement {
+function ConfigPane(props: { api: MemoryPanelApi; onSaved?: () => void }): React.ReactElement {
   // 草稿：字段 → 字符串（输入框统一字符串态，保存时按字段类型转换）
   const [draft, setDraft] = React.useState<Record<string, string>>({})
   const [resolved, setResolved] = React.useState(false)
@@ -410,9 +433,13 @@ function ConfigPane(props: { api: MemoryPanelApi }): React.ReactElement {
       // 保存成功 = 宿主已校验、已持久化到 settings.yaml（~/.dsh/settings.yaml——
       // 原写回 cordis.patch.yml 的链路在重启后被 prepareProfile 重置清空，
       // 2026-08-16 实测根因）并实时热换嵌入后端生效（不重启插件——重启与
-      // apply 秒级异步段竞态，二次实测 fatal load failure 根因）
-      setNotice('已保存并生效（已持久化到 settings.yaml，嵌入后端已热切换；注入/提取/嵌入按新配置运行）')
+      // apply 秒级异步段竞态，二次实测 fatal load failure 根因）。
+      // 生效结果以顶部「嵌入状态」行为准（状态可见化：ready(local)=本地顶班、
+      // 远程未生效原因显式展示）——文案不写死"已热切换"
+      setNotice('已保存并生效（已持久化到 settings.yaml；嵌入后端状态见上方「嵌入状态」行）')
       setResolved(config.embeddingApiKeyResolved)
+      // 保存后刷新顶部统计行（嵌入后端/失败原因实时可见——状态可见化）
+      props.onSaved?.()
     } catch (err) {
       setNotice(err instanceof Error ? err.message : String(err))
     }

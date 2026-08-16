@@ -171,6 +171,38 @@ describe('memory RPC 端点', () => {
     if (!result.ok) return
     expect((result.value as { total: number }).total).toBe(1)
   })
+
+  it('status：透出嵌入后端标签与远程验证失败原因（2026-08-17 状态可见化——杜绝"ready 但远程未生效"静默）', async () => {
+    const { store, handler } = setup()
+    // runtime 注入：当前后端 local 顶班 + 远程验证失败原因（本根因场景）
+    const withRuntime = createMemoryRpcHandler(store, {
+      config: () => ({ ...DEFAULTS }) as ResolvedConfig,
+      settings: { update: async () => {} },
+      applyChange: async () => {},
+    }, {
+      writeFailures: 0,
+      embeddingState: 'ready',
+      lastMaintenanceAt: null,
+      embeddingBackend: 'local',
+      embeddingInitError: '远程嵌入返回维度 1024 ≠ 配置维度 2048（请核对 embeddingDimension 并删除旧嵌入索引重建）',
+    })
+    const result = await withRuntime('status', null)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const value = result.value as { embeddingBackend?: string; embeddingInitError?: string }
+    expect(value.embeddingBackend).toBe('local')
+    expect(value.embeddingInitError).toContain('维度')
+  })
+
+  it('status：无 runtime（测试直连）时不带可见化字段（可选访问，不影响旧宿主）', async () => {
+    const { store, handler } = setup()
+    const result = await handler('status', null)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const value = result.value as { embeddingBackend?: string; embeddingInitError?: string }
+    expect(value.embeddingBackend).toBeUndefined()
+    expect(value.embeddingInitError).toBeUndefined()
+  })
 })
 
 describe('memory RPC 载荷校验', () => {

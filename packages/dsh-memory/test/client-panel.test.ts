@@ -39,12 +39,14 @@ function fakeApi(overrides?: Partial<MemoryPanelApi>): MemoryPanelApi {
     }),
     getConfig: async () => ({
       embeddingApiBaseUrl: '',
+      embeddingApiKey: 'sk-old',
       embeddingApiKeyResolved: false,
       embeddingModel: '',
       embeddingDimension: 1024,
     }),
     setConfig: async () => ({
       embeddingApiBaseUrl: '',
+      embeddingApiKey: 'sk-old',
       embeddingApiKeyResolved: false,
       embeddingModel: '',
       embeddingDimension: 1024,
@@ -128,6 +130,69 @@ describe('MemoryPanel 组件行为（jsdom）', () => {
       await waitFor(() => expect(screen.getByText(/写失败 3 次/)).toBeTruthy())
       expect(screen.getByText(/嵌入状态：ready/)).toBeTruthy()
       expect(screen.getByText(/上次维护：2026-08-16/)).toBeTruthy()
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('状态可见化（2026-08-17）：ready(local) 顶班 + 远程验证失败原因显式展示——不再静默', async () => {
+    const status = vi.fn(async () => ({
+      total: 0,
+      active: 0,
+      archived: 0,
+      byKind: { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 },
+      writeFailures: 0,
+      embeddingState: 'ready',
+      embeddingBackend: 'local',
+      embeddingInitError: '远程嵌入返回维度 1024 ≠ 配置维度 2048（请核对 embeddingDimension 并删除旧嵌入索引重建）',
+      lastMaintenanceAt: null,
+      rejectedCount: 0,
+    }))
+    const view = render(React.createElement(MemoryPanel, { api: fakeApi({ status }), close: () => {} }))
+    try {
+      await waitFor(() => expect(screen.getByText(/嵌入状态：ready（后端：local）/)).toBeTruthy())
+      expect(screen.getByText(/远程嵌入未生效：.*维度/)).toBeTruthy()
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('保存后刷新统计行（onSaved——嵌入后端状态实时可见，2026-08-17 状态可见化）', async () => {
+    const status = vi.fn(async () => ({
+      total: 0,
+      active: 0,
+      archived: 0,
+      byKind: { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 },
+      writeFailures: 0,
+      embeddingState: 'disabled',
+      lastMaintenanceAt: null,
+      rejectedCount: 0,
+    }))
+    const setConfig = vi.fn(async () => ({
+      embeddingApiBaseUrl: 'https://b.example/v1',
+      embeddingApiKey: 'sk-old',
+      embeddingApiKeyResolved: true,
+      embeddingModel: 'm',
+      embeddingDimension: 1024,
+    }))
+    const getConfig = vi.fn(async () => ({
+      embeddingApiBaseUrl: 'https://a.example/v1',
+      embeddingApiKey: 'sk-old',
+      embeddingApiKeyResolved: true,
+      embeddingModel: 'm',
+      embeddingDimension: 1024,
+    }))
+    const view = render(React.createElement(MemoryPanel, { api: fakeApi({ status, setConfig, getConfig }), close: () => {} }))
+    try {
+      await waitFor(() => expect(status.mock.calls.length).toBeGreaterThan(0))
+      const before = status.mock.calls.length
+      // 修改 Base URL 输入框 → 与初始草稿不同（有变更项）
+      fireEvent.change(screen.getByDisplayValue('https://a.example/v1'), { target: { value: 'https://b.example/v1' } })
+      fireEvent.click(screen.getByText('保存'))
+      await waitFor(() => expect(setConfig).toHaveBeenCalledWith({ embeddingApiBaseUrl: 'https://b.example/v1' }), { timeout: 2000 })
+      // 保存成功后 onSaved 触发 status 二次刷新（顶部嵌入状态行实时更新）
+      await waitFor(() => expect(status.mock.calls.length).toBeGreaterThan(before), { timeout: 2000 })
+      expect(screen.getByText(/已保存并生效/)).toBeTruthy()
     } finally {
       view.unmount()
     }

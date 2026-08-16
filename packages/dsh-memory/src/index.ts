@@ -290,6 +290,14 @@ export async function mountMemory(
     get embeddingState() {
       return holder.service?.state ?? 'disabled'
     },
+    // 当前后端标签（状态可见化：面板区分 ready(remote) 与 ready(local) 顶班）
+    get embeddingBackend() {
+      return holder.service?.backendLabel
+    },
+    // 最近一次远程验证失败原因（远程未生效时展示，杜绝静默回退——2026-08-17 实测根因）
+    get embeddingInitError() {
+      return holder.service?.lastInitError
+    },
     lastMaintenanceAt: maintenance.lastRunAt,
   }
 

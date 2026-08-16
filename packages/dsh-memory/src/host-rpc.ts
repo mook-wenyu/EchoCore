@@ -76,6 +76,10 @@ export function createMemoryRpcHandler(store: MemoryStore, rpc: MemoryRpcContext
           ...stats,
           writeFailures: runtime?.writeFailures ?? stats.writeFailures,
           embeddingState: runtime?.embeddingState ?? stats.embeddingState,
+          // 状态可见化（2026-08-17）：后端标签 + 远程验证失败原因——面板据此
+          // 展示"ready(local) 顶班 / 远程未生效"，杜绝静默降级
+          embeddingBackend: runtime?.embeddingBackend,
+          embeddingInitError: runtime?.embeddingInitError,
           lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
         })
       }
