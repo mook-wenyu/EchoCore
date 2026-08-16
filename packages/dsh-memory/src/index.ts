@@ -21,7 +21,7 @@ import { Config, DEFAULTS, type Config as ConfigType, type ResolvedConfig } from
 import { EmbeddingIndex } from './embed-index.js'
 import { EmbeddingService, EmbeddingUnavailableError, resolveApiKey } from './embedding.js'
 import { MemoryExtractor } from './extractor.js'
-import { registerMemoryRpc } from './host-rpc.js'
+import { registerMemoryRpc, type MemoryRpcContext } from './host-rpc.js'
 import { MemoryInjector } from './injector.js'
 import { MemoryMaintenance } from './maintenance.js'
 import { MEMORY_TABLE, memoryEntrySchema } from './memory-domain.js'
@@ -29,6 +29,7 @@ import { registerSnapshot } from './snapshot.js'
 import { migrateMemoryJson, SqliteKvTable } from './sqlite-kv.js'
 import { MemoryStableSnapshot } from './stable-snapshot.js'
 import { MemoryStore } from './store.js'
+import { installSettingsSeam, type SettingsSeam } from './settings.js'
 import { registerMemoryTools } from './tools.js'
 import { jiebaWords } from './scoring.js'
 import type { MemoryEntry } from './types.js'
@@ -48,10 +49,32 @@ export function apply(ctx: Context, config: ConfigType): Promise<void> {
   // R2-1（B1）：装配失败必须上抛——apply 返回 mountMemory 的 promise，
   // Cordis fiber 在启动错误时拒绝（registry.d.ts：rejecting on startup errors），
   // 插件加载失败对宿主可见。禁止 catch 后保持"已激活但功能全缺"的半死状态。
-  // R2-4（B4）：显式配置解析边界——schemastery 运行时已填默认值，此处仅做
-  // 类型收窄（Config 可选 → ResolvedConfig 必填），装配代码直接读字段。
-  const resolved: ResolvedConfig = { ...DEFAULTS, ...config }
-  return mountMemory(ctx, resolved, logger)
+  // 配置持久化 seam（settings.yaml）：根因修复见 settings.ts 文件头——原
+  // fiber.update(noSave=false) 写回 cordis.yml，该文件每次启动被 prepareProfile
+  // 重置，面板配置"保存成功但重启丢失"（2026-08-16 实测）。
+  const seam = installSettingsSeam(ctx, config)
+  // R2-4（B4）：显式配置解析边界——entry 配置经 DEFAULTS 填充（settings.ts
+  // entryConfig）；seam.effective() 在 settings 未挂载时即 entry 配置。装配
+  // 代码直接读必填字段（类型收窄，非运行时兜底）。
+  return mountMemory(ctx, seam.effective(), logger, { seam })
+}
+
+/**
+ * 由 settings seam 构建面板配置 RPC 上下文。
+ * 无 seam（测试直连 mountMemory）：配置视图用装配传入值；持久化/重启拒绝——
+ * 测试面不触碰真实配置源（index.test 只验证装配，配置端点契约见 host-rpc.test）。
+ */
+function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig): MemoryRpcContext {
+  if (seam === undefined) {
+    return {
+      config: () => fallback,
+      settings: {
+        update: () => Promise.reject(new Error('settings seam 未接线：配置无法持久化（测试直连装配）')),
+      },
+      applyChange: () => Promise.resolve(),
+    }
+  }
+  return { config: seam.effective, settings: seam.channel, applyChange: seam.applyChange }
 }
 
 /** 嵌入索引文件路径（按维度隔离：本地 384 / 远程配置值——不同维度混用会使余弦失真） */
@@ -80,6 +103,8 @@ export interface MountOverrides {
   dbFile?: string
   /** 旧 memory.json 路径（默认 ~/.dsh/storages/memory.json；迁移源） */
   legacyJsonFile?: string
+  /** 配置持久化 seam（apply 注入；测试直连装配可不传——配置端点见 rpcContextFrom） */
+  seam?: SettingsSeam
 }
 
 /** 装配各模块：打开 SQLite 存储（含首启迁移）→ 构造存储与提取器 → 挂接生命周期 */
@@ -219,10 +244,15 @@ export async function mountMemory(
   registerSnapshot(ctx, { store, logger })
 
   // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面；
-  // config 传入供 getConfig/setConfig 端点（setConfig 经 ctx.fiber.update 写回+重启）
-  registerMemoryRpc(ctx, store, config, runtime)
+  // 配置端点由 settings seam 供数（getConfig 读生效配置 / setConfig 持久化到
+  // settings.yaml 并经内存重启生效——根因修复见 settings.ts 文件头）
+  registerMemoryRpc(ctx, store, rpcContextFrom(overrides.seam, config), runtime)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }
 
 export { Config }
+
+
+
+

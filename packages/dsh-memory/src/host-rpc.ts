@@ -46,13 +46,20 @@ export type MemoryRpcHandler = (endpoint: string, payload: unknown) => Promise<R
 
 /**
  * 配置端点运行时依赖（面板配置读写的最小面）：
- * - config：当前生效配置（getConfig 展示 / setConfig 合并基底）；
- * - fiber.update：Cordis 原生配置更新链路——整体校验 → restart 插件 →
- *   loader 自动写回 cordis.patch.yml（noSave=false）。面板保存走此通道。
+ * - config：当前生效配置读取（getConfig 展示 / setConfig 合并基底；随 settings
+ *   变更实时更新）；
+ * - settings：持久化通道——setConfig 落盘 settings.yaml（DSH 官方用户设置 seam，
+ *   重启不丢。不写 loader 配置树：其写回目标 cordis.yml 每次启动被
+ *   prepareProfile 重置，2026-08-16 实测"保存成功但重启丢失"根因）；
+ * - applyChange：应用新配置并等待生效（装配层实现：幂等内存重启 noSave=true）。
  */
 export interface MemoryRpcContext {
-  config: ResolvedConfig
-  fiber: { update(config: Record<string, unknown>, noSave?: boolean): Promise<void> }
+  /** 当前生效配置读取（getConfig 展示 / setConfig 合并基底） */
+  config: () => ResolvedConfig
+  /** settings 持久化通道（未接线时 update 拒绝——不静默降级） */
+  settings: { update(patch: Record<string, unknown>): Promise<void> }
+  /** 应用新配置并等待生效（幂等内存重启） */
+  applyChange(next: ResolvedConfig): Promise<void>
 }
 
 /** 构造 RPC 分发器（O1：runtime 健康指标可选注入——status 端点覆盖 store 占位） */
@@ -72,7 +79,7 @@ export function createMemoryRpcHandler(store: MemoryStore, rpc: MemoryRpcContext
           lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
         })
       }
-      if (endpoint === 'getConfig') return ok({ config: configView(rpc.config) })
+      if (endpoint === 'getConfig') return ok({ config: configView(rpc.config()) })
       if (endpoint === 'setConfig') return ok(await handleSetConfig(rpc, payload))
       return internalError(`未知记忆端点：${endpoint}`)
     } catch (error) {
@@ -89,14 +96,22 @@ function configView(config: ResolvedConfig): Record<string, unknown> {
   }
 }
 
-/** setConfig：合并 partial → 整体校验（含跨字段互斥）→ fiber.update（写回+重启）→ 新配置视图 */
+/**
+ * setConfig：合并 partial → 整体校验（含跨字段互斥）→ 持久化到 settings.yaml
+ * → 内存重启插件生效 → 新配置视图。
+ * 持久化失败（settings 服务缺失/磁盘错误/校验拒绝）即整体拒绝——绝不"保存成功
+ * 但重启丢失"（2026-08-16 实测根因：原走 fiber.update(noSave=false) 写回
+ * cordis.yml，该文件每次启动被 prepareProfile 重置）。
+ */
 async function handleSetConfig(rpc: MemoryRpcContext, payload: unknown): Promise<{ config: Record<string, unknown> }> {
   const partial = parseSetConfigPayload(payload)
   // Config(...) 整体校验：未知键保留但不影响（键已在上一步白名单过滤）；
   // 类型/边界/跨字段（transform）错误在此抛 ValidationError → internal。
-  const next = Config({ ...rpc.config, ...partial }) as ResolvedConfig
-  // noSave=false：loader 级 internal/update 处理器自动写回配置源（cordis.patch.yml 原子写）
-  await rpc.fiber.update(next, false)
+  const next = Config({ ...rpc.config(), ...partial }) as ResolvedConfig
+  // ① 持久化：settings 命名空间 → ~/.dsh/settings.yaml（DSH 官方用户设置 seam）
+  await rpc.settings.update(partial)
+  // ② 生效：装配层内存重启（noSave=true：不触发 loader 写回 cordis.yml）
+  await rpc.applyChange(next)
   return { config: configView(next) }
 }
 
@@ -105,14 +120,12 @@ async function handleSetConfig(rpc: MemoryRpcContext, payload: unknown): Promise
  * R2-3（B3）：connection 已声明为硬 inject（index.ts）——Cordis 语义"缺失则不加载"，
  * 运行期必有该服务，删除 optional 守卫（防御性死代码）。
  * ctx.get 返回 unknown，类型强转保留（Cordis 未在 Context 类型声明 connection）。
+ * @param rpc - 配置端点运行时依赖（index.ts 从 settings seam 构建）
  */
-export function registerMemoryRpc(ctx: Context, store: MemoryStore, config: ResolvedConfig, runtime?: RuntimeHealth): void {
+export function registerMemoryRpc(ctx: Context, store: MemoryStore, rpc: MemoryRpcContext, runtime?: RuntimeHealth): void {
   const connection = ctx.get('connection') as {
     rpc: { handle(channel: string, handler: MemoryRpcHandler, options: { authority: string }): () => Promise<void> }
   }
-  // 配置端点依赖插件 fiber：setConfig 经 fiber.update 走 Cordis 原生"校验→重启→写回"链路
-  const fiber = (ctx as unknown as { fiber: MemoryRpcContext['fiber'] }).fiber
-  const rpc: MemoryRpcContext = { config, fiber }
   const dispose = connection.rpc.handle('/memory', createMemoryRpcHandler(store, rpc, runtime), { authority: 'loopback' })
   ctx.effect(() => () => {
     void dispose()

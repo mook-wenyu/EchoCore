@@ -60,6 +60,20 @@ export interface Config {
  */
 export type ResolvedConfig = Required<Config>
 
+/**
+ * 生效配置相等判定（四字段逐一比较）。
+ * settings seam 的幂等守卫：注册期初始 onChange 与面板 setConfig 显式调用共用，
+ * 配置未变则跳过重启——防"重启 → 再注册 → 再重启"环与并发双重启（见 settings.ts）。
+ */
+export function sameConfig(a: ResolvedConfig, b: ResolvedConfig): boolean {
+  return (
+    a.embeddingApiBaseUrl === b.embeddingApiBaseUrl &&
+    a.embeddingApiKey === b.embeddingApiKey &&
+    a.embeddingModel === b.embeddingModel &&
+    a.embeddingDimension === b.embeddingDimension
+  )
+}
+
 /** 插件配置 schema（loader 校验与默认值填充；默认值全部引用 DEFAULTS 单源） */
 export const Config = z.object({
   /** 远程嵌入 base URL（OpenAI 兼容端点） */

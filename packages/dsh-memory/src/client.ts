@@ -81,7 +81,7 @@ export interface MemoryPanelApi {
   status(): Promise<MemoryStatsView>
   /** 读取当前生效配置（含 apiKey 解析状态） */
   getConfig(): Promise<MemoryPanelConfigView>
-  /** 更新配置（仅变更项；宿主校验并写回 cordis.patch.yml，插件重启生效） */
+  /** 更新配置（仅变更项；宿主校验并持久化到 settings.yaml，插件内存重启生效） */
   setConfig(partial: Record<string, unknown>): Promise<MemoryPanelConfigView>
 }
 
@@ -335,7 +335,7 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
     error !== '' ? React.createElement('div', { style: errorStyle }, error) : null,
     React.createElement('div', { style: listStyle }, rows.length > 0 ? rows : React.createElement('div', null, '（暂无记忆）')),
     selected !== undefined ? React.createElement(DetailPane, { entry: selected, onArchive: () => void doArchive(selected.id) }) : null,
-    // 配置区块（面板底部）：当前生效配置表单 + 保存（写回配置源并重启插件生效）
+    // 配置区块（面板底部）：当前生效配置表单 + 保存（持久化到 settings.yaml 并重启插件生效）
     React.createElement(ConfigPane, { api: props.api }),
   )
 }
@@ -407,8 +407,10 @@ function ConfigPane(props: { api: MemoryPanelApi }): React.ReactElement {
         return
       }
       const config = await props.api.setConfig(partial)
-      // 保存成功 = 宿主已校验并写回配置源、插件重启生效
-      setNotice('已保存并生效（插件已重启；注入/提取/嵌入按新配置运行）')
+      // 保存成功 = 宿主已校验、已持久化到 settings.yaml（~/.dsh/settings.yaml——
+      // 原写回 cordis.patch.yml 的链路在重启后被 prepareProfile 重置清空，
+      // 2026-08-16 实测根因）并重启插件生效
+      setNotice('已保存并生效（已持久化到 settings.yaml，插件已重启；注入/提取/嵌入按新配置运行）')
       setResolved(config.embeddingApiKeyResolved)
     } catch (err) {
       setNotice(err instanceof Error ? err.message : String(err))

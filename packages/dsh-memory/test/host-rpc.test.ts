@@ -7,27 +7,35 @@ import { describe, expect, it } from 'vitest'
 import { createMemoryRpcHandler } from '../src/host-rpc.js'
 import { MemoryStore } from '../src/store.js'
 import type { NewMemoryInput } from '../src/types.js'
-import { DEFAULTS } from '../src/config.js'
+import { DEFAULTS, type ResolvedConfig } from '../src/config.js'
 import { FakeTable } from './helpers.js'
 
 /** 组装被测对象 */
 function setup() {
   const table = new FakeTable()
   const store = new MemoryStore(table)
-  // 假 fiber：记录 update 调用与载荷；config 引用可变（模拟 fiber 配置）
+  // 假配置上下文：记录持久化/生效调用与顺序；config 可变（模拟 settings 变更后视图刷新）
   const rpcConfig: Record<string, unknown> = { ...DEFAULTS }
-  const updates: Array<Record<string, unknown>> = []
+  const calls: string[] = []
+  const settingsUpdates: Array<Record<string, unknown>> = []
+  const applied: Array<Record<string, unknown>> = []
   const rpc = {
-    config: rpcConfig,
-    fiber: {
-      async update(config: Record<string, unknown>, _noSave?: boolean): Promise<void> {
-        updates.push(config)
-        Object.assign(rpcConfig, config)
+    config: () => rpcConfig as unknown as ResolvedConfig,
+    settings: {
+      async update(patch: Record<string, unknown>): Promise<void> {
+        calls.push('settings.update')
+        settingsUpdates.push(patch)
+        Object.assign(rpcConfig, patch)
       },
+    },
+    async applyChange(next: Record<string, unknown>): Promise<void> {
+      calls.push('applyChange')
+      applied.push(next)
+      Object.assign(rpcConfig, next)
     },
   }
   const handler = createMemoryRpcHandler(store, rpc)
-  return { store, handler, table, rpc, updates }
+  return { store, handler, table, rpc, rpcConfig, calls, settingsUpdates, applied }
 }/** 播种一条记忆 */
 async function seed(store: MemoryStore, input: Partial<NewMemoryInput> = {}): Promise<string> {
   const result = await store.create({
@@ -219,60 +227,96 @@ describe('memory RPC 配置端点（面板配置）', () => {
     expect('embeddingModelDir' in value.config).toBe(false)
   })
 
-  it('setConfig：合法载荷合并到当前配置并调用 fiber.update（noSave=false 写回）', async () => {
-    const { handler, updates } = setup()
+  it('getConfig：随 config() 动态读取（settings 变更后视图即时刷新）', async () => {
+    const { handler, rpcConfig } = setup()
+    rpcConfig.embeddingModel = 'BAAI/bge-m3'
+    const result = await handler('getConfig', null)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect((result.value as { config: { embeddingModel: string } }).config.embeddingModel).toBe('BAAI/bge-m3')
+  })
+
+  it('setConfig：合法载荷先持久化到 settings（partial）再内存重启生效（合并后完整配置）', async () => {
+    const { handler, calls, settingsUpdates, applied } = setup()
     const result = await handler('setConfig', { embeddingModel: 'BAAI/bge-m3', embeddingDimension: 512 })
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(updates).toHaveLength(1)
-    // fiber.update 收到合并后完整配置（未传字段保留当前值）
-    expect(updates[0]?.embeddingModel).toBe('BAAI/bge-m3')
-    expect(updates[0]?.embeddingDimension).toBe(512)
-    expect(updates[0]?.embeddingApiBaseUrl).toBe(DEFAULTS.embeddingApiBaseUrl)
+    // 顺序契约：持久化先于生效（settings.yaml 落盘后插件才重启）
+    expect(calls).toEqual(['settings.update', 'applyChange'])
+    // 持久化通道收到白名单校验后的变更项
+    expect(settingsUpdates[0]).toEqual({ embeddingModel: 'BAAI/bge-m3', embeddingDimension: 512 })
+    // 生效收到合并后完整配置（未传字段保留当前值）
+    expect(applied[0]?.embeddingModel).toBe('BAAI/bge-m3')
+    expect(applied[0]?.embeddingDimension).toBe(512)
+    expect(applied[0]?.embeddingApiBaseUrl).toBe(DEFAULTS.embeddingApiBaseUrl)
     // 响应返回更新后配置
     const value = result.value as { config: Record<string, unknown> }
     expect(value.config.embeddingModel).toBe('BAAI/bge-m3')
   })
 
+  it('setConfig：持久化失败整体拒绝且不重启（不静默"保存成功"）', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table)
+    const calls: string[] = []
+    const rpc = {
+      config: () => ({ ...DEFAULTS }),
+      settings: {
+        async update(): Promise<void> {
+          calls.push('settings.update')
+          throw new Error('settings.yaml 写入失败')
+        },
+      },
+      async applyChange(): Promise<void> {
+        calls.push('applyChange')
+      },
+    }
+    const handler = createMemoryRpcHandler(store, rpc)
+    const result = await handler('setConfig', { embeddingModel: 'm' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.message).toContain('写入失败')
+    expect(calls).toEqual(['settings.update'])
+  })
+
   it('setConfig：未知键拒绝（internal）', async () => {
-    const { handler, updates } = setup()
+    const { handler, calls } = setup()
     const result = await handler('setConfig', { 不存在的键: 1 })
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.error.message).toContain('未知配置键')
-    expect(updates).toHaveLength(0)
+    expect(calls).toHaveLength(0)
   })
 
   it('setConfig：已删除的旧配置键拒绝（配置面最小化后不再是合法键）', async () => {
-    const { handler, updates } = setup()
+    const { handler, calls } = setup()
     const result = await handler('setConfig', { topK: 12 })
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.error.message).toContain('未知配置键')
-    expect(updates).toHaveLength(0)
+    expect(calls).toHaveLength(0)
   })
 
   it('setConfig：类型错误拒绝（internal）', async () => {
-    const { handler, updates } = setup()
+    const { handler, calls } = setup()
     const result = await handler('setConfig', { embeddingDimension: '不是数字' })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(updates).toHaveLength(0)
+    expect(calls).toHaveLength(0)
   })
 
   it('setConfig：数值越界拒绝（embeddingDimension 0）', async () => {
-    const { handler, updates } = setup()
+    const { handler, calls } = setup()
     const result = await handler('setConfig', { embeddingDimension: 0 })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(updates).toHaveLength(0)
+    expect(calls).toHaveLength(0)
   })
 
   it('setConfig：空载荷拒绝', async () => {
-    const { handler, updates } = setup()
+    const { handler, calls } = setup()
     const result = await handler('setConfig', {})
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(updates).toHaveLength(0)
+    expect(calls).toHaveLength(0)
   })
 })

@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { DEFAULTS, Config } from '../src/config.js'
+import { DEFAULTS, Config, sameConfig } from '../src/config.js'
 
 /** 用 schemastery 的 validate 语义跑一次解析（等价于 loader 加载路径） */
 function parseConfig(raw: Record<string, unknown>): unknown {
@@ -58,6 +58,15 @@ describe('Config 默认值', () => {
 
   it('非正数值被拒绝（embeddingDimension ≥1）', () => {
     expect(() => parseConfig({ embeddingDimension: 0 })).toThrow()
+  })
+
+  it('sameConfig：四字段逐一比较（settings 幂等守卫——防重复重启）', () => {
+    const base: typeof DEFAULTS = { ...DEFAULTS }
+    expect(sameConfig(base, { ...base })).toBe(true)
+    expect(sameConfig(base, { ...base, embeddingModel: 'BAAI/bge-m3' })).toBe(false)
+    expect(sameConfig(base, { ...base, embeddingDimension: 512 })).toBe(false)
+    expect(sameConfig(base, { ...base, embeddingApiBaseUrl: 'http://x' })).toBe(false)
+    expect(sameConfig(base, { ...base, embeddingApiKey: 'env:K' })).toBe(false)
   })
 
   it('宿主 loader 契约：Config["simplify"] 裸调用不崩（this 绑定）', () => {
