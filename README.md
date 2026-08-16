@@ -14,7 +14,7 @@ DSH (DeepSeek Harness) **session-scoped memory plugin**: automatic extraction, c
 - **Contradiction resolution**: Jaccard ≥0.7 same-kind new statements auto-supersede old ones (bidirectional pointers + audit + retrieval exclusion)
 - **Background maintenance**: scheduled dedup merge, soft-decay re-ranking, tag tidying (rule-based, no LLM)
 - **Full audit trail**: every create/merge/supersede/archive action is traceable
-- **Browser panel**: settings "Memory" page — search/filter/detail/archive + config section (remote embedding, save-to-apply)
+- **Browser panel**: settings "Memory" page — search/filter/detail/archive + config section (remote embedding, save-to-apply, **persisted across restarts** via the `memory` section of `~/.dsh/settings.yaml` — DSH's official user-settings seam)
 
 ## Quick Start
 

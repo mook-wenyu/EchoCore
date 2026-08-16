@@ -87,9 +87,13 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 ### 记忆面板（设置页「记忆」）
 
 面板除搜索/列表/详情/归档外，底部提供**配置区块**（字段驱动表单，全部配置项
-可编辑）：修改后点「保存」——宿主经 `ctx.fiber.update` 整体校验（类型/边界/
-跨字段互斥）→ **写回 cordis.patch.yml 并重启插件**（毫秒级，记忆数据不丢）→
-新配置立即生效。apiKey 行展示解析状态（字面 key 或 `env:NAME` 引用是否可用）。
+可编辑）：修改后点「保存」——宿主经 settings 命名空间整体校验（类型/边界/
+跨字段互斥）→ **持久化到 `~/.dsh/settings.yaml` 的 `memory` 段并内存重启插件**
+（毫秒级，记忆数据不丢）→ 新配置立即生效。**配置跨重启保留**（2026-08-16
+修复：原写回 cordis.patch.yml 的链路实为写进 cordis.yml——该文件每次启动被
+DSH 重置为组合基底，保存的配置重启即丢失；settings.yaml 是 DSH 官方用户设置
+seam，内建插件配置页同款通道）。apiKey 行展示解析状态（字面 key 或 `env:NAME`
+引用是否可用）。
 
 ### 防上下文污染（F1-F5，2026-08-15）
 
