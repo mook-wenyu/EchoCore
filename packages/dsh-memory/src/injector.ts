@@ -35,6 +35,13 @@ import type { MemoryEntry } from './types.js'
  */
 /** 注入预算（字符）：≈4K token，与 magic-context 的 injection_budget_tokens:4000 对齐 */
 const INJECT_BUDGET_CHARS = 16384
+/** N2（2026-08-16 目录注入）：预算截断跳过的条目标题目录独立预算（字符）。
+ * 语义（TencentDB 2026）：目录是"导航"而非"内容"——"列入目录 ≠ 被回忆"，
+ * 目录只列标题供模型主动 memory_recall 取全文，不注入内容。故允许总注入 =
+ * INJECT_BUDGET_CHARS + 1500：导航段超一点不挤占内容预算（内容段仍受严格预算约束）。 */
+const CATALOG_BUDGET_CHARS = 1500
+/** N2：目录标题 = content 前 N 字符（中英通用短标题，足够模型判断是否值得取全文） */
+const CATALOG_TITLE_CHARS = 24
 /** 每次注入最多召回的相关记忆条数 */
 const TOP_K = 8
 /**
@@ -197,6 +204,19 @@ export class MemoryInjector {
     )
     if (pack === undefined) return decision
 
+    // N2（目录注入）：renderBudgetedPack 预算截断跳过的条目对模型不可见（模型
+    // 无从发现"还有 N 条相关记忆"的细节——known-information forgetting 根因）。
+    // 从 fresh 侧取跳过条目（lines 即 renderBudgetedPack 的输入顺序，二者一致）：
+    // 跳过 = 未进 pack.renderedIds 的行；保留 renderBudgetedPack 自带的计数提示
+    // （pack.text 已含），在其后追加这些条目的标题目录（导航段，独立预算）。
+    if (pack.renderedIds.length < lines.length) {
+      const byId = new Map(fresh.map(({ entry }) => [entry.id, entry]))
+      const skipped = lines
+        .filter((item) => !pack.renderedIds.includes(item.id))
+        .map((item) => ({ entry: byId.get(item.id)!, line: item.line }))
+      pack.text += renderCatalog(skipped)
+    }
+
     const message = createUserMessage({
       content: [{ type: 'text', text: pack.text }],
       source: { kind: 'plugin', plugin: MEMORY_PLUGIN_ID, form: 'recall' },
@@ -281,4 +301,27 @@ export function renderPack(entries: MemoryEntry[], budgetChars: number): Rendere
   )
   if (pack === undefined) return undefined
   return { text: pack.text, ids: pack.renderedIds }
+}
+
+/**
+ * N2（2026-08-16 目录注入）：未渲染条目标题目录——防 known-information
+ * forgetting（ICLR 2026：被预算截断的关键事实模型无从发现）。
+ * 预算截断跳过的条目对模型不可见，仅剩一行计数提示；把它们的**标题**列出
+ * 供模型判断是否有必要主动 memory_recall 检索全文。语义（TencentDB 2026）：
+ * 列入目录 ≠ 被回忆——目录是导航不含内容，故独立预算 CATALOG_BUDGET_CHARS
+ * （允许总注入 = INJECT_BUDGET_CHARS + 1500，导航段超一点不挤占内容预算）。
+ * 标题 = content 前 CATALOG_TITLE_CHARS 字符（中英通用短标题）。
+ * 目录超出自身预算时在目录段内截断，追加截断提示（不再只保留计数提示）。
+ */
+export function renderCatalog(skipped: Array<{ entry: MemoryEntry; line: string }>): string {
+  const header = '\n## 未展示的记忆目录（可 memory_recall 检索）\n'
+  const rows = skipped.map(({ entry }) => {
+    const title = entry.content.slice(0, CATALOG_TITLE_CHARS)
+    return `- [${entry.kind}] ${title}（记忆 #${entry.id.slice(0, 8)}）`
+  })
+  let text = `${header}${rows.join('\n')}`
+  if (text.length > CATALOG_BUDGET_CHARS) {
+    text = `${text.slice(0, CATALOG_BUDGET_CHARS)}\n（目录截断，可用 memory_recall 检索更多）`
+  }
+  return text
 }
