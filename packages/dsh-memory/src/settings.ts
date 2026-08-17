@@ -139,9 +139,17 @@ export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSe
  * 并发调用各自进入 applier（装配层以 epoch 守卫丢弃过期结果）。
  */
 export function applyConfigChange(next: ResolvedConfig): Promise<void> {
-  if (active !== undefined && sameConfig(next, active)) return Promise.resolve()
+  const prev = active
+  if (prev !== undefined && sameConfig(next, prev)) return Promise.resolve()
   active = next
-  return applier(next)
+  return applier(next).catch((error) => {
+    // 热换失败（applier 抛错，运行态未切换，仍保留旧后端）：回滚 active 到旧值。
+    // 若不回滚，active 已指向新配置而运行态仍是旧后端——配置态与运行态漂移，
+    // 且后续同配置变更会被 sameConfig 幂等门拦下，无法重试/自愈（Q6 拍板修复）。
+    // 回滚后 effective() 返回旧配置，下次 applyChange 新配置可再次触发生效。
+    active = prev
+    throw error
+  })
 }
 
 /** 测试隔离：重置进程级单例（仅测试调用；运行期不导出语义变化） */

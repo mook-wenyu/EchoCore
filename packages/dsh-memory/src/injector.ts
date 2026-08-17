@@ -77,12 +77,6 @@ export interface InjectorDeps {
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
 }
 
-/** 渲染结果：模型可见文本 + 注入的记忆 id 列表（供回填序号追踪） */
-export interface RenderedPack {
-  text: string
-  ids: string[]
-}
-
 /** pre-step 事件载荷（与 Event 目录签名一致；messages 为 UserMessage 精确形态） */
 interface PreStepPayload {
   agent: { id: string; session: Session }
@@ -271,33 +265,6 @@ export function textOfBatch(messages: PreStepPayload['messages']): string {
     .filter((block) => block.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text as string)
     .join('\n')
-}
-
-/**
- * 渲染记忆包：完整行渲染（formatMemoryLine）+ 共享预算拼装（renderBudgetedPack）。
- * 实时注入的完整行入口（P1 三档的摘要档走 handlePreStep 内的分档路径）。
- * 返回 undefined 表示一条都放不下（不注入，避免空消息）。
- */
-export function renderPack(entries: MemoryEntry[], budgetChars: number): RenderedPack | undefined {
-  const pack = renderBudgetedPack(
-    entries.map((entry) => ({
-      id: entry.id,
-      line: formatMemoryLine({
-        id: entry.id,
-        kind: entry.kind,
-        content: entry.content,
-        importance: entry.importance,
-        sessionId: entry.source.sessionId,
-        // F3：渲染创建日期——模型可判断记忆新旧（防把过时记忆当现行事实）
-        createdAt: entry.createdAt,
-      }),
-    })),
-    budgetChars,
-    MEMORY_INJECTION_HEADER,
-    (skipped) => `（另有 ${skipped} 条相关记忆，可用 memory_recall 查看）`,
-  )
-  if (pack === undefined) return undefined
-  return { text: pack.text, ids: pack.renderedIds }
 }
 
 /**

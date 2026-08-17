@@ -58,7 +58,7 @@ Embedding backend auto-select: remote first → local fallback → disabled (key
 
 ## Backup
 
-The single copy of the memory store needs backup (script keeps latest 10):
+The memory store lives in `$DSH_HOME/storages/memory.sqlite` (SQLite WAL). Backup with a consistent snapshot via the SQLite backup API (script keeps latest 10 by default):
 
 ```bash
 node packages/dsh-memory/scripts/backup-memory.mjs

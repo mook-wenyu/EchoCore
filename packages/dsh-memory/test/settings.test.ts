@@ -156,4 +156,24 @@ describe('settings seam（配置持久化 settings.yaml + 实时生效）', () =
     expect(applier).toHaveBeenCalledTimes(1)
     expect(applier).toHaveBeenCalledWith(next)
   })
+
+  // Q6（2026-08-16 拍板）：热换失败必须回滚 active——修复"幂等门拦死自愈"漂移。
+  // 旧实现 active = next 在 applier 完成前提交：热换失败（保留旧后端）后 active
+  // 已指向新配置，后续同配置变更被 sameConfig 幂等门拦下，配置态与运行态漂移。
+  it('applier 抛错 → active 回滚到旧值，后续新配置变更不被幂等门拦下（可重试/自愈）', async () => {
+    const { ctx, entry, fireInject } = setup({ section: undefined })
+    const seam: SettingsSeam = installSettingsSeam(ctx, entry)
+    // 失败的生效器：模拟热换抛错（运行态未切换，仍为旧后端）
+    const failApplier = vi.fn(async () => Promise.reject(new Error('热换失败')))
+    seam.setApplier(failApplier)
+    fireInject()
+    const next = mergedConfig({ embeddingModel: 'BAAI/bge-m3' })
+    // 首次应用失败：错误透传
+    await expect(seam.applyChange(next)).rejects.toThrow('热换失败')
+    // active 已回滚 → effective() 仍是旧配置（entry），非新配置
+    expect(seam.effective()).toEqual(entry)
+    // 幂等门未被污染：active 已回滚，再次应用同一新配置仍可触发（不被 sameConfig 拦下）
+    await expect(seam.applyChange(next)).rejects.toThrow('热换失败')
+    expect(failApplier).toHaveBeenCalledTimes(2)
+  })
 })

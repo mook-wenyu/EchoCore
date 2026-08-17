@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { MemoryInjector, renderCatalog, renderPack, textOfBatch } from '../src/injector.js'
+import { MemoryInjector, renderCatalog, textOfBatch } from '../src/injector.js'
 import { MemoryStableSnapshot, SNAPSHOT_MIN_REBUILD_INTERVAL_MS } from '../src/stable-snapshot.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
@@ -252,47 +252,22 @@ describe('MemoryInjector pre-step 注入', () => {
   })
 })
 
-describe('renderPack', () => {
-  const entries = [
-    {
-      id: 'aaaaaaaa-1111-1111-1111-111111111111',
-      kind: 'fact',
-      content: '内容甲',
-      importance: 7,
-      source: { sessionId: 'ssssssss-2222-2222-2222-222222222222', eventSeqs: [1], excerpt: '' },
-    },
-    {
-      id: 'bbbbbbbb-3333-3333-3333-333333333333',
-      kind: 'decision',
-      content: '内容乙',
-      importance: 9,
-      source: { sessionId: 'ssssssss-2222-2222-2222-222222222222', eventSeqs: [2], excerpt: '' },
-    },
-  ] as MemoryEntry[]
-
-  it('渲染标题与逐条 bullet，包含短 id 溯源', () => {
-    const pack = renderPack(entries, 4096)
-    expect(pack).toBeDefined()
-    expect(pack?.text).toContain('[参考记忆]')
-    expect(pack?.text).toContain('[fact] 内容甲')
-    expect(pack?.text).toContain('记忆 #aaaaaaaa')
-    expect(pack?.text).toContain('来自会话 ssssssss')
-    expect(pack?.ids).toEqual(['aaaaaaaa-1111-1111-1111-111111111111', 'bbbbbbbb-3333-3333-3333-333333333333'])
-  })
-
-  it('预算不足时截断并提示其余数量', () => {
-    const longEntries = [
-      entries[0] as MemoryEntry,
-      { ...entries[1] as MemoryEntry, content: '内容乙'.repeat(80) },
-    ]
-    const pack = renderPack(longEntries, 200)
-    expect(pack).toBeDefined()
-    expect(pack?.text).toContain('另有 1 条相关记忆')
-    expect(pack?.ids).toHaveLength(1)
-  })
-
-  it('预算连一条都放不下时返回 undefined（不注入空包）', () => {
-    expect(renderPack(entries, 10)).toBeUndefined()
+// renderPack 已删除（生产死代码：无真实调用点，完整行渲染语义已内联在
+// handlePreStep 高置信档——header/逐条 bullet/短 id 溯源/预算截断/计数提示
+// 分别由下述 MemoryInjector 用例与原 N2 目录用例覆盖）。
+// 此处仅保留原 renderPack 独有、未在别处覆盖的"空包保护"行为：
+// 预算连一条都放不下时不得注入空消息（renderBudgetedPack 返回 undefined → 不注入）。
+// 以 handlePreStep 等效路径验证：单条记忆渲染行超 INJECT_BUDGET_CHARS(16384)
+// 预算 → 空包 → 消息保持原样（仅下游 1 条）。
+describe('MemoryInjector 空包保护（预算连一条都放不下时不注入）', () => {
+  it('单条渲染超预算 → renderBudgetedPack 返回 undefined → 不注入空包', async () => {
+    const { preStep, store } = setup()
+    // 内容远超注入预算：formatMemoryLine 全量渲染 → 单行超 16384 → 空包
+    await seed(store, { content: longContent('pnpm workspace', 17000), importance: 10 })
+    const decision = await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision())
+    expect(decision.kind).toBe('enter')
+    // 无条件断言（防弱断言静默跳过）：不注入空包 → 消息保持原样 1 条
+    expect(decision.messages).toHaveLength(1)
   })
 })
 
