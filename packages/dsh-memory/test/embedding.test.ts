@@ -207,11 +207,11 @@ describe('EmbeddingService 状态机（远程优先回退本地）', () => {
     expect(service.state).toBe('error')
   })
 
-  it('运行期远程 embed 失败 → 回退本地后端重试成功', async () => {
+  it('运行期远程 embed 失败 + 本地维度 ≠ 远程维度 → 禁止跨维顶班：显式降级 disabled + 原因可读（Q1/A 拍板）', async () => {
     let remoteCalls = 0
     const service = new EmbeddingService({
       modelDir: '/models',
-      remote: remoteConfig,
+      remote: remoteConfig, // 512 维；本地假后端恒 384 维——跨维
       hasLocalModel: async () => true,
       loadLocalBackend: fakeLocalBackend,
       fetchRemoteEmbeddings: async (input, config) => {
@@ -223,10 +223,66 @@ describe('EmbeddingService 状态机（远程优先回退本地）', () => {
     await service.init()
     expect(service.state).toBe('ready')
     expect(service.dimension).toBe(512)
-    // 首次 embed 远程失败 → 回退本地成功（维度切换为 384）
-    const v = await service.embed('测试')
+    // 运行期远程失败：索引按远程维度建表，跨维切本地会让 KNN/写库维度错乱 →
+    // Q1/A 显式降级为关键词（不得静默切本地、不得抛裸错破坏检索降级契约）
+    await expect(service.embed('测试')).rejects.toThrow('嵌入失败')
+    expect(service.state).toBe('disabled')
+    expect(service.degradedReason).toContain('维度')
+    expect(service.backendLabel).toBe('remote(运行期降级)')
+    // 后续调用一致走不可用（state=disabled 门控 → 检索侧 searchWithSemantic 走纯关键词）
+    await expect(service.embed('再试')).rejects.toThrow('语义嵌入不可用')
+  })
+
+  it('运行期远程 embed 失败 + 本地维度 == 远程维度（384==384）→ 允许切本地顶班', async () => {
+    let remoteCalls = 0
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      remote: { ...remoteConfig, dimension: 384 }, // 远程声明 384 维与本地一致——同维顶班安全
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: async (input, config) => {
+        remoteCalls++
+        if (remoteCalls === 1) return fakeRemote(input, config)
+        throw new Error('网络抖动')
+      },
+    })
+    await service.init()
+    expect(service.state).toBe('ready')
+    const v = await service.embed('测试') // 切本地顶班成功（维度不变）
     expect(v).toHaveLength(384)
-    expect(service.dimension).toBe(384)
+    expect(service.state).toBe('ready')
+    expect(service.backendLabel).toBe('local')
+    expect(service.degradedReason).toBeUndefined()
+  })
+
+  it('degradedReason 仅记录运行期降级；新实例（热换重建）不携带陈旧原因', async () => {
+    let remoteCalls = 0
+    const service1 = new EmbeddingService({
+      modelDir: '/models',
+      remote: remoteConfig,
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: async (input, config) => {
+        remoteCalls++
+        if (remoteCalls === 1) return fakeRemote(input, config)
+        throw new Error('网络抖动')
+      },
+    })
+    await service1.init()
+    await expect(service1.embed('x')).rejects.toThrow()
+    expect(service1.degradedReason).toBeDefined()
+    // 热换 = 新实例（initEmbedding 重建），不携带上一实例的降级原因
+    const service2 = new EmbeddingService({
+      modelDir: '/models',
+      remote: remoteConfig,
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakeLocalBackend,
+      fetchRemoteEmbeddings: fakeRemote,
+    })
+    await service2.init()
+    expect(service2.state).toBe('ready')
+    expect(service2.degradedReason).toBeUndefined()
+    expect(service2.lastInitError).toBeUndefined()
   })
 
   it('超时策略按调用面传参：验证 15s 单发 / 单条 15s+1 重试 / 批量 90s+2 重试', async () => {
@@ -680,5 +736,50 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  it('loadLegacy：迁移向量维度不匹配 → 跳过 + logWarn（防错误维度行落库，Q2 拍板）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'embed-legacy-dim-'))
+    const file = join(dir, 'memory-embeddings-384.json')
+    const vectors: Record<string, number[]> = {}
+    // 两条 384 维合法
+    for (let i = 0; i < 2; i++) {
+      const v = new Array(384).fill(0)
+      v[0] = i
+      vectors[`ok-${i}`] = v
+    }
+    // 一条 512 维不匹配（历史配置维度遗留）——不得落库（否则 KNN MATCH 维度错乱）
+    vectors['bad-dim'] = new Array(512).fill(0.5)
+    await writeFile(file, JSON.stringify(vectors), 'utf8')
+    try {
+      const db = new DatabaseSync(':memory:', { allowExtension: true })
+      const warns: string[] = []
+      const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: (m) => warns.push(m) })
+      const migrated = await index.loadLegacy(file)
+      expect(migrated).toBe(2) // 维度不匹配行被跳过
+      expect(warns.some((m) => m.includes('维度'))).toBe(true)
+      // 仅合法 384 维行可被 KNN 命中；bad-dim 未落库
+      const hits = index.knn(queryVec(1), 10)
+      expect(hits.some((h) => h.id === 'ok-1')).toBe(true)
+      expect(hits.some((h) => h.id === 'bad-dim')).toBe(false)
+      db.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('dropOtherDimensionTables：只删除非当前维度表（防旧维度表堆积，Q2 拍板）', () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: () => {} }) // 当前维度 384
+    // 手工模拟历史遗留的同库其它维度表（换维后 ensureAll 已按新维重嵌，旧表无引用价值）
+    db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS "vec_memory_512" USING vec0(embedding float[512] distance_metric=cosine, memory_id TEXT)')
+    db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS "vec_memory_768" USING vec0(embedding float[768] distance_metric=cosine, memory_id TEXT)')
+    index.dropOtherDimensionTables()
+    const rows = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_memory_%'`).all() as Array<{ name: string }>
+    // 仅断言纯维度表（vec_memory_<digits>）：vec0 影子表（_info/_rowid 等）受 SQLite
+    // 保护不可 DROP，属预期残留；换维后旧维度表应已清理
+    const dimTables = rows.filter((r) => /^vec_memory_\d+$/.test(r.name)).map((r) => r.name).sort()
+    expect(dimTables).toEqual(['vec_memory_384'])
+    db.close()
   })
 })

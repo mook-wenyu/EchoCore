@@ -64,9 +64,13 @@ function vecLiteral(vector: Float32Array): string {
   return `X'${Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength).toString('hex')}'`
 }
 
-/** JSON 数字数组 → Float32Array（旧 JSON 索引文件迁移源的读侧换算） */
-function parseJsonVec(list: unknown): Float32Array | undefined {
+/** JSON 数字数组 → Float32Array（旧 JSON 索引文件迁移源的读侧换算）。
+ * 可选 expectedLength：不等于该值时视为**维度不匹配**（历史配置维度遗留）——
+ * 返回 undefined 由调用方跳过并告警，防错误维度行落库（Q2 拍板：免得 KNN
+ * MATCH 维度错乱）。为空/含非有限数同样视为畸形返回 undefined。 */
+function parseJsonVec(list: unknown, expectedLength?: number): Float32Array | undefined {
   if (!Array.isArray(list) || list.length === 0) return undefined
+  if (expectedLength !== undefined && list.length !== expectedLength) return undefined
   const array = new Float32Array(list.length)
   for (let i = 0; i < list.length; i++) {
     const n = list[i]
@@ -153,6 +157,29 @@ export class EmbeddingIndex {
     this.deleteStmt.run(id)
   }
 
+  /**
+   * 清理其它维度表（Q2 拍板 2026-08-17）：维度切换后旧维度 vec0 表
+   * （vec_memory_<dim>）不再被引用（ensureAll 已按当前维度重嵌全部缺失条目）
+   * —— DROP 防表随维度切换无界堆积。安全过滤：只处理本插件的
+   * `vec_memory_%` 命名空间，且跳过当前表；名字经单引号转义防注入。
+   * 装配层在 ready 且本维度表已建后调用（数据文件冗余清理，非迁移路径）。
+   */
+  dropOtherDimensionTables(): void {
+    const current = this.table
+    const rows = this.deps.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_memory_%'`)
+      .all() as Array<{ name: string }>
+    for (const row of rows) {
+      if (row.name === current) continue
+      // 仅 DROP 纯维度表名 vec_memory_<digits>：sqlite-vec 会为每个 vec0 表建影子表
+      // （vec_memory_<dim>_info/_rowid/_chunks 等），影子表受 SQLite 保护不可 DROP
+      // （"may not be dropped"）——必须跳过；非本插件命名空间同样不碰。
+      if (!/^vec_memory_\d+$/.test(row.name)) continue
+      const name = row.name.replace(/'/g, "''")
+      this.deps.db.exec(`DROP TABLE IF EXISTS "${name}"`)
+    }
+  }
+
   /** 全量补齐缺失条目（128/批批量嵌入；失败批跳过——缺失保持关键词检索） */
   ensureAll(): Promise<void> {
     if (this.building !== undefined) return this.building
@@ -187,9 +214,11 @@ export class EmbeddingIndex {
     }
     let migrated = 0
     for (const [id, value] of Object.entries(parsed)) {
-      const vector = parseJsonVec(value)
+      // Q2 拍板：迁移严格按当前表维度校验——历史配置维度遗留的错误维度向量
+      // 不得落库（vec0 列维度写死，混维行会让 KNN MATCH 报维度错误）
+      const vector = parseJsonVec(value, this.deps.service.dimension)
       if (vector === undefined) {
-        this.deps.logWarn(`[dsh-memory] 旧嵌入索引含畸形向量（跳过）：${id}`)
+        this.deps.logWarn(`[dsh-memory] 旧嵌入索引含畸形或维度不匹配向量（跳过）：${id}`)
         continue
       }
       this.writeVector(id, vector)

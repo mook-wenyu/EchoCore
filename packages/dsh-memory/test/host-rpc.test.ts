@@ -203,6 +203,25 @@ describe('memory RPC 端点', () => {
     expect(value.embeddingBackend).toBeUndefined()
     expect(value.embeddingInitError).toBeUndefined()
   })
+
+  it('status：透出运行期降级原因 embeddingDegradedReason（Q1/A 状态可见化——跨维禁顶班后"已降级为关键词"可见）', async () => {
+    const { store } = setup()
+    const withRuntime = createMemoryRpcHandler(store, {
+      config: () => ({ ...DEFAULTS }) as ResolvedConfig,
+      settings: { update: async () => {} },
+      applyChange: async () => {},
+    }, {
+      writeFailures: 0,
+      embeddingState: 'disabled',
+      lastMaintenanceAt: null,
+      embeddingDegradedReason: '远程嵌入运行期失败且本地模型维度(384)与远程配置维度(512)不匹配——语义嵌入已显式降级为关键词检索',
+    })
+    const result = await withRuntime('status', null)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const value = result.value as { embeddingDegradedReason?: string }
+    expect(value.embeddingDegradedReason).toContain('维度')
+  })
 })
 
 describe('memory RPC 载荷校验', () => {
@@ -308,6 +327,32 @@ describe('memory RPC 配置端点（面板配置）', () => {
     if (result.ok) return
     expect(result.error.message).toContain('写入失败')
     expect(calls).toEqual(['settings.update'])
+  })
+
+  it('setConfig：持久化成功但实时生效失败 → 显式"已保存、重启后自动生效"中间态（Q6⑫ 拍板——非静默"保存失败"）', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table)
+    const calls: string[] = []
+    const rpc = {
+      config: () => ({ ...DEFAULTS }),
+      settings: {
+        async update(): Promise<void> {
+          calls.push('settings.update')
+        },
+      },
+      async applyChange(): Promise<void> {
+        calls.push('applyChange')
+        throw new Error('热换嵌入后端失败（网络超时）')
+      },
+    }
+    const handler = createMemoryRpcHandler(store, rpc)
+    const result = await handler('setConfig', { embeddingModel: 'm' })
+    // 生效失败但有别于"保存失败"：错误信息必须明示配置已持久化、重启后生效
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.message).toContain('已保存')
+    expect(result.error.message).toContain('重启')
+    expect(calls).toEqual(['settings.update', 'applyChange'])
   })
 
   it('setConfig：未知键拒绝（internal）', async () => {

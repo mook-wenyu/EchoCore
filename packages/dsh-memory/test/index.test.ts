@@ -37,20 +37,31 @@ vi.mock('../src/embedding.js', async (importOriginal) => {
     ...actual,
     EmbeddingService: class {
       static constructed: Array<{ remote?: { model?: string } }> = []
-      state = 'disabled'
+      /** 测试开关：readyMode=true 时模拟就绪后端（走真实 EmbeddingIndex 建表/ensureAll
+       * 路径）；默认 false 保持既有 disabled 语义（装配测试不加载真实 ONNX） */
+      static readyMode = false
+      /** 测试开关：readyMode 下 embed/embedMany 抛错（模拟运行期嵌入故障——验证
+       * 索引联动失败被收容、装配不崩） */
+      static failEmbed = false
+      state = EmbeddingService.readyMode ? 'ready' : 'disabled'
       dimension = 384
-      backendLabel = 'local'
+      backendLabel = 'remote'
       constructor(deps: { remote?: { model?: string } }) {
         ;(this.constructor as { constructed: Array<{ remote?: { model?: string } }> }).constructed.push({
           remote: deps.remote,
         })
       }
       async init(): Promise<void> {}
+      get degradedReason(): string | undefined {
+        return undefined
+      }
       async embed(): Promise<Float32Array> {
-        throw new Error('mock 嵌入未就绪（index.test 不测 ready 路径）')
+        if (EmbeddingService.failEmbed) throw new Error('mock 嵌入故障（语义层降级）')
+        return new Float32Array(384)
       }
       async embedMany(): Promise<Float32Array[]> {
-        throw new Error('mock 嵌入未就绪（index.test 不测 ready 路径）')
+        if (EmbeddingService.failEmbed) throw new Error('mock 嵌入故障（语义层降级）')
+        return [new Float32Array(384)]
       }
     },
   }
@@ -298,6 +309,64 @@ describe('插件组合根（index.ts）', () => {
       for (const dispose of ctx.disposers) dispose()
       await new Promise((resolve) => setTimeout(resolve, 0))
       rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('迁移全坏/全跳过（migrated=0 且 skipped>0）：不 rename .bak（保留原文件 + 告警，可修复后重试）', async () => {
+    const store = tmpStore()
+    // 全部记录 schema 非法（缺字段）——迁移 0 条、跳过 2 条
+    writeFileSync(
+      store.jsonFile,
+      JSON.stringify({
+        tables: {
+          entries: {
+            a: { id: 'a', kind: 'fact', content: '缺字段' },
+            b: { id: 'b', kind: 'fact', content: '也缺字段' },
+          },
+        },
+      }),
+      'utf8',
+    )
+    const { ctx } = setup()
+    await mountMemory(ctx as never, { ...DEFAULTS } as never, { warn: () => {}, info: () => {} } as never, {
+      dbFile: store.dbFile,
+      legacyJsonFile: store.jsonFile,
+    })
+    // 原文件保留（未被改名 .bak）——数据仍原位可人工修复后重新迁移（Q6① 拍板）
+    expect(existsSync(store.jsonFile)).toBe(true)
+    expect(existsSync(`${store.jsonFile}.bak`)).toBe(false)
+    // 库为空（迁移 0 条，未 rename）
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(store.dbFile)
+    const count = (db.prepare('SELECT COUNT(*) AS c FROM entries').get() as { c: number }).c
+    expect(count).toBe(0)
+    db.close()
+    await cleanup(ctx, store.dir)
+  })
+
+  it('语义嵌入 ready 但运行期嵌入故障（ensureAll/indexEntry 失败）被收容——装配完成不崩 apply（Q6② 拍板：索引联动为附属效果，失败仅告警）', async () => {
+    const store = tmpStore()
+    // 经 legacy 迁移灌入条目（store 非空 → ensureAll 会真正调 embedMany 走失败收容路径）
+    writeFileSync(
+      store.jsonFile,
+      JSON.stringify({ tables: { entries: { a: makeEntry('a', '记忆甲'), b: makeEntry('b', '记忆乙') } } }),
+      'utf8',
+    )
+    const { ctx } = setup()
+    const EmbeddingServiceMock = EmbeddingService as unknown as { readyMode: boolean; failEmbed: boolean }
+    EmbeddingServiceMock.readyMode = true
+    EmbeddingServiceMock.failEmbed = true
+    try {
+      await expect(
+        mountMemory(ctx as never, { ...DEFAULTS } as never, { warn: () => {}, info: () => {} } as never, {
+          dbFile: store.dbFile,
+          legacyJsonFile: store.jsonFile,
+        }),
+      ).resolves.toBeUndefined()
+    } finally {
+      EmbeddingServiceMock.readyMode = false
+      EmbeddingServiceMock.failEmbed = false
+      await cleanup(ctx, store.dir)
     }
   })
 })

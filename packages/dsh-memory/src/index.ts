@@ -155,6 +155,9 @@ async function initEmbedding(
       listAll: () => store.listRecent(Number.MAX_SAFE_INTEGER),
       logWarn: (message, error) => logger.warn(message, error),
     })
+    // Q2 拍板：清理非当前维度的旧 vec0 表（维度切换后 ensureAll 已按当前维度
+    // 重嵌缺失条目，旧表无引用价值——防 vec_memory_<dim> 随维度切换无界堆积）
+    index.dropOtherDimensionTables()
     const legacyFile = legacyEmbeddingsFile(service.dimension)
     const migrated = await index.loadLegacy(legacyFile)
     if (migrated > 0) {
@@ -246,12 +249,21 @@ export async function mountMemory(
       await rename(legacyFile, `${legacyFile}.bak`).catch(() => {
         logger.warn('[dsh-memory] 损坏文件改名 .bak 失败（保留原位置）')
       })
-    } else if (migrated > 0 || skipped > 0) {
+    } else if (migrated > 0) {
       logger.info(`[dsh-memory] 记忆库已迁移至 SQLite：${migrated} 条导入，${skipped} 条跳过（原 memory.json 已改名 .bak 保留）`)
       // 原文件改名保留（迁移完成后旧文件不再作为数据源——防重复迁移）
       await rename(legacyFile, `${legacyFile}.bak`).catch(() => {
         logger.warn('[dsh-memory] memory.json 改名 .bak 失败（迁移已完成，旧文件保留原位置）')
       })
+    } else if (skipped > 0) {
+      // Q6①：全坏/全跳过（migrated=0 且 skipped>0）——**不** rename .bak：
+      // 否则旧记录只在 .bak 中、SQLite 仍空、无重试路径（数据静默不可达）。
+      // 保留原文件原位 + 明显告警：下次启动（SQLite 仍空）会重新尝试迁移，
+      // 坏数据可人工修复/导回后重试迁移。
+      logger.warn(
+        `[dsh-memory] 旧记忆库 ${legacyFile} 全部 ${skipped} 条记录校验失败（未导入任何条目）——` +
+          `保留原文件以便人工修复后重新迁移（SQLite 现为空库）`,
+      )
     }
   }
 
@@ -264,8 +276,15 @@ export async function mountMemory(
       logger.warn(`[dsh-memory] 发现 source 结构畸形的记忆条目（已从检索/浏览过滤，可用 memory_audit ${id} 查看）：${id}`)
     },
     {
-      // 新建记忆增量嵌入（fire-and-forget，嵌入失败仅记录，检索保持关键词）
-      onCreate: (entry) => holder.index?.indexEntry(entry),
+      // 新建记忆增量嵌入（fire-and-forget 附属效果）——嵌入失败**只记录**，不得
+      // 让主链路（store.create）出现未处理 rejection（DSH 对未处理拒绝 exit(1)
+      // 杀进程）；与 onArchive/onSupersede 的收容形态一致。非静默兜底：显式
+      // logWarn 让运行期嵌入故障可观测（面板/日志可见），检索保持关键词。
+      onCreate: (entry) => {
+        void holder.index?.indexEntry(entry).catch((error: unknown) =>
+          logger.warn(`[dsh-memory] 新建记忆嵌入索引失败（${entry.id}）：`, error),
+        )
+      },
       onArchive: (id) => {
         holder.index?.remove(id)
         // 归档条目不再参与因果图（孤儿清理；fire-and-forget 收容失败）
@@ -320,6 +339,10 @@ export async function mountMemory(
     // 最近一次远程验证失败原因（远程未生效时展示，杜绝静默回退——2026-08-17 实测根因）
     get embeddingInitError() {
       return holder.service?.lastInitError
+    },
+    // Q1/A：运行期跨维降级原因（语义已降级为关键词时展示——状态可见化，非静默）
+    get embeddingDegradedReason() {
+      return holder.service?.degradedReason
     },
     lastMaintenanceAt: maintenance.lastRunAt,
     // 自进化/因果观测（动态 getter：维护周期/手动触发后即时刷新，供 memory_status/面板）

@@ -92,6 +92,8 @@ export function createMemoryRpcHandler(
           // 展示"ready(local) 顶班 / 远程未生效"，杜绝静默降级
           embeddingBackend: runtime?.embeddingBackend,
           embeddingInitError: runtime?.embeddingInitError,
+          // Q1/A：运行期跨维降级原因（"已降级为关键词，需重新保存配置"可见）
+          embeddingDegradedReason: runtime?.embeddingDegradedReason,
           lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
           // 自进化/因果观测（null = 未运行/未接线——度量"反思是否变好"的可观测起点）
           reflection: runtime?.reflection ?? null,
@@ -151,8 +153,16 @@ async function handleSetConfig(rpc: MemoryRpcContext, payload: unknown): Promise
   const next = Config({ ...rpc.config(), ...partial }) as ResolvedConfig
   // ① 持久化：settings 命名空间 → ~/.dsh/settings.yaml（DSH 官方用户设置 seam）
   await rpc.settings.update(partial)
-  // ② 生效：装配层内存重启（noSave=true：不触发 loader 写回 cordis.yml）
-  await rpc.applyChange(next)
+  // ② 生效：装配层实时热换嵌入后端（settings.ts applyChange → initEmbedding）。
+  // Q6⑫ 中间态显式化：热换失败 ≠ 保存失败——配置已落盘（重启后自动生效），
+  // 错误信息必须明示这一"延迟生效"语义，面板不致误判为保存失败。
+  try {
+    await rpc.applyChange(next)
+  } catch (error) {
+    throw new Error(
+      `配置已保存（settings.yaml，重启后自动生效）但实时生效失败：${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
   return { config: configView(next) }
 }
 

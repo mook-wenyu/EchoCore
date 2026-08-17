@@ -56,6 +56,8 @@ export interface RuntimeHealth {
   embeddingBackend?: string
   /** 最近一次初始化期远程验证失败原因（远程未生效时展示，杜绝静默回退） */
   embeddingInitError?: string
+  /** Q1/A：运行期跨维降级原因（语义已降级为关键词时展示——状态可见化，非静默） */
+  embeddingDegradedReason?: string
   /** 反思观测：最近一次成功执行的观察量（审/决/合并/归档/跳过；未运行 null） */
   reflection?: ReflectionSummary | null
   /** 反思最近一次成功执行时刻（ISO；未运行 null） */

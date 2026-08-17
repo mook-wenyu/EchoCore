@@ -269,6 +269,13 @@ export class EmbeddingService {
    * 不静默降级。每次 init 开始重置（配置修正后热换不携带陈旧原因）。
    */
   lastInitError: string | undefined
+  /**
+   * 运行期降级原因（Q1/A 拍板 2026-08-17）：远程运行期故障且本地维度 ≠ 远程维度
+   * （禁止跨维顶班）时一次性记录——语义嵌入显式降级为关键词检索，原因对面板/
+   * 状态可读（"已降级，需重新保存配置或重启重建索引"）。每次 init 开始重置；
+   * 热换重建的**新实例**天然不带上一实例的原因。
+   */
+  runtimeDegraded: string | undefined
 
   private readonly hasLocalModel: () => Promise<boolean>
   private readonly loadLocalBackend: () => Promise<LocalEmbeddingBackend>
@@ -300,7 +307,14 @@ export class EmbeddingService {
   get backendLabel(): string {
     if (this.backend === 'remote') return 'remote'
     if (this.backend === 'local') return 'local'
+    // Q1/A：运行期跨维降级后的可辨识标签（区别于初始化期"远程验证失败"）
+    if (this.runtimeDegraded !== undefined) return 'remote(运行期降级)'
     return this.deps.remote !== undefined ? 'remote(验证失败)' : 'local'
+  }
+
+  /** 运行期降级原因（未降级 undefined；index.ts runtime 经此透给 status/面板） */
+  get degradedReason(): string | undefined {
+    return this.runtimeDegraded
   }
 
   /**
@@ -312,6 +326,7 @@ export class EmbeddingService {
     if (this.initPromise !== undefined) return this.initPromise
     // 每次初始化重置陈旧失败原因（配置修正后热换不携带上次的降级原因）
     this.lastInitError = undefined
+    this.runtimeDegraded = undefined
     this.stateValue = 'loading'
     this.initPromise = this.bootstrap().catch((error: unknown) => {
       this.stateValue = 'error'
@@ -396,16 +411,30 @@ export class EmbeddingService {
       }
       throw new EmbeddingUnavailableError(`语义嵌入不可用（state=${this.stateValue}）`)
     } catch (error) {
-      // 运行期故障回退：remote 失败且有本地模型 → 按需加载本地后端，切 local 重试一次。
-      // 初始化走远程成功时本地后端未加载（bootstrap 早退）——此处按需加载；
-      // 本地加载失败（模型损坏）则随本错误上抛（外层包装为 EmbeddingUnavailableError）。
+      // Q1/A 运行期降级语义（2026-08-17 用户拍板：禁止跨维度运行期顶班）。
+      // 根因：索引按就绪维度建表（vec_memory_<remoteDim>），运行期跨维切本地
+      // （384）会让 KNN MATCH / 向量写入维度错乱 → 抛裸 SQL 错、破坏检索降级契约。
+      // 因此仅当「本地维度 == 远程声明维度」时才允许切本地顶班（同维安全）；
+      // 否则**一次性**显式降级：state→disabled（语义不可用）、记录可观测原因
+      // （面板/状态提示"已降级为关键词，请重新保存配置或重启重建索引"）——
+      // 检索路径经 searchWithSemantic 的 state 门控走纯关键词，不抛裸错、不崩进程。
       if (this.backend === 'remote' && this.deps.remote !== undefined && (await this.hasLocalModel())) {
-        this.localBackend ??= await this.loadLocalBackend()
-        this.backend = 'local'
-        this.dimensionValue = LOCAL_EMBEDDING_DIMENSION
-        const vectors: Float32Array[] = []
-        for (const text of texts) vectors.push(await this.localBackend.embed(text))
-        return vectors
+        if (LOCAL_EMBEDDING_DIMENSION === this.deps.remote.dimension) {
+          this.localBackend ??= await this.loadLocalBackend()
+          this.backend = 'local'
+          this.dimensionValue = LOCAL_EMBEDDING_DIMENSION
+          const vectors: Float32Array[] = []
+          for (const text of texts) vectors.push(await this.localBackend.embed(text))
+          return vectors
+        }
+        // 跨维且本地模型存在：禁止顶班 → 显式降级（后续 embed/embedMany 均按
+        // state 门控拒绝，不再反复尝试远程——一次性决策，状态稳定可观测）
+        this.stateValue = 'disabled'
+        this.backend = undefined
+        this.runtimeDegraded =
+          `远程嵌入运行期失败且本地模型维度(${LOCAL_EMBEDDING_DIMENSION})与远程配置维度(${this.deps.remote.dimension})不匹配——` +
+          `语义嵌入已显式降级为关键词检索；请重新保存嵌入配置或重启以重建嵌入索引。` +
+          `原始错误：${error instanceof Error ? error.message : String(error)}`
       }
       if (error instanceof EmbeddingUnavailableError) throw error
       throw new EmbeddingUnavailableError(`嵌入失败：${error instanceof Error ? error.message : String(error)}`, { cause: error })
