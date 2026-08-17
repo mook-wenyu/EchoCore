@@ -131,7 +131,7 @@ describe('插件组合根（index.ts）', () => {
     expect(ctx.listeners.get('agent/disposed')?.size ?? 0).toBeGreaterThanOrEqual(1)
     // RPC 已注册；六个工具已注册
     expect(connection.rpc.handle).toHaveBeenCalledWith('/memory', expect.any(Function), { authority: 'loopback' })
-    expect(ctx.toolDefs.size).toBe(6)
+    expect(ctx.toolDefs.size).toBe(7)
     // 稳定快照段已注册（P1：systemPrompt.context）
     expect(ctx.systemPromptContexts.has('memory:snapshot')).toBe(true)
     // 卸载：effect disposer 存在（SQLite 关闭）

@@ -68,12 +68,24 @@ const MS_PER_DAY = 86_400_000
  */
 export const MAINTENANCE_INTERVAL_MS = 1 * 3_600_000
 
-/** 整理任务依赖（store/logger/now 注入，便于单测；无 llm——任务纯规则） */
+/**
+ * LLM 子任务形状（反思/因果抽取共用）：runOnce(route, {force?}) 自含周期门控与
+ * 自收容（不抛错）。结构类型注入——maintenance 不依赖具体模块，测试可用假件。
+ */
+interface Subtask {
+  runOnce(route: { provider: string; model: string }, opts?: { force?: boolean }): Promise<unknown>
+}
+
+/** 整理任务依赖（store/logger/now 注入，便于单测）。纯规则任务不依赖 llm；反思/因果为可选 LLM 子任务 */
 export interface MemoryMaintenanceDeps {
   store: MemoryStore
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
   /** 当前时刻（毫秒）；测试注入固定时钟 */
   now: () => number
+  /** 反思自进化子任务（可选；注入则每批规则后按其自身周期门控执行，缺省不调 LLM） */
+  reflector?: Subtask
+  /** 因果抽取子任务（可选；注入则每批规则后按其自身周期门控执行，缺省不调 LLM） */
+  causal?: Subtask
 }
 
 /** 最近一次活跃会话（供批处理的模型路由解析） */
@@ -186,6 +198,10 @@ export class MemoryMaintenance {
       await this.mergeDuplicates(window)
       await this.archiveStale(window)
       await this.normalizeTags(window)
+      // LLM 子任务（反思/因果抽取）：规则任务之后串行执行（各自带周期门控与自收容）。
+      // 与规则任务同处 runOnce 成功路径——任一段失败仅告警不影响后续与批次完成记录。
+      await this.runSubtask('反思', this.deps.reflector?.runOnce(route))
+      await this.runSubtask('因果抽取', this.deps.causal?.runOnce(route))
       // O1：批次完成时刻记录（成功路径；失败由 catch 告警且不更新——可观测"上次成功维护"）
       this.lastRunAtValue = new Date().toISOString()
     } catch (error) {
@@ -295,6 +311,20 @@ export class MemoryMaintenance {
       } catch (error) {
         this.deps.logger.warn(`[dsh-memory] 标签整理失败（${entry.id}）：`, error)
       }
+    }
+  }
+
+  /**
+   * 执行一个可选 LLM 子任务（反思/因果抽取；注入缺失则跳过）。
+   * 子任务自含周期门控与自收容（正常不抛错）；此处兜底再收一次——后台批次
+   * 绝不让必然成功之外的 rejection 逃逸（防测试假件/异常实现上抛打翻整批）。
+   */
+  private async runSubtask(name: string, task: Promise<unknown> | undefined): Promise<void> {
+    if (task === undefined) return
+    try {
+      await task
+    } catch (error) {
+      this.deps.logger.warn(`[dsh-memory] ${name} 子任务执行失败：`, error)
     }
   }
 }

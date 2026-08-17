@@ -352,3 +352,54 @@ describe('memory RPC 配置端点（面板配置）', () => {
     expect(calls).toHaveLength(0)
   })
 })
+
+describe('memory RPC reflect 端点与自进化/因果观测', () => {
+  it('reflect：未接线反思器 → ran:false', async () => {
+    const { handler } = setup()
+    const result = await handler('reflect', {})
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect((result.value as { ran: boolean }).ran).toBe(false)
+  })
+
+  it('reflect：接线后 force 触发并返回观察量（面板无会话 → route 回退反思器缓存）', async () => {
+    const { store, rpc } = setup()
+    const reflector = {
+      async runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }) {
+        expect(route).toBeUndefined()
+        expect(opts?.force).toBe(true)
+        return { reviewed: 5, decisions: 3, merged: 2, archived: 1, skipped: 1 }
+      },
+    }
+    const handler = createMemoryRpcHandler(store, rpc, undefined, reflector)
+    const result = await handler('reflect', {})
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value).toEqual({ ran: true, reviewed: 5, decisions: 3, merged: 2, archived: 1, skipped: 1 })
+  })
+
+  it('status：透出自进化/因果观测（缺省为 null）', async () => {
+    const { store, rpc } = setup()
+    const handler = createMemoryRpcHandler(store, rpc, {
+      writeFailures: 1,
+      embeddingState: 'ready',
+      lastMaintenanceAt: null,
+      reflection: { reviewed: 2, decisions: 1, merged: 1, archived: 0, skipped: 0 },
+      lastReflectionAt: '2026-08-17T00:00:00.000Z',
+      causal: { reviewed: 3, edges: 1, created: 1, skipped: 0 },
+      lastCausalAt: '2026-08-17T01:00:00.000Z',
+    })
+    const result = await handler('status', {})
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const value = result.value as {
+      reflection: { reviewed: number }
+      causal: { created: number }
+      lastReflectionAt: string | null
+    }
+    expect(value.reflection?.reviewed).toBe(2)
+    expect(value.causal?.created).toBe(1)
+    expect(value.lastReflectionAt).toBe('2026-08-17T00:00:00.000Z')
+  })
+})
+

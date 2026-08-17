@@ -17,6 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { Config, DEFAULTS, type Config as ConfigType, type ResolvedConfig } from './config.js'
+import { MemoryCausalExtractor, MemoryCausalStore } from './causal.js'
 import { EmbeddingIndex } from './embed-index.js'
 import { EmbeddingService, EmbeddingUnavailableError, resolveApiKey, type EmbeddingHolder } from './embedding.js'
 import { MemoryExtractor } from './extractor.js'
@@ -24,6 +25,7 @@ import { registerMemoryRpc, type MemoryRpcContext } from './host-rpc.js'
 import { MemoryInjector } from './injector.js'
 import { MemoryMaintenance } from './maintenance.js'
 import { MEMORY_TABLE, memoryEntrySchema } from './memory-domain.js'
+import { MemoryReflector } from './reflect.js'
 import { registerSnapshot } from './snapshot.js'
 import { migrateMemoryJson, SqliteKvTable } from './sqlite-kv.js'
 import { MemoryStableSnapshot } from './stable-snapshot.js'
@@ -31,7 +33,7 @@ import { MemoryStore } from './store.js'
 import { installSettingsSeam, type SettingsSeam } from './settings.js'
 import { registerMemoryTools } from './tools.js'
 import { jiebaWords } from './scoring.js'
-import type { MemoryEntry } from './types.js'
+import type { MemoryCausalEdge, MemoryEntry } from './types.js'
 
 export const name = 'memory'
 // 直接访问的服务必须全部声明注入（Cordis 守卫：未声明即拒绝）：
@@ -214,6 +216,10 @@ export async function mountMemory(
     if (db.isOpen) db.close()
   })
   const table = new SqliteKvTable<MemoryEntry>(db, MEMORY_TABLE, (entry) => jiebaWords(entry.content).join(' '))
+  // 因果链独立边表（拍板：独立边表——不污染 MemoryEntry JSON；与 entries 同库共连接，
+  // SqliteKvTable 泛型自动 CREATE TABLE IF NOT EXISTS，无迁移成本）
+  const edgeTable = new SqliteKvTable<MemoryCausalEdge>(db, 'memory_causal_edges')
+  const causalStore = new MemoryCausalStore(edgeTable, () => Date.now())
 
   // 嵌入后端持有者 + 实时生效器接线（面板保存热换嵌入后端，不重启插件——
   // 重启与 apply 秒级异步段竞态，2026-08-16 实测 fatal load failure，见上方
@@ -260,9 +266,17 @@ export async function mountMemory(
     {
       // 新建记忆增量嵌入（fire-and-forget，嵌入失败仅记录，检索保持关键词）
       onCreate: (entry) => holder.index?.indexEntry(entry),
-      onArchive: (id) => holder.index?.remove(id),
-      // P2-1：被覆盖条目联动移除向量（检索已隐藏，向量不再有语义召回价值）
-      onSupersede: (id) => holder.index?.remove(id),
+      onArchive: (id) => {
+        holder.index?.remove(id)
+        // 归档条目不再参与因果图（孤儿清理；fire-and-forget 收容失败）
+        void causalStore.removeEdgesFor(id).catch((error: unknown) => logger.warn(`[dsh-memory] 归档关联因果边清理失败（${id}）：`, error))
+      },
+      // P2-1：被覆盖条目联动移除向量（检索已隐藏，向量不再有语义召回价值）；
+      // 其因果边指向受隐藏条目已无审计价值——一并清理（与向量同生命周期）
+      onSupersede: (id) => {
+        holder.index?.remove(id)
+        void causalStore.removeEdgesFor(id).catch((error: unknown) => logger.warn(`[dsh-memory] 覆盖关联因果边清理失败（${id}）：`, error))
+      },
     },
   ))
 
@@ -284,11 +298,15 @@ export async function mountMemory(
   // embedding 传 holder（调用时读 service/index——面板保存热换后即生效，无需重启）
   new MemoryInjector({ store, snapshot: snapshotService, embedding: holder, logger }).install(ctx)
 
+  // LLM 子任务（自进化/因果链）：复用 ctx.llm（与提取器同通道）。维护周期每批
+  // 规则任务后按各自周期门控自动执行；工具/RPC 可 force 手动触发。
+  const reflector = new MemoryReflector({ store, llm: ctx.llm, logger, now: () => Date.now() })
+  const causalExtractor = new MemoryCausalExtractor({ store, causal: causalStore, llm: ctx.llm, logger, now: () => Date.now() })
   // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）
-  const maintenance = new MemoryMaintenance({ store, logger, now: () => Date.now() })
+  const maintenance = new MemoryMaintenance({ store, logger, now: () => Date.now(), reflector, causal: causalExtractor })
   maintenance.install(ctx)
 
-  // O1：运行健康指标组装（写链失败/嵌入状态/上次维护——tools status 与 RPC status 共用）
+  // O1：运行健康指标组装（写链失败/嵌入状态/上次维护/反思因果——tools status 与 RPC status 共用）
   const runtime = {
     writeFailures: table.writeFailures,
     // 动态读 holder（热换后状态即时刷新；getter 惰性求值）
@@ -304,19 +322,33 @@ export async function mountMemory(
       return holder.service?.lastInitError
     },
     lastMaintenanceAt: maintenance.lastRunAt,
+    // 自进化/因果观测（动态 getter：维护周期/手动触发后即时刷新，供 memory_status/面板）
+    get reflection() {
+      return reflector.lastSummary
+    },
+    get lastReflectionAt() {
+      return reflector.lastRunAt
+    },
+    get causal() {
+      return causalExtractor.lastSummary
+    },
+    get lastCausalAt() {
+      return causalExtractor.lastRunAt
+    },
   }
 
-  // 模型工具：recall / search / note / forget / audit / status
+  // 模型工具：recall / search / note / forget / audit / status / reflect
   // （G3：snapshot 传入供工具回路去重——快照已注入的记忆不再由工具重复输出）
-  registerMemoryTools(ctx, { store, snapshot: snapshotService, embedding: holder, logger, runtime })
+  registerMemoryTools(ctx, { store, snapshot: snapshotService, embedding: holder, logger, runtime, causal: causalStore, reflector })
 
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
   registerSnapshot(ctx, { store, logger })
 
   // 面板 RPC：connection 通道（/memory），客户端 settings.section 面板的数据面；
   // 配置端点由 settings seam 供数（getConfig 读生效配置 / setConfig 持久化到
-  // settings.yaml 并经实时生效器热换嵌入后端——根因修复见 settings.ts 文件头）
-  registerMemoryRpc(ctx, store, rpcContextFrom(overrides.seam, config), runtime)
+  // settings.yaml 并经实时生效器热换嵌入后端——根因修复见 settings.ts 文件头）；
+  // reflect 端点 = 面板手动触发反思（route 缺省回退反思器缓存——面板无会话）
+  registerMemoryRpc(ctx, store, rpcContextFrom(overrides.seam, config), runtime, reflector)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }

@@ -18,6 +18,7 @@ import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 
 import type { MemoryStore } from './store.js'
 import { toDetail, toSummary, type RuntimeHealth } from './tools.js'
+import type { ReflectionSummary } from './reflect.js'
 import type { MemoryKind } from './types.js'
 import { Config, DEFAULTS, type ResolvedConfig } from './config.js'
 import { resolveApiKey } from './embedding.js'
@@ -62,14 +63,25 @@ export interface MemoryRpcContext {
   applyChange(next: ResolvedConfig): Promise<void>
 }
 
-/** 构造 RPC 分发器（O1：runtime 健康指标可选注入——status 端点覆盖 store 占位） */
-export function createMemoryRpcHandler(store: MemoryStore, rpc: MemoryRpcContext, runtime?: RuntimeHealth): MemoryRpcHandler {
+/** 反思触发形状（面板 RPC 手动触发；route 缺省回退反思器缓存——面板无会话） */
+export interface ReflectTrigger {
+  runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<ReflectionSummary | undefined>
+}
+
+/** 构造 RPC 分发器（O1：runtime 健康指标可选注入——status 端点覆盖 store 占位；reflector 可选——reflect 端点） */
+export function createMemoryRpcHandler(
+  store: MemoryStore,
+  rpc: MemoryRpcContext,
+  runtime?: RuntimeHealth,
+  reflector?: ReflectTrigger,
+): MemoryRpcHandler {
   return async (endpoint, payload) => {
     try {
       if (endpoint === 'list') return ok(await handleList(store, payload))
       if (endpoint === 'search') return ok(await handleSearch(store, payload))
       if (endpoint === 'get') return ok(handleGet(store, payload))
       if (endpoint === 'archive') return ok(await handleArchive(store, payload))
+      if (endpoint === 'reflect') return ok(await handleReflect(reflector))
       if (endpoint === 'status') {
         const stats = store.stats()
         return ok({
@@ -81,6 +93,11 @@ export function createMemoryRpcHandler(store: MemoryStore, rpc: MemoryRpcContext
           embeddingBackend: runtime?.embeddingBackend,
           embeddingInitError: runtime?.embeddingInitError,
           lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
+          // 自进化/因果观测（null = 未运行/未接线——度量"反思是否变好"的可观测起点）
+          reflection: runtime?.reflection ?? null,
+          lastReflectionAt: runtime?.lastReflectionAt ?? null,
+          causal: runtime?.causal ?? null,
+          lastCausalAt: runtime?.lastCausalAt ?? null,
         })
       }
       if (endpoint === 'getConfig') return ok({ config: configView(rpc.config()) })
@@ -89,6 +106,26 @@ export function createMemoryRpcHandler(store: MemoryStore, rpc: MemoryRpcContext
     } catch (error) {
       return internalError(error instanceof Error ? error.message : String(error))
     }
+  }
+}
+
+/**
+ * reflect 端点：面板手动触发一轮反思（force 无视周期门控）。
+ * 无会话路由 → 反思器回退缓存的上次路由；未接线或仍无路由 → ran:false（诚实返回）。
+ */
+async function handleReflect(
+  reflector: ReflectTrigger | undefined,
+): Promise<{ ran: boolean; reviewed?: number; decisions?: number; merged?: number; archived?: number; skipped?: number }> {
+  if (reflector === undefined) return { ran: false }
+  const summary = await reflector.runOnce(undefined, { force: true })
+  if (summary === undefined) return { ran: false }
+  return {
+    ran: true,
+    reviewed: summary.reviewed,
+    decisions: summary.decisions,
+    merged: summary.merged,
+    archived: summary.archived,
+    skipped: summary.skipped,
   }
 }
 
@@ -126,11 +163,17 @@ async function handleSetConfig(rpc: MemoryRpcContext, payload: unknown): Promise
  * ctx.get 返回 unknown，类型强转保留（Cordis 未在 Context 类型声明 connection）。
  * @param rpc - 配置端点运行时依赖（index.ts 从 settings seam 构建）
  */
-export function registerMemoryRpc(ctx: Context, store: MemoryStore, rpc: MemoryRpcContext, runtime?: RuntimeHealth): void {
+export function registerMemoryRpc(
+  ctx: Context,
+  store: MemoryStore,
+  rpc: MemoryRpcContext,
+  runtime?: RuntimeHealth,
+  reflector?: ReflectTrigger,
+): void {
   const connection = ctx.get('connection') as {
     rpc: { handle(channel: string, handler: MemoryRpcHandler, options: { authority: string }): () => Promise<void> }
   }
-  const dispose = connection.rpc.handle('/memory', createMemoryRpcHandler(store, rpc, runtime), { authority: 'loopback' })
+  const dispose = connection.rpc.handle('/memory', createMemoryRpcHandler(store, rpc, runtime, reflector), { authority: 'loopback' })
   ctx.effect(() => () => {
     void dispose()
   })

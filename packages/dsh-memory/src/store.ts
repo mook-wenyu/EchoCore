@@ -433,14 +433,22 @@ export class MemoryStore {
     }
   }
 
-  /** 归档（软删除）：从检索结果中消失，审计与来源保留（D-D 裁决：无 restore——恢复=重建，审计可溯源） */
-  async archive(id: string, by: AuditActor): Promise<boolean> {
+  /**
+   * 归档（软删除）：从检索结果中消失，审计与来源保留（D-D 裁决：无 restore——
+   * 恢复=重建，审计可溯源）。
+   * detail 为可选依据说明（自进化/因果模块传入"为什么归档"——审计 detail 是
+   * 追加式审计的可读字段；既有调用不传则与原行为完全一致，向后兼容）。
+   */
+  async archive(id: string, by: AuditActor, detail?: string): Promise<boolean> {
     try {
       await this.table.update(id, (current) => ({
         ...current,
         status: 'archived' as const,
         updatedAt: this.iso(),
-        audit: [...current.audit, { action: 'archive' as const, at: this.iso(), by }],
+        audit: [
+          ...current.audit,
+          { action: 'archive' as const, at: this.iso(), by, ...(detail !== undefined ? { detail } : {}) },
+        ],
       }))
       this.revisionValue++
       // P4：嵌入索引联动（归档条目不再参与检索，移除向量防陈旧占用）

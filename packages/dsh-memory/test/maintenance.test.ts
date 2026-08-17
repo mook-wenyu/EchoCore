@@ -373,3 +373,69 @@ describe('MemoryMaintenance 定时器清理', () => {
     }
   })
 })
+
+describe('MemoryMaintenance LLM 子任务接线（反思/因果）', () => {
+  it('注入反思/因果子任务后 runOnce 依次调用并透传路由（规则任务之后）', async () => {
+    const calls: string[] = []
+    const reflector = {
+      async runOnce(route: { provider: string; model: string }) {
+        calls.push(`reflect:${route.provider}/${route.model}`)
+        return { reviewed: 1, decisions: 0, merged: 0, archived: 0, skipped: 0 }
+      },
+    }
+    const causal = {
+      async runOnce(route: { provider: string; model: string }) {
+        calls.push(`causal:${route.provider}/${route.model}`)
+        return { reviewed: 1, edges: 0, created: 0, skipped: 0 }
+      },
+    }
+    const ctx = new FakeCtx()
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => NOW)
+    const maintenance = new MemoryMaintenance({
+      store,
+      logger: { warn: () => {}, info: () => {} },
+      now: () => NOW,
+      reflector,
+      causal,
+    })
+    maintenance.install(ctx as unknown as Context)
+    const sessionEvent = ctx.listener('session/event') as (session: Session, event: SessionEvent) => void
+    activate(sessionEvent, makeSession('s1'))
+    await maintenance.runOnce()
+    // 规则任务后按序调用：反思 → 因果；路由来自会话 request/header
+    expect(calls).toEqual(['reflect:deepseek/m', 'causal:deepseek/m'])
+  })
+
+  it('子任务抛错不打断批次：warn 后继续执行其余子任务，批次完成记录照常更新', async () => {
+    const calls: string[] = []
+    const reflector = {
+      async runOnce() {
+        throw new Error('反思器爆炸')
+      },
+    }
+    const causal = {
+      async runOnce(route: { provider: string; model: string }) {
+        calls.push(`causal:${route.provider}/${route.model}`)
+        return { reviewed: 0, edges: 0, created: 0, skipped: 0 }
+      },
+    }
+    const ctx = new FakeCtx()
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => NOW)
+    const maintenance = new MemoryMaintenance({
+      store,
+      logger: { warn: () => {}, info: () => {} },
+      now: () => NOW,
+      reflector,
+      causal,
+    })
+    maintenance.install(ctx as unknown as Context)
+    const sessionEvent = ctx.listener('session/event') as (session: Session, event: SessionEvent) => void
+    activate(sessionEvent, makeSession('s1'))
+    await expect(maintenance.runOnce()).resolves.toBeUndefined()
+    expect(calls).toEqual(['causal:deepseek/m'])
+    expect(maintenance.lastRunAt).not.toBeNull() // 批次成功完成（子任务失败被收容）
+  })
+})
+

@@ -11,10 +11,15 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { JsonValue } from '@deepseek-ai/dsh-session'
 
+import type { MemoryCausalStore } from './causal.js'
 import { DEFAULT_WORKSPACE, EXCERPT_MAX_CHARS } from './constants.js'
+import { resolveRoute } from './extract.js'
 import { searchWithSemantic, type EmbeddingHolder } from './embedding.js'
+import type { CausalSummary } from './causal.js'
 import { formatMemoryLine } from './render.js'
+import type { ReflectionSummary } from './reflect.js'
 import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry, MemoryKind } from './types.js'
@@ -34,6 +39,12 @@ export interface MemoryToolsDeps {
   logger?: Pick<ReturnType<Context['logger']>, 'warn'>
   /** O1 运行健康指标（装配层组装；测试环境不传 → 占位） */
   runtime?: RuntimeHealth
+  /** 因果边表（可选：memory_audit 渲染因果视图用；未接线不显示因果链） */
+  causal?: MemoryCausalStore
+  /** 反思器（可选：memory_reflect 手动触发用；未接线时工具仍注册并诚实返回未执行） */
+  reflector?: {
+    runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<ReflectionSummary | undefined>
+  }
 }
 
 /** O1：运行健康指标（写链失败/嵌入状态/维护时间——"写失败一眼可见"闭环） */
@@ -45,6 +56,14 @@ export interface RuntimeHealth {
   embeddingBackend?: string
   /** 最近一次初始化期远程验证失败原因（远程未生效时展示，杜绝静默回退） */
   embeddingInitError?: string
+  /** 反思观测：最近一次成功执行的观察量（审/决/合并/归档/跳过；未运行 null） */
+  reflection?: ReflectionSummary | null
+  /** 反思最近一次成功执行时刻（ISO；未运行 null） */
+  lastReflectionAt?: string | null
+  /** 因果抽取观测：最近一次成功批次（审/提边/建成/跳过；未运行 null） */
+  causal?: CausalSummary | null
+  /** 因果抽取最近一次成功批次时刻（ISO；未运行 null） */
+  lastCausalAt?: string | null
 }
 
 /** 记忆条目的最小规范形态（工具输出与 RPC 共用） */
@@ -118,7 +137,7 @@ export function sessionIdOf(exec: { agent?: Agent }): string {
   return exec.agent.id
 }
 
-/** 注册全部记忆工具；返回各注册的 disposer 集合（随插件 fiber 自动清理） */
+/** 注册全部记忆工具（七件：+ memory_reflect）；返回各注册的 disposer 集合（随插件 fiber 自动清理） */
 export function registerMemoryTools(ctx: Context, deps: MemoryToolsDeps): void {
   registerRecall(ctx, deps)
   registerSearch(ctx, deps)
@@ -126,6 +145,7 @@ export function registerMemoryTools(ctx: Context, deps: MemoryToolsDeps): void {
   registerForget(ctx, deps)
   registerAudit(ctx, deps)
   registerStatus(ctx, deps)
+  registerReflect(ctx, deps)
 }
 
 /** memory_recall：按查询检索 Top-K 相关记忆（显式召回路径） */
@@ -464,6 +484,38 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
               },
               additionalProperties: false,
             },
+            // 因果链视图（可选：未接线因果边表或无边时不返回）——保守利用：v1 仅审计展示，
+            // 不做检索沿链扩散（"仅因果方向扩散更优"无直接论文证明，见设计说明）
+            causal: {
+              type: 'object',
+              properties: {
+                causedBy: {
+                  type: 'array',
+                  required: true,
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string', required: true, description: '短记忆 id（前 8 位）' },
+                      confidence: { type: 'number', required: true, description: '边置信 0-1' },
+                    },
+                    additionalProperties: false,
+                  },
+                },
+                causeOf: {
+                  type: 'array',
+                  required: true,
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string', required: true, description: '短记忆 id（前 8 位）' },
+                      confidence: { type: 'number', required: true, description: '边置信 0-1' },
+                    },
+                    additionalProperties: false,
+                  },
+                },
+              },
+              additionalProperties: false,
+            },
           },
           additionalProperties: false,
         },
@@ -476,6 +528,19 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
             entry.supersededBy != null || entry.supersedes != null
               ? `supersede 链：${entry.supersedes != null ? `覆盖了 #${entry.supersedes.slice(0, 8)}` : ''}${entry.supersededBy != null && entry.supersedes != null ? '；' : ''}${entry.supersededBy != null ? `被 #${entry.supersededBy.slice(0, 8)} 覆盖` : ''}`
               : ''
+          // 因果链视图（v1 保守：仅审计展示，供模型做多跳排查/反事实）
+          const causal = value.causal
+          const causalLines =
+            causal === undefined
+              ? []
+              : [
+                  ...(causal.causedBy.length > 0
+                    ? [`因果（被谁影响/支撑）：${causal.causedBy.map((c) => `#${c.id}（置信 ${c.confidence}）`).join('、')}`]
+                    : []),
+                  ...(causal.causeOf.length > 0
+                    ? [`因果（影响/支撑谁）：${causal.causeOf.map((c) => `#${c.id}（置信 ${c.confidence}）`).join('、')}`]
+                    : []),
+                ]
           const lines = [
             `记忆 #${entry.id.slice(0, 8)}（${entry.kind}，重要度 ${entry.importance}，状态 ${entry.status}）`,
             `内容：${entry.content}`,
@@ -484,6 +549,7 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
             `原文摘录：${entry.source.excerpt.slice(0, 200)}${entry.source.excerpt.length > 200 ? '…' : ''}`,
             `访问次数：${entry.accessCount}`,
             ...(supersedeLine !== '' ? [supersedeLine] : []),
+            ...causalLines,
             `审计日志：`,
             ...entry.audit.map((record) => `  - ${record.at} [${record.by}] ${record.action}${record.detail ? `：${record.detail}` : ''}`),
           ]
@@ -493,7 +559,77 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
       async execute(args) {
         const entry = deps.store.getById(args.id)
         if (entry === undefined) return { found: false, entry: undefined }
-        return { found: true, entry: toDetail(entry) }
+        const detail = toDetail(entry)
+        if (deps.causal === undefined) return { found: true, entry: detail }
+        // 因果装订：out（本条→target）= 本条支撑/导致谁；in（source→本条）= 谁影响/支撑本条
+        const { out, in: inEdges } = deps.causal.edgesOf(entry.id)
+        return {
+          found: true,
+          entry: detail,
+          causal: {
+            causedBy: inEdges.map((edge) => ({ id: edge.sourceId.slice(0, 8), confidence: edge.confidence })),
+            causeOf: out.map((edge) => ({ id: edge.targetId.slice(0, 8), confidence: edge.confidence })),
+          },
+        }
+      },
+    }),
+  )
+}
+
+/**
+ * memory_reflect：手动触发一轮 LLM 反思（自进化）。
+ * 与维护周期共用同一 MemoryReflector（force 跳过周期门控即时执行）；只做可逆的
+ * "归档一侧"动作，审计 by:'system' 可回滚。未接线/无路由 → 诚实返回 ran:false。
+ */
+function registerReflect(ctx: Context, deps: MemoryToolsDeps): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'memory_reflect',
+      description:
+        '立即执行一轮记忆反思（LLM 自进化）：审视已有记忆条目间的语义近似重复与跨条目矛盾，' +
+        '只执行可逆的"归档一侧"动作（归档较旧、保留较新，审计可回滚）。' +
+        '适用于手动触发/验证反思效果；平时由维护周期自动运行。',
+      parameters: {},
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ran: { type: 'boolean', required: true },
+            reviewed: { type: 'integer', required: true },
+            decisions: { type: 'integer', required: true },
+            merged: { type: 'integer', required: true },
+            archived: { type: 'integer', required: true },
+            skipped: { type: 'integer', required: true },
+          },
+          additionalProperties: false,
+        },
+        render: (_args, value) => [
+          {
+            type: 'text',
+            text: value.ran
+              ? `反思完成：审定 ${value.reviewed} 条焦点 · 提议 ${value.decisions} 个动作 · 合并 ${value.merged} · 矛盾归档 ${value.archived} · 跳过/拒绝 ${value.skipped}（审计 by:system，可回滚）`
+              : '反思未执行：当前无可用模型路由，或反思器未接线。',
+          },
+        ],
+      },
+      async execute(_args, exec) {
+        if (deps.reflector === undefined) {
+          return { ran: false, reviewed: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 }
+        }
+        // 路由：优先从当前执行会话解析；无 agent 则传给反思器回退其缓存路由（仅 RPC 面板场景）
+        const route = exec.agent === undefined ? undefined : resolveRoute(exec.agent.session, exec.agent)
+        const summary = await deps.reflector.runOnce(route, { force: true })
+        if (summary === undefined) {
+          return { ran: false, reviewed: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 }
+        }
+        return {
+          ran: true,
+          reviewed: summary.reviewed,
+          decisions: summary.decisions,
+          merged: summary.merged,
+          archived: summary.archived,
+          skipped: summary.skipped,
+        }
       },
     }),
   )
@@ -530,6 +666,11 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
             // O1：string|null 形态——ValueSchemaSpec 无联合 type，用 'json' 声明
             lastMaintenanceAt: { type: 'json', required: true },
             rejectedCount: { type: 'integer', required: true },
+            // 自进化/因果链观测（null = 未运行/未接线；'json' 承载对象或 null）
+            reflection: { type: 'json', required: true },
+            lastReflectionAt: { type: 'json', required: true },
+            causal: { type: 'json', required: true },
+            lastCausalAt: { type: 'json', required: true },
           },
           additionalProperties: false,
         },
@@ -541,6 +682,14 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
               `fact ${value.byKind.fact} · preference ${value.byKind.preference} · decision ${value.byKind.decision} · todo ${value.byKind.todo} · insight ${value.byKind.insight}`,
               `运行健康：写失败 ${value.writeFailures} 次 · 嵌入 ${value.embeddingState} · 上次维护 ${value.lastMaintenanceAt ?? '未运行'}`,
               `写端门：已拦截 ${value.rejectedCount} 条噪声（extractor 通道）`,
+              // 自进化/因果观测（A′ 建议 5：度量"反思是否真正变好"的起点——先可观测，再谈优化；
+              // schema 为 json 承载 null/对象，读取时经 unknown 收窄为行为形状）
+              `反思自进化：上次 ${value.lastReflectionAt ?? '未运行'}${
+                value.reflection ? `（审定 ${(value.reflection as unknown as ReflectionSummary).reviewed} · 合并 ${(value.reflection as unknown as ReflectionSummary).merged} · 矛盾归档 ${(value.reflection as unknown as ReflectionSummary).archived} · 跳过 ${(value.reflection as unknown as ReflectionSummary).skipped}）` : ''
+              }`,
+              `因果链：上次 ${value.lastCausalAt ?? '未运行'}${
+                value.causal ? `（审 ${(value.causal as unknown as CausalSummary).reviewed} · 建边 ${(value.causal as unknown as CausalSummary).created} · 跳过 ${(value.causal as unknown as CausalSummary).skipped}）` : ''
+              }`,
             ].join('\n'),
           },
         ],
@@ -559,6 +708,11 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
           lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
           // R2：P2 写端门拒绝计数（store 自身可观测，直读 stats）
           rejectedCount: stats.rejectedCount,
+          // json 承载对象或 null（schema 为 'json'）；运行时对象即为 JsonValue（显式收窄）
+          reflection: (runtime?.reflection ?? null) as JsonValue,
+          lastReflectionAt: runtime?.lastReflectionAt ?? null,
+          causal: (runtime?.causal ?? null) as JsonValue,
+          lastCausalAt: runtime?.lastCausalAt ?? null,
         }
       },
     }),

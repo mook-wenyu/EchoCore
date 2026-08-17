@@ -5,18 +5,20 @@
 
 import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
+import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
-import { registerMemoryTools, sessionIdOf, toDetail, toSummary, workspaceOf } from '../src/tools.js'
+import { MemoryCausalStore } from '../src/causal.js'
+import { registerMemoryTools, sessionIdOf, toDetail, toSummary, workspaceOf, type RuntimeHealth } from '../src/tools.js'
 import { MemoryStore } from '../src/store.js'
 import { MemoryStableSnapshot } from '../src/stable-snapshot.js'
-import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
+import type { MemoryCausalEdge, MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
 
-/** 假执行上下文（workspace 解析用） */
+/** 假执行上下文（workspace/路由解析用；agent 带空 options——真实 Agent 必有该字段） */
 function fakeExec(agentId = 's1', cwd = 'D:/workspace') {
   return {
-    agent: { id: agentId, session: { id: agentId, header: { cwd } } },
+    agent: { id: agentId, session: { id: agentId, header: { cwd } }, options: {} },
     signal: new AbortController().signal,
   }
 }
@@ -35,12 +37,26 @@ function fakeSnapshot(snapshotIdsOf: (workspace: string) => ReadonlySet<string> 
 /** 组装被测对象：注册全部工具，返回定义表、store 与 table（R3-1：统一 FakeCtx）
  * - store：可注入既有 MemoryStore（去重用例需让工具与播种共享同一存储）；
  * - snapshotOf：通过即可注入快照 id 视图（缺省假快照空集 = 不触发去重）；
- * - runtime：O1 运行健康指标（缺省不传 = 占位路径）。 */
-function setup(opts?: { snapshotOf?: (workspace: string) => ReadonlySet<string>; store?: MemoryStore; runtime?: RuntimeHealth }) {
+ * - runtime：O1 运行健康指标（缺省不传 = 占位路径）；
+ * - causal：因果边表（memory_audit 因果视图用例）；
+ * - reflector：反思器（memory_reflect 用例）。 */
+function setup(opts?: {
+  snapshotOf?: (workspace: string) => ReadonlySet<string>
+  store?: MemoryStore
+  runtime?: RuntimeHealth
+  causal?: MemoryCausalStore
+  reflector?: { runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<import('../src/reflect.js').ReflectionSummary | undefined> }
+}) {
   const ctx = new FakeCtx()
   const table = opts?.store !== undefined ? undefined : new FakeTable()
   const store = opts?.store ?? new MemoryStore(table!)
-  registerMemoryTools(ctx as unknown as Context, { store, snapshot: fakeSnapshot(opts?.snapshotOf), runtime: opts?.runtime })
+  registerMemoryTools(ctx as unknown as Context, {
+    store,
+    snapshot: fakeSnapshot(opts?.snapshotOf),
+    runtime: opts?.runtime,
+    causal: opts?.causal,
+    reflector: opts?.reflector,
+  })
   return { tools: ctx.toolDefs, store, table }
 }
 
@@ -68,9 +84,9 @@ async function seed(store: MemoryStore, input: Partial<NewMemoryInput> = {}): Pr
 }
 
 describe('工具注册', () => {
-  it('六个工具全部注册', () => {
+  it('七个工具全部注册（含 memory_reflect）', () => {
     const { tools } = setup()
-    for (const name of ['memory_recall', 'memory_search', 'memory_note', 'memory_forget', 'memory_audit', 'memory_status']) {
+    for (const name of ['memory_recall', 'memory_search', 'memory_note', 'memory_forget', 'memory_audit', 'memory_status', 'memory_reflect']) {
       expect(tools.has(name), name).toBe(true)
     }
   })
@@ -445,3 +461,145 @@ describe('工具输出 schema 覆盖返回形状（防 additionalProperties 拒�
     }
   })
 })
+
+// ── memory_reflect：手动反思触发（拍板：维护周期自动 + 手动工具/RPC 共享同一 runOnce） ──
+describe('memory_reflect', () => {
+  it('未接线反思器时诚实返回 ran:false（不抛错）', async () => {
+    const { tools } = setup()
+    const result = (await toolOf(tools, 'memory_reflect').execute({}, fakeExec() as never)) as { ran: boolean }
+    expect(result.ran).toBe(false)
+  })
+
+  it('接线后 force 触发：把当前会话路由传给反思器，返回执行观察量', async () => {
+    const calls: Array<{ route: { provider: string; model: string } | undefined; opts?: { force?: boolean } }> = []
+    const reflector = {
+      async runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }) {
+        calls.push({ route, opts })
+        return { reviewed: 3, decisions: 2, merged: 1, archived: 1, skipped: 1 }
+      },
+    }
+    const { tools } = setup({ reflector })
+    // 带 request/header 的会话 → resolveRoute 可得 provider/model
+    const exec = fakeExec('s1', 'D:/workspace') as {
+      agent: { id: string; session: { id: string; header: { cwd: string }; events: unknown[] } }
+    }
+    exec.agent.session.events = [
+      { type: 'request/header', seq: 1, data: { header: { config: { provider: 'deepseek', model: 'm' } } } },
+    ] as never
+    const result = (await toolOf(tools, 'memory_reflect').execute({}, exec as never)) as {
+      ran: boolean
+      merged: number
+      archived: number
+    }
+    expect(result.ran).toBe(true)
+    expect(result.merged).toBe(1)
+    expect(result.archived).toBe(1)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.route).toEqual({ provider: 'deepseek', model: 'm' })
+    expect(calls[0]?.opts?.force).toBe(true)
+  })
+
+  it('反思器返回 undefined（无路由缓存）时诚实返回 ran:false', async () => {
+    const reflector = { async runOnce() { return undefined } }
+    const { tools } = setup({ reflector })
+    // 会话无 request/header → resolveRoute 返回 undefined → 反思器无缓存路由 → ran:false
+    const exec = fakeExec() as { agent: { id: string; session: { id: string; header: { cwd: string }; events: unknown[] } } }
+    exec.agent.session.events = []
+    const result = (await toolOf(tools, 'memory_reflect').execute({}, exec as never)) as { ran: boolean }
+    expect(result.ran).toBe(false)
+  })
+})
+
+// ── memory_audit 因果视图（保守利用：v1 仅审计展示，不做检索扩散） ──────────────
+describe('memory_audit 因果视图', () => {
+  /** 构造一个 Map 支撑的 MemoryCausalStore（与 causal.test.ts 同思路，免 sqlite） */
+  function makeCausalStore(): MemoryCausalStore {
+    const map = new Map<string, MemoryCausalEdge>()
+    const table: KvTable<string, MemoryCausalEdge> = {
+      get: (key) => map.get(key),
+      entries: () => map.entries(),
+      keys: () => map.keys(),
+      get size() {
+        return map.size
+      },
+      put: async (key, value) => {
+        map.set(key, value)
+      },
+      delete: async (key) => map.delete(key),
+      update: async (key, fn) => {
+        const current = map.get(key)
+        if (current === undefined) throw new Error(`missing: ${key}`)
+        const next = fn(current)
+        map.set(key, next)
+        return next
+      },
+    }
+    return new MemoryCausalStore(table, () => Date.now())
+  }
+
+  it('未接线因果边表时不返回 causal 字段', async () => {
+    const { tools, store } = setup()
+    const id = await seed(store)
+    const result = (await toolOf(tools, 'memory_audit').execute({ id }, fakeExec() as never)) as { found: boolean; causal?: unknown }
+    expect(result.found).toBe(true)
+    expect(result.causal).toBeUndefined()
+  })
+
+  it('接线后返回因果装订：causedBy=入边源、causeOf=出边目标', async () => {
+    const causal = makeCausalStore()
+    const { tools, store } = setup({ causal })
+    const a = await seed(store, { content: 'A 是根因' })
+    const b = await seed(store, { content: 'B 由 A 导致' })
+    // 方向语义：A 是 B 的因/前提
+    const entryA = store.getById(a)
+    const entryB = store.getById(b)
+    expect(entryA).toBeDefined()
+    expect(entryB).toBeDefined()
+    await causal.upsertEdge({ sourceId: a, targetId: b, relation: 'causal', confidence: 0.9, source: entryA!.source })
+
+    const forB = (await toolOf(tools, 'memory_audit').execute({ id: b }, fakeExec() as never)) as {
+      causal?: { causedBy: Array<{ id: string; confidence: number }>; causeOf: Array<{ id: string; confidence: number }> }
+    }
+    expect(forB.causal?.causedBy).toEqual([{ id: a.slice(0, 8), confidence: 0.9 }])
+    expect(forB.causal?.causeOf).toEqual([])
+
+    const forA = (await toolOf(tools, 'memory_audit').execute({ id: a }, fakeExec() as never)) as {
+      causal?: { causedBy: Array<{ id: string; confidence: number }>; causeOf: Array<{ id: string; confidence: number }> }
+    }
+    expect(forA.causal?.causeOf).toEqual([{ id: b.slice(0, 8), confidence: 0.9 }])
+    expect(forA.causal?.causedBy).toEqual([])
+  })
+})
+
+// ── memory_status 自进化/因果观测透出（A′ 建议 5：先可观测，再谈优化） ─────────
+describe('memory_status 自进化/因果观测', () => {
+  it('runtime 提供反思/因果观察量时透出；缺省为 null', async () => {
+    const plain = (await toolOf(setup().tools, 'memory_status').execute({}, fakeExec() as never)) as {
+      reflection: unknown
+      causal: unknown
+      lastReflectionAt: unknown
+    }
+    expect(plain.reflection).toBeNull()
+    expect(plain.causal).toBeNull()
+    expect(plain.lastReflectionAt).toBeNull()
+
+    const rt: RuntimeHealth = {
+      writeFailures: 1,
+      embeddingState: 'ready',
+      lastMaintenanceAt: '2026-08-16T00:00:00.000Z',
+      reflection: { reviewed: 3, decisions: 2, merged: 1, archived: 1, skipped: 1 },
+      lastReflectionAt: '2026-08-17T00:00:00.000Z',
+      causal: { reviewed: 4, edges: 2, created: 2, skipped: 0 },
+      lastCausalAt: '2026-08-17T01:00:00.000Z',
+    }
+    const withRt = (await toolOf(setup({ runtime: rt }).tools, 'memory_status').execute({}, fakeExec() as never)) as {
+      reflection: { reviewed: number }
+      causal: { created: number }
+      lastCausalAt: string | null
+    }
+    expect(withRt.reflection?.reviewed).toBe(3)
+    expect(withRt.causal?.created).toBe(2)
+    expect(withRt.lastCausalAt).toBe('2026-08-17T01:00:00.000Z')
+  })
+})
+

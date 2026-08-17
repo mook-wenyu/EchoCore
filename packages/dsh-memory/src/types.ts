@@ -158,3 +158,31 @@ export function dedupKeyOf(content: string): string {
 export function newMemoryId(): string {
   return crypto.randomUUID()
 }
+
+/**
+ * 因果边关系（v1 单一关系；方向语义：source 是 target 的因/前提，target 是果/结果）。
+ * 未来如需更细粒度关系（如'part-of'、'contradicts'）在此扩展枚举即可。
+ */
+export const CAUSAL_RELATIONS = ['causal'] as const
+export type CausalRelation = (typeof CAUSAL_RELATIONS)[number]
+
+/**
+ * 持久化因果边（独立边表 memory_causal_edges；进程内键 = causalEdgeKey(sourceId,targetId,relation)）。
+ * 独立成表而非塞进 JSON 条目字段：不污染既有 MemoryEntry 记录，检索/审计展示按需查询。
+ */
+export interface MemoryCausalEdge {
+  /** 因/前提侧记忆 id */
+  sourceId: string
+  /** 果/结果侧记忆 id */
+  targetId: string
+  /** 关系类型（v1 仅 'causal'） */
+  relation: CausalRelation
+  /** LLM 自评置信 0-1（<0.6 不建边，仅当 ≥0.6 才 upsert） */
+  confidence: number
+  /** 建边时间（ISO） */
+  createdAt: string
+  /** 依据锚点（取自源条目（sourceId 侧）的 source；边只允许有来源参与洞察） */
+  source: MemorySource
+  /** 审计（追加式） */
+  audit: AuditRecord[]
+}
