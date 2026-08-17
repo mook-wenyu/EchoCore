@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { MEMORY_INJECTION_HEADER } from '../src/constants.js'
-import { formatMemoryLine, renderBudgetedPack, type MemoryLineView } from '../src/render.js'
+import { formatMemoryLine, formatMemoryLineCondensed, renderBudgetedPack, type MemoryLineView } from '../src/render.js'
 
 /** 构造渲染视图形状（MemoryEntry 展平与工具输出形状共用） */
 function view(overrides: Partial<MemoryLineView> = {}): MemoryLineView {
@@ -77,5 +77,31 @@ describe('renderBudgetedPack 预算边界（P1-2 补盲）', () => {
     expect(pack?.renderedIds).toEqual([short.id])
     expect(pack?.text).toContain(shortLine)
     expect(pack?.text).toContain('另有 1 条未展示')
+  })
+})
+
+describe('formatMemoryLineCondensed（P1 中置信摘要行, R1b 截断标记）', () => {
+  const C = '项目使用 pnpm workspace 管理多包并采用评分检索策略'
+
+  it('略长截断：content 超长 → 前 N 字符 + 省略号 + （原文 N 字符）标记 + 短记忆 id', () => {
+    const line = formatMemoryLineCondensed(view({ content: C }), 10)
+    expect(line).toContain(`- [fact] ${C.slice(0, 10)}…`)
+    expect(line).toContain(`（原文 ${C.length} 字符`)
+    expect(line).toContain('记忆 #a05cc78e')
+  })
+
+  it('不超长原样：content ≤ chars → 完整内容 + 短 id，无省略号与原文标记', () => {
+    const line = formatMemoryLineCondensed(view({ content: '短内容' }), 10)
+    expect(line).toBe('- [fact] 短内容（记忆 #a05cc78e）')
+    expect(line).not.toContain('…')
+    expect(line).not.toContain('（原文')
+  })
+
+  it('R1b 原文标记仅截断时出现（不超长时无原文字符标记）', () => {
+    const short = formatMemoryLineCondensed(view({ content: '短内容' }), 10)
+    expect(short).not.toContain('（原文')
+    const long = formatMemoryLineCondensed(view({ content: C }), 5)
+    expect(long).toContain('（原文')
+    expect(long).toContain(`- [fact] ${C.slice(0, 5)}…`)
   })
 })

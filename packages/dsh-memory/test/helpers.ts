@@ -5,9 +5,13 @@
  * 本类：多监听者 Set、服务注册表、effect disposer 收集、tools.register 捕获。
  */
 
+import { DatabaseSync } from 'node:sqlite'
+
 import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
+import { SqliteKvTable } from '../src/sqlite-kv.js'
+import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry } from '../src/types.js'
 
 /** 内存假表：同步内存语义 + 异步签名（对齐 KvTable 接口） */
@@ -160,4 +164,19 @@ export class FakeCtx {
     info: (...args: unknown[]) => this.logRecords.push({ level: 'info', args }),
     error: (...args: unknown[]) => this.logRecords.push({ level: 'error', args }),
   })
+}
+
+/**
+ * 基于真实 SQLite（SqliteKvTable）构造 MemoryStore——补 FakeTable 覆盖不了的
+ * 真后端集成面：持久化写链、JSON 序列化/反序列化、missing-key 判别在真表上的行为。
+ * 返回 { store, table, db }：底层 table 句柄可用于注入/读状态；db 生命周期由调用方
+ * 负责（`:memory:` 进程结束即释放，测试无需显式 close）。
+ */
+export function createRealSqliteStore(
+  now: () => number = () => Date.now(),
+): { store: MemoryStore; table: SqliteKvTable<MemoryEntry>; db: DatabaseSync } {
+  const db = new DatabaseSync(':memory:')
+  const table = new SqliteKvTable<MemoryEntry>(db)
+  const store = new MemoryStore(table, now)
+  return { store, table, db }
 }

@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MemoryStore, type SearchOptions } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
-import { FakeTable, settle } from './helpers.js'
+import { createRealSqliteStore, FakeTable, settle } from './helpers.js'
 
 /**
  * 可控 id 序列：为「createdAt 相同时按 id 稳定排序」提供确定性 id。
@@ -160,13 +160,15 @@ describe('MemoryStore 状态流转', () => {
     expect(await store.update('missing', {}, 'tool')).toBeUndefined()
   })
 
-  it('更新白名单不含 content（O3 编译期契约：改正文必须走 create，防 dedupKey 漂移）', async () => {
+  it('更新白名单不含 content：真实 update 后读回 content 保持原值（O3 防 dedupKey 漂移）', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
     const { entry } = await store.create(input())
-    // @ts-expect-error -- patch 白名单不再包含 content，由 tsc --noEmit 校验该契约
-    await store.update(entry.id, { content: '不应可更新' }, 'tool')
-    // 运行期（类型擦除）不强断言正文：compile-time 契约由 tsc 把关
-    expect(store.getById(entry.id)).toBeDefined()
+    const original = entry.content
+    // 编译期契约由 update 的 Pick 白名单（kind|importance|tags）全局把关（tsc --noEmit 校验）。
+    // 运行期：走白名单字段的真实 update，读回断言 content 未被触碰（非仅 toBeDefined 弱断言）。
+    const updated = await store.update(entry.id, { importance: 9 }, 'tool')
+    expect(updated?.content).toBe(original)
+    expect(store.getById(entry.id)?.content).toBe(original)
   })
 
   it('archive 后从检索消失（D-D 裁决：无 restore，恢复=重建）', async () => {
@@ -210,6 +212,27 @@ describe('MemoryStore 状态流转', () => {
     const store = new MemoryStore(table, nowFn)
     table.failNextWrite(new Error('磁盘写入失败'))
     await expect(store.archive('any-id', 'tool')).rejects.toThrow('磁盘写入失败')
+  })
+
+  // R2-2/B2 同款语义补盲：create 首写（table.put）路径——失败必须原样上抛
+  // （改动前若 addCover 静默吞错，本测试失败），且未落库、未占去重索引。
+  it('create 首写（table.put）遇异常上抛不吞；未落库、无去重索引占位', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    table.failNextWrite(new Error('磁盘写入失败'))
+    await expect(store.create(input())).rejects.toThrow('磁盘写入失败')
+    expect(store.stats().total).toBe(0)
+  })
+
+  it('create 首写失败不污染后续 create（一次性注入即清除）', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    table.failNextWrite(new Error('磁盘写入失败'))
+    await expect(store.create(input())).rejects.toThrow('磁盘写入失败')
+    // 第二次 create 正常落库（failNextWrite 已一次性清除）
+    const ok = await store.create(input({ content: '第二次写入正常' }))
+    expect(ok.outcome.merged).toBe(false)
+    expect(store.stats().total).toBe(1)
   })
 
   // R4-1：source 完整性防线——畸形 source（手工篡改 memory.json 的伪记忆）不进检索/浏览，
@@ -600,5 +623,130 @@ describe('contradiction 评测基线（B3）', () => {
     // 无关条目仍可被检索
     const hits = store.search({ query: 'React 面板' })
     expect(hits.map((e) => e.id)).toContain(unrelated.id)
+  })
+})
+
+/**
+ * 真实 SQLite 集成（SqliteKvTable，node:sqlite :memory:）。
+ * 上方用例全部走 FakeTable——CRUD/合并/supersede 在真后端（写链、JSON 序列化、
+ * missing-key 判别）上是否正常无验证；此处用 createRealSqliteStore 补真表集成面。
+ */
+describe('MemoryStore 真实 SQLite 集成（SqliteKvTable）', () => {
+  it('create 新建 + getById + stats（total/active/archived/byKind）', async () => {
+    const { store } = createRealSqliteStore(nowFn)
+    const { entry, outcome } = await store.create(input({ kind: 'fact' }))
+    expect(outcome.merged).toBe(false)
+    expect(store.getById(entry.id)?.content).toBe('项目使用 pnpm workspace 管理多包')
+    const stats = store.stats()
+    expect(stats.total).toBe(1)
+    expect(stats.active).toBe(1)
+    expect(stats.archived).toBe(0)
+    expect(stats.byKind.fact).toBe(1)
+  })
+
+  it('create 去重合并：同 dedupKey → merged、existingId、合并审计、不产生新条目', async () => {
+    const { store } = createRealSqliteStore(nowFn)
+    const first = await store.create(input())
+    const second = await store.create(input())
+    expect(second.outcome.merged).toBe(true)
+    expect(second.outcome.existingId).toBe(first.entry.id)
+    const audit = store.getById(first.entry.id)?.audit
+    expect(audit?.at(-1)).toMatchObject({ action: 'merge', by: 'extractor' })
+    expect(store.stats().total).toBe(1)
+  })
+
+  it('supersede：新高重合条目覆盖旧条目，search 默认隐藏、includeSuperseded 可见', async () => {
+    const { store } = createRealSqliteStore(nowFn)
+    const oldE = (await store.create(input({ kind: 'decision', content: '决定采用评分检索' }))).entry
+    const newE = (await store.create(input({ kind: 'decision', content: '决定采用评分检索方案' }))).entry
+    expect(store.getById(oldE.id)?.supersededBy).toBe(newE.id)
+    expect(store.getById(newE.id)?.supersedes).toBe(oldE.id)
+    // 默认隐藏被覆盖条目
+    expect(store.search({ query: '', kind: 'decision' }).map((e) => e.id)).toEqual([newE.id])
+    // includeSuperseded 时可见（审计用途）
+    expect(store.search({ query: '', kind: 'decision', includeSuperseded: true }).map((e) => e.id)).toEqual(
+      expect.arrayContaining([oldE.id, newE.id]),
+    )
+  })
+
+  it('archive 后 search 排除、审计含 archive 动作', async () => {
+    const { store } = createRealSqliteStore(nowFn)
+    const { entry } = await store.create(input({ content: '用户偏好使用简体中文交流' }))
+    expect(store.search({ query: '中文' })).toHaveLength(1)
+    expect(await store.archive(entry.id, 'tool', '测试归档')).toBe(true)
+    expect(store.search({ query: '中文' })).toHaveLength(0)
+    const audit = store.getById(entry.id)?.audit?.at(-1)
+    expect(audit).toMatchObject({ action: 'archive', by: 'tool', detail: '测试归档' })
+    expect(store.stats().archived).toBe(1)
+    expect(store.stats().active).toBe(0)
+  })
+
+  it('update tags 后 token 相关检索仍正确（R1 缓存失效在真表上生效）', async () => {
+    const { store } = createRealSqliteStore(nowFn)
+    // content 不含 tag 词（防 content 2-gram 误命中干扰断言）
+    const { entry } = await store.create(input({ content: '项目使用 pnpm workspace 管理多包', tags: ['交流'] }))
+    expect(store.search({ query: '交流', workspace: 'D:/workspace' })).toHaveLength(1)
+    await store.update(entry.id, { tags: ['部署'] }, 'tool')
+    expect(store.search({ query: '部署', workspace: 'D:/workspace' })).toHaveLength(1)
+    expect(store.search({ query: '交流', workspace: 'D:/workspace' })).toHaveLength(0)
+  })
+})
+
+describe('MemoryStore.listByImportance', () => {
+  it('重要度降序、同分创建倒序、排除归档/被覆盖、workspace 过滤、limit', async () => {
+    let clock = FIXED_NOW
+    const store = new MemoryStore(new FakeTable(), () => clock)
+    const high = (await store.create(input({ content: '高重要事实', importance: 9 }))).entry
+    clock += 1000
+    const midOld = (await store.create(input({ content: '中重要较早', importance: 5 }))).entry
+    clock += 1000
+    const midRecent = (await store.create(input({ content: '中重要新近', importance: 5 }))).entry
+    clock += 1000
+    const low = (await store.create(input({ content: '低重要事实', importance: 1 }))).entry
+    clock += 1000
+    // 归档条目（应被过滤）
+    const archived = (await store.create(input({ content: '已归档事实', importance: 8 }))).entry
+    await store.archive(archived.id, 'tool')
+    clock += 1000
+    // 其他 workspace（应被过滤）
+    await store.create(input({ workspace: 'D:/other', content: '他项目事实', importance: 9 }))
+    // 被覆盖条目：旧 decision 被新 decision 覆盖（旧应被过滤，新为 active 有效条目参与排序）
+    const oldDec = (await store.create(input({ kind: 'decision', content: '决定采用评分检索' }))).entry
+    clock += 1000
+    const newDec = (await store.create(input({ kind: 'decision', content: '决定采用评分检索方案' }))).entry
+    expect(store.getById(oldDec.id)?.supersededBy).toBe(newDec.id)
+
+    // 期望序：9(high) → 两个 5（创建倒序：newDec 最新 > midRecent > midOld）→ 1(low)；
+    // 归档/他项目/被覆盖(oldDec) 均排除
+    const ids = store.listByImportance('D:/workspace', 10).map((e) => e.id)
+    expect(ids).toEqual([high.id, newDec.id, midRecent.id, midOld.id, low.id])
+    expect(ids).not.toContain(archived.id)
+    expect(ids).not.toContain(oldDec.id)
+    // limit 生效
+    expect(store.listByImportance('D:/workspace', 2).map((e) => e.id)).toEqual([high.id, newDec.id])
+  })
+})
+
+describe('MemoryStore.tokenJaccard', () => {
+  it('同内容=1、无关=0、部分重合∈(0,1)；缓存路径与首次计算一致', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    // 用英文词保证 token 集合可控（CJK 二元组兜底会让任意两段中文共享 2-gram，难构造真 0 重合）
+    const e1 = (await store.create(input({ content: 'apple banana' }))).entry
+    // 同 token 集合、不同 id 的实体（绕过 create 去重合并，直接落表）
+    const clone: MemoryEntry = { ...e1, id: 'clone-1' }
+    await table.put(clone.id, clone)
+    expect(store.tokenJaccard(e1, clone)).toBe(1)
+    // 无关内容：token 集合零重合 → 0。必须显式 tags:[]——input() 默认 tags:['架构']
+    // 会让两条条目共享"架构" token（intersection 1 / union 5 = 0.2），破坏"无关=0"意图
+    const unrelated = (await store.create(input({ content: 'cat dog', tags: [] }))).entry
+    expect(store.tokenJaccard(e1, unrelated)).toBe(0)
+    // 部分重合 → 交集/并集 ∈ (0,1)（{apple} ∩ {apple,cat,pie}，排除默认 tag 干扰）
+    const partial = (await store.create(input({ content: 'apple pie', tags: [] }))).entry
+    const j = store.tokenJaccard(e1, partial)
+    expect(j).toBeGreaterThan(0)
+    expect(j).toBeLessThan(1)
+    // 缓存路径（第二次命中 entryTokenCache）与首次计算一致
+    expect(store.tokenJaccard(e1, partial)).toBe(j)
   })
 })
