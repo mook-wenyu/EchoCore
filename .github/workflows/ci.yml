@@ -1,0 +1,52 @@
+# CI 工作流：dsh-memory 包的持续集成
+# 在 push 与 pull_request（main/master 与任意分支）时触发。
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - '**'
+  pull_request:
+    branches:
+      - main
+      - master
+      - '**'
+
+jobs:
+  build-and-test:
+    # 使用最新 Ubuntu 运行器
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 检出仓库代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 2. 安装/缓存 pnpm（v4 action 会读取 packageManager 字段并缓存 pnpm）
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      # 3. 安装 Node 22，并配置 pnpm 依赖缓存（cache: 'pnpm' 复用 store 加速安装）
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      # 4. 按 lockfile 精确安装依赖（frozen-lockfile 保证 CI 与本地锁定版本一致）
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # 5. 仅对 dsh-memory 包执行 TypeScript 类型检查
+      - name: 类型检查
+        run: pnpm --filter @echocore/dsh-memory typecheck
+
+      # 6. 运行 dsh-memory 包测试
+      - name: 运行测试
+        run: pnpm --filter @echocore/dsh-memory test
+
+      # 覆盖率门槛待主代理按基线补充：当前不在此处设置覆盖率阈值，
+      # 因为其它并行任务改动尚未完成，阈值需等基线确定后由主代理决策再添加。

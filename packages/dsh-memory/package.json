@@ -50,7 +50,7 @@
     "@deepseek-ai/schemastery": "^3.18.0",
     "@huggingface/transformers": "^4.2.0",
     "@node-rs/jieba": "^2.0.2",
-    "@photostructure/sqlite-vec": "^1.2.0",
+    "@photostructure/sqlite-vec": "1.2.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
