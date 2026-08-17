@@ -7,7 +7,7 @@
  * - 写链串行（update 原子读改写不交错）。
  */
 
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -16,7 +16,7 @@ import { describe, expect, it } from 'vitest'
 
 import { DomainError } from '@deepseek-ai/dsh-storage-domain'
 
-import { SqliteKvTable } from '../src/sqlite-kv.js'
+import { migrateMemoryJson, SqliteKvTable } from '../src/sqlite-kv.js'
 
 /** 临时数据库文件（每用例独立目录，防 WAL 残留互扰） */
 function tmpDbPath(): string {
@@ -195,6 +195,127 @@ describe('SqliteKvTable', () => {
     expect(r.busy).toBe(0)
     db.close()
     rmSync(join(path, '..'), { recursive: true, force: true })
+  })
+
+  it('Q4/A 加载容错：坏 value 行跳过、其余行正常加载、loadFailures≥1', () => {
+    const path = tmpDbPath()
+    const db = new DatabaseSync(path)
+    // 预置一张表：一行 value 是非法 JSON（外部数据损坏），一行是合法 JSON
+    db.exec('CREATE TABLE entries (id TEXT PRIMARY KEY, value TEXT NOT NULL, content_tokens TEXT)')
+    db.prepare('INSERT INTO entries (id, value) VALUES (?, ?)').run('bad', '这不是JSON{')
+    db.prepare('INSERT INTO entries (id, value) VALUES (?, ?)').run('good', JSON.stringify({ id: 'good', n: 1 }))
+    // 构造不应因坏行而 throw（对称降级：坏行不影响其余行加载）
+    const table = new SqliteKvTable<{ id: string; n: number }>(db)
+    expect(table.get('good')).toEqual({ id: 'good', n: 1 })
+    expect(table.get('bad')).toBeUndefined()
+    expect(table.loadFailures).toBeGreaterThanOrEqual(1)
+    db.close()
+    rmSync(join(path, '..'), { recursive: true, force: true })
+  })
+})
+
+/** 临时 memory.json 路径（每用例独立目录） */
+function tmpJsonPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'sqlite-kv-json-'))
+  return join(dir, 'memory.json')
+}
+
+describe('migrateMemoryJson', () => {
+  /** 组装：空白 SQLite + 空 SqliteKvTable + 临时 json 路径；迁移语义测试用 */
+  function make(): {
+    jsonPath: string
+    table: SqliteKvTable<{ id: string; n: number }>
+    db: DatabaseSync
+    dir: string
+  } {
+    const dbPath = tmpDbPath()
+    const jsonPath = tmpJsonPath()
+    const db = new DatabaseSync(dbPath)
+    return { jsonPath, table: new SqliteKvTable<{ id: string; n: number }>(db), db, dir: join(dbPath, '..') }
+  }
+
+  it('正常迁移：合法记录导入成功，count/size 正确', async () => {
+    const { jsonPath, table, db, dir } = make()
+    writeFileSync(
+      jsonPath,
+      JSON.stringify({ tables: { entries: { a: { id: 'a', n: 1 }, b: { id: 'b', n: 2 } } } }),
+      'utf8',
+    )
+    const result = await migrateMemoryJson(jsonPath, table, () => true)
+    expect(result).toEqual({ migrated: 2, skipped: 0, corrupt: false })
+    expect(table.size).toBe(2)
+    expect(table.get('a')).toEqual({ id: 'a', n: 1 })
+    expect(table.get('b')).toEqual({ id: 'b', n: 2 })
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('坏记录跳过：isValid=false 的记录 skipped，其余正常导入', async () => {
+    const { jsonPath, table, db, dir } = make()
+    writeFileSync(
+      jsonPath,
+      JSON.stringify({
+        tables: {
+          entries: {
+            good: { id: 'good', n: 1 },
+            bad: { id: 'bad', n: 'not-a-number' },
+          },
+        },
+      }),
+      'utf8',
+    )
+    // isValid 只认可 n 为数字——bad 记录校验失败被跳过
+    const result = await migrateMemoryJson(jsonPath, table, (raw) => {
+      const r = raw as { n?: unknown }
+      return typeof r?.n === 'number'
+    })
+    expect(result).toEqual({ migrated: 1, skipped: 1, corrupt: false })
+    expect(table.size).toBe(1)
+    expect(table.get('good')).toEqual({ id: 'good', n: 1 })
+    expect(table.get('bad')).toBeUndefined()
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('整文件 JSON 损坏：corrupt=true，不写入任何行', async () => {
+    const { jsonPath, table, db, dir } = make()
+    writeFileSync(jsonPath, '这不是合法 JSON{', 'utf8')
+    const result = await migrateMemoryJson(jsonPath, table, () => true)
+    expect(result).toEqual({ migrated: 0, skipped: 0, corrupt: true })
+    expect(table.size).toBe(0)
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('文件不存在：返回 0/0/false（首次全新启动）', async () => {
+    const { jsonPath, table, db, dir } = make()
+    const result = await migrateMemoryJson(jsonPath, table, () => true)
+    expect(result).toEqual({ migrated: 0, skipped: 0, corrupt: false })
+    expect(table.size).toBe(0)
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('事务性：中间某条写入抛错 → 先行记录被回滚（目标表保持为空）', async () => {
+    const { jsonPath, db, dir } = make()
+    // 注入故障：deriveTokens 在第二条（n===2）抛错——模拟持久化过程中途失败。
+    // 第一条已写入但仍在未提交事务内，第二条抛错应触发 ROLLBACK，两行都不落库。
+    const table = new SqliteKvTable<{ id: string; n: number }>(db, 'entries', (v) => {
+      if (v.n === 2) throw new Error('deriveTokens 故障')
+      return ''
+    })
+    writeFileSync(
+      jsonPath,
+      JSON.stringify({ tables: { entries: { a: { id: 'a', n: 1 }, b: { id: 'b', n: 2 } } } }),
+      'utf8',
+    )
+    await expect(migrateMemoryJson(jsonPath, table, () => true)).rejects.toThrow('deriveTokens 故障')
+    // 先行记录 a 被回滚：目标表为空 + 内存 cache 为空（可安全重试）
+    const cnt = (db.prepare('SELECT COUNT(*) AS c FROM entries').get() as { c: number }).c
+    expect(cnt).toBe(0)
+    expect(table.size).toBe(0)
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
   })
 })
 

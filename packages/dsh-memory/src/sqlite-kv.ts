@@ -39,6 +39,13 @@ import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
  * @param table 目标 SqliteKvTable（须为空表）
  * @param isValid 记录校验（memoryEntrySchema.safeParse）
  * @returns 迁移数（坏记录计入 skipped；文件损坏 corrupt=true）
+ *
+ * 事务语义（S1 2026-08-16 单事务化）：本函数只做两件事——①过滤合法记录；
+ * ②把合法记录一次性交给 table.migrateAll 在**单个 SQLite 事务**内写入
+ * （BEGIN → 逐条 prepared upsert → 全部成功 COMMIT；任一条失败 ROLLBACK 并
+ * 上抛）。因此迁移是「全有或全无」：任何持久化中途失败都不会留下部分行，
+ * 目标表保持为空 + 内存 cache 保持为空，调用方可安全重试。isValid=false 的
+ * 坏记录仍走"跳过计数"语义（跳过不算失败、不中断迁移，也不会进入事务）。
  */
 export async function migrateMemoryJson<V>(
   jsonPath: string,
@@ -58,17 +65,20 @@ export async function migrateMemoryJson<V>(
     return { migrated: 0, skipped: 0, corrupt: true } // 整文件损坏：调用方降级处理
   }
   const entries = document.tables?.entries ?? {}
-  let migrated = 0
+  const valid: Array<[string, V]> = []
   let skipped = 0
   for (const [id, record] of Object.entries(entries)) {
     if (!isValid(record)) {
       skipped++
       continue
     }
-    await table.put(id, record as V)
-    migrated++
+    valid.push([id, record as V])
   }
-  return { migrated, skipped, corrupt: false }
+  // 合法记录收集完才一次性入单事务——失败上抛，表保持为空可重试
+  if (valid.length > 0) {
+    table.migrateAll(valid)
+  }
+  return { migrated: valid.length, skipped, corrupt: false }
 }
 
 /** 值 JSON 序列化（SQLite 存 TEXT；对象形态仅存在于内存权威态） */
@@ -132,9 +142,20 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
     )
     this.deleteStmt = this.db.prepare(`DELETE FROM "${tableName}" WHERE id = ?`)
     // 启动加载：SQLite → 内存权威态（与 storage-json loadAll 同语义）
+    // Q4/A（坏 SQLite 对称降级）：单行 value 损坏（JSON.parse 抛错）只跳过该行 +
+    // 计数 + warn，**不阻断其余行加载**——与 D2 坏 JSON 的文件级降级语义对称：
+    // 坏行不影响好行，文件级损坏仍由外部显式处理（本处只拦"坏行"这一数据损坏
+    // 边界，不写大 try/catch 包正常路径）。
     const loadStmt = this.db.prepare(`SELECT id, value FROM "${tableName}"`)
     for (const row of loadStmt.all() as Array<{ id: string; value: string }>) {
-      this.cache.set(row.id, deserialize(row.value) as V)
+      try {
+        this.cache.set(row.id, deserialize(row.value) as V)
+      } catch {
+        this.loadFailuresValue++
+        console.warn(
+          `[SqliteKvTable] 跳过损坏行 ${row.id}（value 非合法 JSON），累计跳过 ${this.loadFailuresValue} 行`,
+        )
+      }
     }
   }
 
@@ -172,6 +193,43 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
     return this.enqueue(() => {
       this.deleteStmt.run(key)
     }).then(() => existed)
+  }
+
+  /**
+   * 迁移专用批量导入（**非 KvTable 公开契约**——公开契约 get/put/update/delete/
+   * entries/keys/size 保持不变；与 checkpoint/writeFailures 一样是 SqliteKvTable
+   * 的额外方法），仅在首启迁移路径（migrateMemoryJson）调用。
+   *
+   * 为什么不经 enqueue：put 的写链每个任务都是**单语句自动提交**（外显 BEGIN 会被
+   * 吞掉），逐条调用 put 无法把整个迁移包进一个 SQLite 事务、也就无法实现「全有
+   * 或全无」。此处本方法直接开事务 + 预编译 upsert 顺序写入，绕开写链——迁移是
+   * 一次性启动路径（此时表为空、无并发写者），让链让位给事务是安全的。
+   *
+   * 事务语义与"中断可重试"：BEGIN → 逐条 upsert → 全部成功才 COMMIT；任一条抛错
+   * → ROLLBACK 并把错误上抛（此时库与缓存都保持着传入前的空态）。**内存 cache 只
+   * 在 COMMIT 成功之后才一次性回填**——因此中途失败时 cache 也未被污染，与回滚后
+   * 的空库保持一致，调用方可直接重试。全部成功则 COMMIT 后回填 cache，保证
+   * 「迁移完成 → 内存权威态与库一致」。
+   *
+   * 入参约定：调用方（migrateMemoryJson）已用 isValid 过滤掉坏记录，本方法只收
+   * 到合法记录；若调用方想逐条跳过（枚举期间异常），应在过滤阶段完成，这里不做
+   * 防御性跳过。
+   */
+  migrateAll(records: Array<[string, V]>): void {
+    if (records.length === 0) return
+    this.db.exec('BEGIN')
+    try {
+      for (const [id, value] of records) {
+        this.upsertStmt.run(id, serialize(value), this.deriveTokens?.(value) ?? null)
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    for (const [id, value] of records) {
+      this.cache.set(id, value)
+    }
   }
 
   /**
@@ -228,4 +286,11 @@ export class SqliteKvTable<V> implements KvTable<string, V> {
   }
 
   private writeFailuresValue = 0
+
+  /** Q4/A：构造加载阶段跳过的损坏行数（外部数据损坏可观测；与 writeFailures 同域） */
+  get loadFailures(): number {
+    return this.loadFailuresValue
+  }
+
+  private loadFailuresValue = 0
 }
