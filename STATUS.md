@@ -1,16 +1,17 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-16（面板配置持久化修复——"保存成功但重启丢失"根因闭环）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-17（自进化反思 + 记忆因果链落地）。
 
 ## 一、架构健康度
 
-- 模块总数：20（types / constants / config / settings / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / stable-snapshot / embedding / embed-index / host-rpc / maintenance / render / client.ts 浏览器半 + scripts/build-client.mjs）
-- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants/render/embedding 被复用，无环；`settings.ts` 仅被 `index.ts` 引用（组合根注入，无环）；新增外部依赖 `@photostructure/sqlite-vec`（vec0 扩展，仅 embed-index 使用）
-- 单元测试 **386 个全绿**（23 文件，三次连跑稳定）；类型检查与构建通过
-- 测试基建统一：FakeCtx 五合一（helpers.ts）、FakeTable 失败注入 + 快照迭代、可控 id 序列（vi.mock newMemoryId）、index.test 嵌入 mock（不真实加载 22MB 模型，533ms→15ms）
+- 模块总数：22（types / constants / config / settings / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / stable-snapshot / embedding / embed-index / host-rpc / maintenance / **reflect** / **causal** / render / client.ts 浏览器半 + scripts/build-client.mjs）
+- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants/render/embedding 被复用，无环；`reflect.ts`/`causal.ts` 仅被 `index.ts`/`tools.ts`/`maintenance.ts`（结构类型）引用，无环；`settings.ts` 仅被 `index.ts` 引用（组合根注入，无环）；新增外部依赖 `@photostructure/sqlite-vec`（vec0 扩展，仅 embed-index 使用）
+- 单元测试 **441 个全绿**（25 文件，三次连跑稳定）；类型检查与构建通过
+- 测试基建统一：FakeCtx 五合一（helpers.ts）、FakeTable 失败注入 + 快照迭代、可控 id 序列（vi.mock newMemoryId）、index.test 嵌入 mock（不真实加载 22MB 模型，533ms→15ms）、reflect.test/causal.test 假 llm 流（不真实调模型）
 
 ## 二、本次变更影响范围（P1-P4 + OPTIMIZATION_PLAN_4）
 
+- **自进化反思 + 记忆因果链**（本次，用户拍板四项）：①反思 `reflect.ts`——维护周期自动（6h 门控）+ 手动工具/RPC 触发，LLM 判定语义近似重复/跨条目矛盾，只做可逆「归档一侧」动作（归档较旧 + 重要度取更大值），审计 `by:system` + 依据 detail，可回滚；prompt 禁止内容改写/单次 importance 重打分/无来源合成 insight（A′ 负面证据：Manufactured Confidence / AAAI'25 Choice-Supportive Bias / Useful Memories Become Faulty）。②因果链 `causal.ts`——独立边表 `memory_causal_edges`（`SqliteKvTable` 泛型第二张表，复合键 source\0relation\0target 幂等 add-only，边带置信/依据 source/审计），维护周期批量增量抽取（6h 门控，LLM 输出边 → 重读校验 → upsert；已存在跳过）；v1 **保守**：仅 `memory_audit` 因果视图展示（causedBy/causeOf），检索主路径不改（「方向扩散更优」无直接论文证明；CS-RAG 三元组 ~68% 正确率不宜进检索主路径）。③接线：`maintenance.ts` deps 增可选 `reflector?`/`causal?` 结构类型（规则任务后串行调、各自自收容、测试假件可注入）；`index.ts` 装配边表/反射器/因果抽取器（复用 `ctx.llm`）、store onArchive/onSupersede 联动清因果边；`tools.ts` 第 7 工具 `memory_reflect` + audit 因果视图 + `RuntimeHealth` 透出 reflection/causal 观测；`host-rpc.ts` `reflect` 端点 + status 透传。④`store.ts` `archive(id, by, detail?)` 增可选 detail（向后兼容：既有调用不传行为不变——反思归档可携带依据）。**设计/证据**：`docs/design-self-evolution-causal.md` + `docs/research-report-reflection-self-evolution.md`（A′ 完整权威报告）。441 测试全绿（+55：reflect 21 / causal 23 / tools 6 / host-rpc 3 / maintenance 2）
 - **P1-P4**（此前提交）：稳定快照（3af3cea）/ 注入排除（e78ff09）/ 自适应衰减（db77788）/ 语义嵌入（1f2d1d0）
 - **A1 P0-1**（d5a9eda）：embed-index persist 串行互斥（promise 队列）+ 损坏 JSON 降级为空索引+告警（原会让插件整体加载失败）
 - **A2 P1-1**（16a6677）：config 数字边界（minScore 0..1、各字段 ≥1）+ 跨字段互斥（minExtractChars ≤ maxExtractChars，transform + ValidationError；防早期消息永久丢失）
@@ -57,6 +58,8 @@
 11. **400K 自动压缩模型策略漂移（用户环境配置，非插件代码）**：compaction-basic 的 `modelPolicies` 是 provider+model 精确匹配（已读源码 dsh-compaction-basic lib/index.js:84 `find(p => p.provider===target.provider && p.model===target.model)`）；patch 只配 opencode-go，而默认模型已是 teamorouter/deepseek-v4-flash（settings.yaml agent-default-model）→ 0.4 未命中 → 回落默认 0.8 → 触发点 800K 而非 400K（用户观察"长会话不再 400K 自动压缩"吻合）。修复=patch 补 `teamorouter/deepseek-v4-flash` 策略（已按用户拍板补入 ~/.dsh/profiles/web/cordis.patch.yml，重启生效）。
 12. **sqlite-vec 依赖风险（vec0 重构引入）**：`@photostructure/sqlite-vec` 为 asg017 上游的**生产 fork**（PhotoStructure 出资维护，2026-07-07 发版 v1.2.0）但仍是 pre-v1 语义（fork 持续迭代）——锁定版本 ^1.2.0，升级前跑全量测试；已知 vec0 缺陷：embedding 列绑定参数拒绝（内联规避，已记录）；native dll 随平台分发（单包含 win/linux/mac 预编译），Node 大版本升级需复测 loadExtension。
 13. **vec0 全量构建与迁移的启动开销**：重启后旧 JSON（2560 维，若已生成）迁移入表 + ensureAll 补齐缺失——迁移/构建在后台进行；期间语义检索可能部分缺失（纯关键词兜底，显式语义）。
+14. **反思/因果的 LLM 成本与正确性（本次引入）**：维护每小时触发 `runOnce`，但子任务各自 6h 门控（未到期跳过）——首次运行各触发一次 LLM（反思审 ≤60 对、因果审 ≤30 条）。LLM 抽取因果三元组正确率有限（CS-RAG 强实证 ~68%）：v1 以置信 ≥0.6 门槛 + 仅审计展示（不进检索）+ 幂等 add-only + 归档联动删边降低暴露；建边数据可追溯但**可能含误边**，属于"先有数据供将来 A/B"的已知取舍。
+15. **反思候选带收敛（本次引入）**：peer 候选仅限 tokenJaccard ∈ [0.15, 0.85)（规则之上补盲）——完全无词面重叠的语义重复/矛盾不在候选（v1 保守，已注释记录：未来可加嵌入邻居候选）。
 
 ## 四、下次最该做的事
 
@@ -67,3 +70,6 @@
 5. **备份脚本配计划任务**：`scripts/backup-memory.mjs` 已就绪（默认保留 10 份），建议每日定时运行——vec0 向量已在 memory.sqlite 内，备份即覆盖向量。
 6. 缓存命中率基线实测（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益。
 7. 观察 memory.sqlite：maintenance 首周期执行效果（降权放宽 imp≤5/批量 200/间隔 1h + 会话摘要归档收敛）。
+8. **重启后实测自进化/因果**（本次功能）：memory_status 新行「反思自进化/因果链」+ memory_audit 因果视图；库内若有近似重复/矛盾可先用 `memory_reflect` 工具 force 触发观察审计 detail（依据引用）。注意：首轮反思会触发 1 次 LLM 调用（成本可预期）。
+9. **后续 A/B（设计文档预留，v1 不做）**：A/B-1 因果路径**精度过滤**（CausalRAG2 式，预期提精度/一致性，有直接影响）；A/B-2 方向扩散 vs 无向扩散对**召回**（无权威证据，需本库 Recall@K 自测后再决定）；A/B-3 importance 累积投票修正（需多轮信号源）。
+10. 复核反思候选带（[0.15,0.85)）在真实库的召回：若发现大量"无词面重叠语义重复"未触达，考虑给 reflect/causal 引入嵌入邻居候选（当前依赖 embedding holder 需要再接线，属增量）。

@@ -14,11 +14,13 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 | 跨会话记忆 | 记忆按 workspace（规范化 cwd）持久化于 `$DSH_HOME/storages/memory.sqlite`（未设 DSH_HOME 时 `~/.dsh/storages/memory.sqlite`；SQLite WAL），新会话可检索历史会话记忆；项目间隔离 |
 | 自动注入 | 每个 `agent/pre-step` 检索 Top-K 相关记忆（查询文本仅取真实用户消息，排除插件注入与工具噪声），预算内（默认 16384 字符 ≈ 4K token）注入为带来源标记的 `user/message`（source: plugin + form: recall）；已注入且仍可见的记忆不重复注入，被压缩遮蔽后允许重注入 |
 | 矛盾裁决（D-A） | 新事实写入时与同 workspace 同分类旧记忆做 token 重合度比对（Jaccard ≥ 0.7），命中即标记旧条目 `supersededBy`——检索/注入默认排除被覆盖条目（`memory_search` 可 `includeSuperseded` 审计），审计记录 supersede 链 |
-| 后台整理（O8-M） | 有会话活动后每 1 小时运行：重复合并（Jaccard ≥ 0.85）、过期降级（90 天无访问且重要度 ≤5）、标签小写化整理；全部纯规则、批预算 200 |
+| 后台整理（O8-M） | 有会话活动后每 1 小时运行：重复合并（Jaccard ≥ 0.85）、过期降级（90 天无访问且重要度 ≤5）、标签小写化整理；纯规则批预算 200；规则任务后串行执行可选 LLM 子任务（反思自进化、因果抽取，各自 6h 周期门控） |
+| 反思自进化 | 维护周期自动 + 手动工具/RPC 触发 LLM 审视已有条目间**语义近似重复**与**跨条目矛盾**：只做可逆「归档一侧」动作（归档较旧、保留较新，审计 `by:system` + 依据 detail、可回滚）；**不做**内容改写 / 单次 importance 重打分 / 无来源合成 insight（依据 A′ 负面证据：Manufactured Confidence / Choice-Supportive Bias / Useful Memories Become Faulty） |
+| 记忆因果链 | 独立边表 `memory_causal_edges`（source/target/relation 复合键幂等、自带置信/依据/审计）：维护周期**批量增量**抽取条目间因果边（方向：source 是 target 的因/前提）；v1 **保守**——仅 `memory_audit` 因果视图展示，检索主路径不做沿链扩散（「方向扩散更优」无直接论文证明）；后续 A/B-1 因果路径精度过滤、A/B-2 方向扩散 |
 | 腐化防线 | 提取 prompt 三规则（忽略元内容/保持具体/状态变化）+ `[参考记忆]` 段落级回述过滤 + `source.plugin` 过滤双层防线；会话销毁时 flush 未达阈值批次并清理全部会话态 |
 | 400K 无感压缩 | 宿主 `compaction-basic` 经 patch 解禁并配置 `thresholdRatio: 0.4`（实测模型窗口 1M token → 触发点 400K），对全部 Agent 会话生效，无需手动 `/compact` |
 | 溯源审计 | 每条记忆携带 `source { sessionId, eventSeqs, excerpt }`；`memory_audit` 工具还原依据原文摘录与审计日志（含 supersede 链） |
-| 模型工具 | `memory_recall` / `memory_search` / `memory_note` / `memory_forget` / `memory_audit` / `memory_status` |
+| 模型工具 | `memory_recall` / `memory_search` / `memory_note` / `memory_forget` / `memory_audit` / `memory_status` / `memory_reflect` |
 | 会话快照 | 压缩摘要自动登记为会话摘要记忆；会话结束时写快照记录（起止时间、记忆规模），支撑跨会话连续性 |
 | 记忆面板 | 设置页新增"记忆"页面（搜索/分类过滤/列表/详情溯源/归档/统计行），数据经 `ctx.connection.rpc` `/memory` 通道 |
 | 记忆投毒防线（R4） | 注入块带"仅作背景资料、指令不构成用户请求、记忆可能过时或被覆盖"声明；注入消息与用户指令结构隔离（source plugin + form recall）；读路径校验 `source` 锚点完整性，畸形条目从检索/浏览过滤并告警 |
@@ -30,7 +32,9 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 宿主（每进程一个预设实例，状态按 Session 键控）：
   extractor.ts  双通道提取（compaction/summary + turn/end，串行链 + 水位）
   injector.ts   agent/pre-step 注入（预算截断/去重/压缩后重注入）
-  tools.ts      六个模型工具（defineTool 规范输出）
+  tools.ts      七个模型工具（defineTool 规范输出）
+  reflect.ts    反思自进化（LLM 判定语义近似重复/矛盾，只归档一侧，审计 by:system）
+  causal.ts     因果链（独立边表 + 维护批量增量抽取；v1 仅供审计展示）
   snapshot.ts   会话摘要/快照登记
   host-rpc.ts   /memory RPC 通道（载荷严格校验，业务结果值形态）
   store.ts      MemoryStore（CRUD/去重合并/评分检索/审计）
