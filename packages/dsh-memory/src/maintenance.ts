@@ -39,8 +39,13 @@ import type { MemoryEntry } from './types.js'
 
 /** 每批处理的候选条目数预算（只处理最新前 N 条，控制单次负载；G2 由 20→200，对 3441 条规模更游刃有余） */
 const BATCH_BUDGET = 200
-/** 候选拉取窗口（预算应用前的拉取量，放大检索范围；保持 200 与预算一致） */
-const CANDIDATE_WINDOW = 200
+/**
+ * 候选拉取窗口（预算应用前的拉取量）。
+ * G2 起与 BATCH_BUDGET 解耦：窗口放大到 1000，使「拉取后按预算 slice(0, BATCH_BUDGET)」
+ * 真正独立生效——重读语义充分，已归档/被覆盖条目跳过后批次预算仍能独立约束；
+ * 若窗口与预算同为 200，slice 恒等、预算不构成独立约束（冗余）。
+ */
+const CANDIDATE_WINDOW = 1000
 
 /** 重复合并：tokenize Jaccard 相似度下限（≥0.85 视为近似重复） */
 const JACCARD_THRESHOLD = 0.85
@@ -111,6 +116,15 @@ export class MemoryMaintenance {
     return this.lastRunAtValue
   }
 
+  /**
+   * 重入互斥：当前运行中的批次 promise。
+   * 定时触发器、手动工具/RPC 触发可能并发进入 runOnce——若先后起动两次会对同一
+   * 对象重复 merge/update/archive 产生重复审计。合并并发：已有批次在运行则返回
+   * 同一 promise，不重复执行。规则任务幂等可安全合并；子任务（反思/因果）各自带
+   * 周期门控，天然去重，不会因合并产生额外执行。
+   */
+  private running: Promise<void> | undefined
+
   constructor(private readonly deps: MemoryMaintenanceDeps) {}
 
   /**
@@ -179,34 +193,49 @@ export class MemoryMaintenance {
 
   /**
    * 执行一个整理批次（公开，供定时器与测试直接调用）。
-   * 全程自收容：单条处理失败仅告警并继续，批次级整体失败仅告警——
-   * 后台异步任务绝不让 rejection 逃离（工程必需）。
+   * 重入互斥：定时+手动/工具并发合并为一次（见 running 字段说明），避免对同一
+   * 对象重复处理产生重复审计。全程自收容：单条处理失败仅告警并继续，批次级整体
+   * 失败仅告警——后台异步任务绝不让 rejection 逃离（工程必需）。
    */
-  async runOnce(): Promise<void> {
-    try {
-      const session = this.recent?.session
-      if (session === undefined) return // 活动门：进程内尚未出现会话活动
-      const route = resolveRoute(session, undefined)
-      if (route === undefined) {
-        this.deps.logger.warn('[dsh-memory] 无可用模型路由，跳过本批后台整理')
-        return
+  runOnce(): Promise<void> {
+    // 重入互斥：已有批次在运行 → 返回同一 promise（合并并发，不重复执行）
+    if (this.running !== undefined) return this.running
+    // 同步建立运行中 Promise（在进入异步体前赋值），使"批执行中再调一次"能看见它；
+    // 并发方（含首个）都拿到同一个 run 引用——外层不能是 async 包装（async 函数会
+    // 产生新的 promise 身份，破坏"合并为一次"的身份语义与测试断言）。
+    const run = (async () => {
+      try {
+        const session = this.recent?.session
+        if (session === undefined) return // 活动门：进程内尚未出现会话活动
+        const route = resolveRoute(session, undefined)
+        if (route === undefined) {
+          this.deps.logger.warn('[dsh-memory] 无可用模型路由，跳过本批后台整理')
+          return
+        }
+
+        const candidates = this.deps.store.listRecent(CANDIDATE_WINDOW, 'active')
+        const window = candidates.slice(0, BATCH_BUDGET)
+
+        await this.mergeDuplicates(window)
+        await this.archiveStale(window)
+        await this.normalizeTags(window)
+        // LLM 子任务（反思/因果抽取）：规则任务之后串行执行（各自带周期门控与自收容）。
+        // 与规则任务同处 runOnce 成功路径——任一段失败仅告警不影响后续与批次完成记录。
+        await this.runSubtask('反思', this.deps.reflector?.runOnce(route))
+        await this.runSubtask('因果抽取', this.deps.causal?.runOnce(route))
+        // O1：批次完成时刻记录（成功路径；失败由 catch 告警且不更新——可观测"上次成功维护"）
+        this.lastRunAtValue = new Date().toISOString()
+      } catch (error) {
+        this.deps.logger.warn('[dsh-memory] 后台记忆整理批次执行失败：', error)
       }
-
-      const candidates = this.deps.store.listRecent(CANDIDATE_WINDOW, 'active')
-      const window = candidates.slice(0, BATCH_BUDGET)
-
-      await this.mergeDuplicates(window)
-      await this.archiveStale(window)
-      await this.normalizeTags(window)
-      // LLM 子任务（反思/因果抽取）：规则任务之后串行执行（各自带周期门控与自收容）。
-      // 与规则任务同处 runOnce 成功路径——任一段失败仅告警不影响后续与批次完成记录。
-      await this.runSubtask('反思', this.deps.reflector?.runOnce(route))
-      await this.runSubtask('因果抽取', this.deps.causal?.runOnce(route))
-      // O1：批次完成时刻记录（成功路径；失败由 catch 告警且不更新——可观测"上次成功维护"）
-      this.lastRunAtValue = new Date().toISOString()
-    } catch (error) {
-      this.deps.logger.warn('[dsh-memory] 后台记忆整理批次执行失败：', error)
-    }
+    })()
+    // 失败清理钩子：批次体自收容（logger.warn）不会 reject，finally 派生态无拒绝；
+    // 比对引用才复位——并发方已被合并到同一 run，引用不变则复位；若被替换则不覆盖。
+    this.running = run
+    void run.finally(() => {
+      if (this.running === run) this.running = undefined
+    })
+    return run
   }
 
   /**
@@ -280,6 +309,10 @@ export class MemoryMaintenance {
     for (const candidate of window) {
       const entry = this.deps.store.getById(candidate.id)
       if (entry === undefined || entry.status !== 'active') continue
+      // 重读补查 supersededBy（与 mergeDuplicates 同语义）：窗口快照可能在并发
+      // create 的 supersede 回写前取得——已被覆盖的条目不应再被降级归档
+      // （"现行表述"由 create 侧 supersede 语义管理，降级会与之打架）。
+      if (entry.supersededBy !== undefined) continue
       if (entry.accessCount !== 0) continue
       if (entry.importance > MAX_STALE_IMPORTANCE) continue
       const updatedAt = Date.parse(entry.updatedAt)
@@ -302,6 +335,10 @@ export class MemoryMaintenance {
     for (const candidate of window) {
       const entry = this.deps.store.getById(candidate.id)
       if (entry === undefined || entry.status !== 'active') continue
+      // 重读补查 supersededBy（与 mergeDuplicates/archiveStale 同语义）：窗口快照
+      // 可能在并发 create 的 supersede 回写前取得——已被覆盖的现行表述由 create 侧
+      // supersede 语义管理，标签整理不应再触碰（与归档同理，防与 supersede 打架）。
+      if (entry.supersededBy !== undefined) continue
       const lowered = [...new Set(entry.tags.map((tag) => tag.toLowerCase()))]
       const changed =
         lowered.length !== entry.tags.length || lowered.some((tag, i) => tag !== entry.tags[i])

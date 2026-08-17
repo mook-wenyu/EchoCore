@@ -176,6 +176,17 @@ describe('selectReflectionPairs', () => {
     }
   })
 
+  it('peer 仅限同 workspace：跨 workspace 不构成对比对', () => {
+    // 同 workspace 内相似对才喂 LLM；跨 workspace 即使 jaccard 落在带内也不作 peer
+    // （避免跨域对白喂 LLM 随后在 applyDecision 才 skip 的浪费）
+    const focus = makeEntry({ id: 'focus', content: 'a b c d e f', workspace: 'D:/wsA', importance: 10 })
+    const sameWs = makeEntry({ id: 'same', content: 'a b c d e f g h', workspace: 'D:/wsA', importance: 1 }) // j=6/8=0.75 带内
+    const otherWs = makeEntry({ id: 'other', content: 'a b c d e f g h i', workspace: 'D:/wsB', importance: 1 }) // j=6/9≈0.667 带内但跨域
+    const pairs = selectReflectionPairs([focus, sameWs, otherWs])
+    expect(pairs[0]?.focus.id).toBe('focus')
+    expect(pairs[0]?.peers.map((p) => p.id)).toEqual(['same']) // 跨 workspace 不作 peer
+  })
+
   it('每个焦点 peers 数受 REFLECT_PEERS_PER_FOCUS 上限约束', () => {
     const focus = makeEntry({ id: 'focus', content: 'a b c d e f', importance: 10 })
     // 构造 5 个带内 peer（jaccard 各异），仅取前 3
@@ -267,7 +278,7 @@ describe('MemoryReflector.runOnce', () => {
     expect(store.getById('older01')?.status).toBe('active') // 未被归档
   })
 
-  it('跨 workspace 条目不操作，计入 skipped', async () => {
+  it('跨 workspace 条目不构成候选对（Q6⑦ 拍板：不喂 LLM；applyDecision 的跨域守卫仍保留为竞态兜底）', async () => {
     const older = makeEntry({ id: 'older01', content: 'a b c d e f g h', workspace: 'D:/wsA', createdAt: new Date(NOW - MS_PER_DAY).toISOString() })
     const newer = makeEntry({ id: 'newer01', content: 'a b c d e f', workspace: 'D:/wsB', createdAt: new Date(NOW).toISOString() })
     const { store, reflector } = makeReflector(
@@ -275,7 +286,8 @@ describe('MemoryReflector.runOnce', () => {
       '{"decisions":[{"focusId":"older01","peerId":"newer01","action":"merge","reason":"x"}]}',
     )
     const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
-    expect(summary.skipped).toBe(1)
+    // 新契约：跨 workspace 对不再进入候选（无带内 peer）→ 不喂 LLM、无裁决、无任何操作
+    expect(summary).toEqual({ reviewed: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 })
     expect(store.getById('older01')?.status).toBe('active')
     expect(store.getById('newer01')?.status).toBe('active')
   })
@@ -343,6 +355,21 @@ describe('MemoryReflector.runOnce', () => {
     expect(reflector.lastRunAt).toBeNull()
     await reflector.runOnce({ provider: 'deepseek', model: 'm' })
     expect(reflector.lastRunAt).toBe(new Date(NOW).toISOString())
+  })
+
+  it('重入互斥：并发调用 runOnce（force）合并为一次，只一次 LLM 调用', async () => {
+    const { older, newer } = duplicatePair()
+    const { llm, reflector } = makeReflector(
+      [older, newer],
+      '{"decisions":[{"focusId":"older01","peerId":"newer01","action":"none","reason":"x"}]}',
+    )
+    // 定时（force=false 但首启通过门控）与手动（force=true）并发——都应合并为一次
+    const p1 = reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    const p2 = reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(p2).toBe(p1) // 返回同一 promise，合并并发
+    const [s1, s2] = await Promise.all([p1, p2])
+    expect(s1).toEqual(s2)
+    expect(llm.calls).toHaveLength(1) // 只一次 LLM 调用，不重复
   })
 })
 

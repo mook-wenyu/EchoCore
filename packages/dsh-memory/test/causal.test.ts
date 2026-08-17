@@ -415,4 +415,14 @@ describe('MemoryCausalExtractor', () => {
     expect(summary).toMatchObject({ reviewed: 0, edges: 0, created: 0, skipped: 0 })
     expect(extractor.lastRunAt).not.toBeNull()
   })
+
+  it('重入互斥：并发调用 runOnce（force）合并为一次，只一次 LLM 调用', async () => {
+    const { entryTable, llm, extractor } = setupExtractor('{"edges":[]}')
+    await seedPair(entryTable)
+    const p1 = extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })
+    const p2 = extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })
+    expect(p2).toBe(p1) // 返回同一 promise，合并并发
+    await Promise.all([p1, p2])
+    expect(llm.calls).toHaveLength(1) // 只一次 LLM 调用，不重复
+  })
 })

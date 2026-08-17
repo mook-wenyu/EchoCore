@@ -200,6 +200,10 @@ export function selectReflectionPairs(entries: MemoryEntry[]): Array<{ focus: Me
     const scored: Array<{ peer: MemoryEntry; j: number }> = []
     for (const entry of entries) {
       if (entry.id === focus.id) continue
+      // 跨 workspace 不构成对比对（Q6⑦ 拍板）：LLM 只审同 workspace 内的语义近重复/
+      // 矛盾——跨域对在 applyDecision 也会被 skip，喂 LLM 纯属浪费 token；
+      // undefined 与 undefined（同缺省）视为同域，不影响既有同域 fixture。
+      if (entry.workspace !== focus.workspace) continue
       const j = jaccardOf(focus, entry)
       if (j >= PEER_MIN_JACCARD && j < PEER_MAX_JACCARD) scored.push({ peer: entry, j })
     }
@@ -264,29 +268,52 @@ export class MemoryReflector {
    * 执行一个反思批次。route 缺省回退缓存的上次 route；无可用 route 且无缓存则
    * warn 并返回 undefined（RPC 无会话场景）。
    */
-  async runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<ReflectionSummary | undefined> {
-    const force = opts?.force ?? false
-    // 周期门控：非强制且距上次成功执行未满间隔 → 直接返回（不打 LLM）
-    if (!force && this.lastRunAtMs !== null && this.deps.now() - this.lastRunAtMs < REFLECT_INTERVAL_MS) {
-      return undefined
-    }
-    const resolved = route ?? this.lastRoute
-    if (resolved === undefined) {
-      this.deps.logger.warn('[dsh-memory] 无可用模型路由，跳过反思（RPC 无会话场景）')
-      return undefined
-    }
-    try {
-      const summary = await this.runReflection(resolved)
-      const nowIso = new Date(this.deps.now()).toISOString()
-      this.lastRunAtValue = nowIso
-      this.lastRunAtMs = this.deps.now()
-      this.lastRoute = resolved
-      this.lastSummaryValue = summary
-      return summary
-    } catch (error) {
-      this.deps.logger.warn('[dsh-memory] 反思批次执行失败：', error)
-      return undefined
-    }
+  /** 重入互斥：当前运行中的批次 promise（定时 + 手动 force 并发合并为一次执行） */
+  private running: Promise<ReflectionSummary | undefined> | undefined
+
+  /**
+   * 执行一个反思批次。route 缺省回退缓存的上次 route；无可用 route 且无缓存则
+   * warn 并返回 undefined（RPC 无会话场景）。
+   * 重入互斥（Q6④ 拍板）：并发调用合并为一次——已有批次在运行则返回同一 promise，
+   * 避免对同一对重复归档/合并产生重复审计；周期门控在异步体内仍各自生效。
+   */
+  runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<ReflectionSummary | undefined> {
+    // 重入互斥：已有批次在运行 → 返回同一 promise（合并并发，不重复执行）
+    if (this.running !== undefined) return this.running
+    // 并发方（含首个）都拿到同一个 run 引用——外层不能是 async 包装（async 函数会
+    // 产生新的 promise 身份，破坏"合并为一次"的身份语义与测试断言）。
+    const run = (async (): Promise<ReflectionSummary | undefined> => {
+      const force = opts?.force ?? false
+      // 周期门控：非强制且距上次成功执行未满间隔 → 直接返回（不打 LLM）
+      if (!force && this.lastRunAtMs !== null && this.deps.now() - this.lastRunAtMs < REFLECT_INTERVAL_MS) {
+        return undefined
+      }
+      const resolved = route ?? this.lastRoute
+      if (resolved === undefined) {
+        this.deps.logger.warn('[dsh-memory] 无可用模型路由，跳过反思（RPC 无会话场景）')
+        return undefined
+      }
+      try {
+        const summary = await this.runReflection(resolved)
+        const nowIso = new Date(this.deps.now()).toISOString()
+        this.lastRunAtValue = nowIso
+        this.lastRunAtMs = this.deps.now()
+        this.lastRoute = resolved
+        this.lastSummaryValue = summary
+        return summary
+      } catch (error) {
+        this.deps.logger.warn('[dsh-memory] 反思批次执行失败：', error)
+        return undefined
+      }
+    })()
+    // 失败清理钩子：批次体自收容（logger.warn）不会 reject，finally 派生态无拒绝；
+    // 比对引用才复位（与 maintenance.runOnce 同模式）——并发方已被合并到同一 run，
+    // 引用不变则复位；若被替换则不覆盖别人的 promise，保证互斥不早破。
+    this.running = run
+    void run.finally(() => {
+      if (this.running === run) this.running = undefined
+    })
+    return run
   }
 
   /** 执行反思主体：拉候选 → 选焦点对 → 渲染 → 单次 LLM → 逐条执行 */

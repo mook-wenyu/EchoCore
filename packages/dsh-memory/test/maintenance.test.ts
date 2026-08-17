@@ -356,6 +356,88 @@ describe('MemoryMaintenance 批预算', () => {
   })
 })
 
+describe('MemoryMaintenance 重入互斥（定时+手动并发合并为一次）', () => {
+  it('并发调用 runOnce 两次：返回同一 promise，只执行一次完整批次；结束后 running 复位可再开新批次', async () => {
+    const { table, store, sessionEvent, maintenance } = setup()
+    // 计数 listRecent：每次开启一个完整批次都会调用它（作为"完整批次执行"观测点）
+    let listRecentCalls = 0
+    const origListRecent = store.listRecent.bind(store)
+    store.listRecent = ((limit: number, status?: unknown) => {
+      listRecentCalls++
+      return origListRecent(limit, status as Parameters<typeof origListRecent>[1])
+    }) as typeof store.listRecent
+
+    // 预置一对将被合并的近似重复（保证批次有真实工作：merge/archive）
+    const older = makeEntry({ id: 'old', content: 'keep all logs for compliance and audit', createdAt: new Date(NOW - 2 * MS_PER_DAY).toISOString() })
+    const newer = makeEntry({ id: 'new', content: 'keep all logs for compliance and audit forever' })
+    await table.put(older.id, older)
+    await table.put(newer.id, newer)
+    activate(sessionEvent, makeSession('s1'))
+
+    // 并发调用两次（第二次发生在第一次执行中）→ 合并到同一 promise，不重复执行
+    const p1 = maintenance.runOnce()
+    const p2 = maintenance.runOnce()
+    expect(p2).toBe(p1) // 返回同一 promise
+    await Promise.all([p1, p2])
+    expect(listRecentCalls).toBe(1) // 只执行一次完整批次（未重复）
+
+    // 结束后 running 已复位：再次调用开启新批次（不残留死锁）
+    await maintenance.runOnce()
+    expect(listRecentCalls).toBe(2)
+
+    // 合并结果正确（并发不破坏）
+    expect(store.getById('old')?.status).toBe('archived')
+    expect(store.getById('new')?.status).toBe('active')
+  })
+})
+
+describe('MemoryMaintenance 重读补查 supersededBy（P1-2 并发一致性）', () => {
+  it('archiveStale 不归档被 supersededBy 覆盖的过期条目（与 mergeDuplicates 同语义）', async () => {
+    const { table, store, sessionEvent, maintenance } = setup()
+    // 过期 + 从未访问 + 低重要度，但已被 supersededBy 覆盖（P1-2：批次快照后被
+    // 并发 create 覆盖的窗口条目——listRecent 快照时尚未 supersede，archiveStale
+    // 重读时才看到）。用 includeSuperseded 变体让它进入窗口以模拟该竞态。
+    const superseded = makeEntry({
+      id: 'sup',
+      content: '旧表述',
+      importance: 2,
+      accessCount: 0,
+      createdAt: new Date(NOW - 95 * MS_PER_DAY).toISOString(),
+      updatedAt: new Date(NOW - 95 * MS_PER_DAY).toISOString(),
+      supersededBy: 'new',
+    })
+    await table.put(superseded.id, superseded)
+    // 复刻"窗口快照已包含该条目"：强制 listRecent 把被覆盖条目也纳入窗口
+    const origListRecent = store.listRecent.bind(store)
+    store.listRecent = ((limit: number, status?: unknown) =>
+      origListRecent(limit, status as Parameters<typeof origListRecent>[1], true)) as typeof store.listRecent
+
+    activate(sessionEvent, makeSession('s1'))
+    await maintenance.runOnce()
+    // 被覆盖条目不得被归档（否则"现行表述"体系被破坏）
+    expect(store.getById('sup')?.status).toBe('active')
+  })
+
+  it('normalizeTags 不改写被 supersededBy 覆盖条目的标签', async () => {
+    const { table, store, sessionEvent, maintenance } = setup()
+    const superseded = makeEntry({
+      id: 'suptag',
+      content: '旧表述',
+      tags: ['Vite', 'vite', 'USE'], // 需归一化的大小写分裂标签
+      supersededBy: 'new',
+    })
+    await table.put(superseded.id, superseded)
+    const origListRecent = store.listRecent.bind(store)
+    store.listRecent = ((limit: number, status?: unknown) =>
+      origListRecent(limit, status as Parameters<typeof origListRecent>[1], true)) as typeof store.listRecent
+
+    activate(sessionEvent, makeSession('s1'))
+    await maintenance.runOnce()
+    // 被覆盖条目标签保持原样（不归一化白跑）
+    expect(store.getById('suptag')?.tags).toEqual(['Vite', 'vite', 'USE'])
+  })
+})
+
 describe('MemoryMaintenance 定时器清理', () => {
   it('install 后有活动启动计时；dispose 后不再触发', async () => {
     vi.useFakeTimers()

@@ -292,78 +292,102 @@ export class MemoryCausalExtractor {
    * （force 无视）。route 缺省回退缓存，无 → warn 返回 undefined。
    * 全程自收容：任何异常仅告警并返回 undefined，不更新 lastRunAt/route 缓存。
    */
-  async runOnce(
+  /** 重入互斥：当前运行中的批次 promise（定时 + 手动 force 并发合并为一次执行） */
+  private running: Promise<CausalSummary | undefined> | undefined
+
+  /**
+   * 执行一个因果抽取批次。周期门控：距上次成功未满 CAUSAL_INTERVAL_MS → undefined
+   * （force 无视）。route 缺省回退缓存，无 → warn 返回 undefined。
+   * 重入互斥（Q6④ 拍板）：并发调用合并为一次——已有批次在运行则返回同一 promise，
+   * 避免对同一批条目重复建边/重复 LLM 调用；周期门控在异步体内仍各自生效。
+   * 全程自收容：任何异常仅告警并返回 undefined，不更新 lastRunAt/route 缓存。
+   */
+  runOnce(
     route: { provider: string; model: string } | undefined,
     opts?: { force?: boolean },
   ): Promise<CausalSummary | undefined> {
-    try {
-      // 周期门控（force 无视）
-      if (!opts?.force && this.lastRunAtValue !== null) {
-        const elapsed = this.deps.now() - Date.parse(this.lastRunAtValue)
-        if (Number.isFinite(elapsed) && elapsed < CAUSAL_INTERVAL_MS) return undefined
-      }
+    // 重入互斥：已有批次在运行 → 返回同一 promise（合并并发，不重复执行）
+    if (this.running !== undefined) return this.running
+    // 并发方（含首个）都拿到同一个 run 引用——外层不能是 async 包装（async 函数会
+    // 产生新的 promise 身份，破坏"合并为一次"的身份语义与测试断言）。
+    const run = (async (): Promise<CausalSummary | undefined> => {
+      try {
+        // 周期门控（force 无视）
+        if (!opts?.force && this.lastRunAtValue !== null) {
+          const elapsed = this.deps.now() - Date.parse(this.lastRunAtValue)
+          if (Number.isFinite(elapsed) && elapsed < CAUSAL_INTERVAL_MS) return undefined
+        }
 
-      // 路由解析：显式优先，缺省回退缓存；无 → 告警跳过
-      const resolved = route ?? this.routeCache
-      if (resolved === undefined) {
-        this.deps.logger.warn('[dsh-memory] 无可用模型路由，跳过本批因果抽取')
-        return undefined
-      }
+        // 路由解析：显式优先，缺省回退缓存；无 → 告警跳过
+        const resolved = route ?? this.routeCache
+        if (resolved === undefined) {
+          this.deps.logger.warn('[dsh-memory] 无可用模型路由，跳过本批因果抽取')
+          return undefined
+        }
 
-      // 候选：最近窗口 active（listRecent 已过滤非得体 source），截预算
-      const candidates = this.deps.store.listRecent(CAUSAL_WINDOW, 'active').slice(0, CAUSAL_BUDGET)
-      const reviewed = candidates.length
-      if (reviewed === 0) {
-        const empty: CausalSummary = { reviewed: 0, edges: 0, created: 0, skipped: 0 }
+        // 候选：最近窗口 active（listRecent 已过滤非得体 source），截预算
+        const candidates = this.deps.store.listRecent(CAUSAL_WINDOW, 'active').slice(0, CAUSAL_BUDGET)
+        const reviewed = candidates.length
+        if (reviewed === 0) {
+          const empty: CausalSummary = { reviewed: 0, edges: 0, created: 0, skipped: 0 }
+          this.lastRunAtValue = new Date(this.deps.now()).toISOString()
+          this.routeCache = resolved
+          this.lastSummaryValue = empty
+          return empty
+        }
+
+        // 一次性 LLM 调用
+        const userText = `以下是记忆条目列表（判断它们之间的因果/衍生关系）：\n\n${renderCandidates(candidates)}`
+        const userMessage: Message = createUserMessage({
+          content: [{ type: 'text', text: userText }],
+          source: { kind: 'plugin', plugin: MEMORY_PLUGIN_ID },
+        })
+        const assembler = new BlockAssembler()
+        for await (const chunk of this.deps.llm.stream({
+          provider: resolved.provider,
+          model: resolved.model,
+          system: CAUSAL_SYSTEM_PROMPT,
+          messages: [userMessage],
+          maxTokens: CAUSAL_MAX_TOKENS,
+        })) {
+          assembler.push(chunk)
+        }
+        const finishKind = assembler.finish.kind
+        if (finishKind === 'aborted' || finishKind === 'error') {
+          throw new Error(`因果抽取调用未正常完成（${finishKind} finish）`)
+        }
+        const text = assembler
+          .blocks()
+          .filter((block) => block.type === 'text')
+          .map((block) => (block as { text: string }).text)
+          .join('')
+
+        const parsed = parseCausalEdges(text)
+        const summary: CausalSummary = { reviewed, edges: parsed.length, created: 0, skipped: 0 }
+
+        // 逐条校验建边（重读 store 当前状态）
+        for (const edge of parsed) {
+          await this.acceptCandidate(edge, summary)
+        }
+
+        // 批次成功：更新 lastRunAt/route 缓存与观察量（失败路径在上面 catch，不更新）
         this.lastRunAtValue = new Date(this.deps.now()).toISOString()
         this.routeCache = resolved
-        this.lastSummaryValue = empty
-        return empty
+        this.lastSummaryValue = summary
+        return summary
+      } catch (error) {
+        this.deps.logger.warn('[dsh-memory] 因果抽取批次执行失败：', error)
+        return undefined
       }
-
-      // 一次性 LLM 调用
-      const userText = `以下是记忆条目列表（判断它们之间的因果/衍生关系）：\n\n${renderCandidates(candidates)}`
-      const userMessage: Message = createUserMessage({
-        content: [{ type: 'text', text: userText }],
-        source: { kind: 'plugin', plugin: MEMORY_PLUGIN_ID },
-      })
-      const assembler = new BlockAssembler()
-      for await (const chunk of this.deps.llm.stream({
-        provider: resolved.provider,
-        model: resolved.model,
-        system: CAUSAL_SYSTEM_PROMPT,
-        messages: [userMessage],
-        maxTokens: CAUSAL_MAX_TOKENS,
-      })) {
-        assembler.push(chunk)
-      }
-      const finishKind = assembler.finish.kind
-      if (finishKind === 'aborted' || finishKind === 'error') {
-        throw new Error(`因果抽取调用未正常完成（${finishKind} finish）`)
-      }
-      const text = assembler
-        .blocks()
-        .filter((block) => block.type === 'text')
-        .map((block) => (block as { text: string }).text)
-        .join('')
-
-      const parsed = parseCausalEdges(text)
-      const summary: CausalSummary = { reviewed, edges: parsed.length, created: 0, skipped: 0 }
-
-      // 逐条校验建边（重读 store 当前状态）
-      for (const edge of parsed) {
-        await this.acceptCandidate(edge, summary)
-      }
-
-      // 批次成功：更新 lastRunAt/route 缓存与观察量（失败路径在上面 catch，不更新）
-      this.lastRunAtValue = new Date(this.deps.now()).toISOString()
-      this.routeCache = resolved
-      this.lastSummaryValue = summary
-      return summary
-    } catch (error) {
-      this.deps.logger.warn('[dsh-memory] 因果抽取批次执行失败：', error)
-      return undefined
-    }
+    })()
+    // 失败清理钩子：批次体自收容（logger.warn）不会 reject，finally 派生态无拒绝；
+    // 比对引用才复位（与 maintenance/reflect.runOnce 同模式）——并发方已被合并到
+    // 同一 run，引用不变则复位；若被替换则不覆盖别人的 promise。
+    this.running = run
+    void run.finally(() => {
+      if (this.running === run) this.running = undefined
+    })
+    return run
   }
 
   /**
