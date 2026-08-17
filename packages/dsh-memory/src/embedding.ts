@@ -108,8 +108,12 @@ export function defaultHasLocalModel(modelDir: string): () => Promise<boolean> {
     try {
       await access(join(modelDir, LOCAL_MODEL_REL))
       return true
-    } catch {
-      return false
+    } catch (error) {
+      // Q6⑨：仅 ENOENT（模型文件不存在）→ 视为"无本地模型"（正常禁用态）；其它错误
+      // （如 EACCES 目录/文件不可读、IO 故障）**上抛**——权限等真实故障不能静默当作
+      // "无模型"降级为 disabled 掩盖（否则模型目录为何不可用永远不可见）。
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
     }
   }
 }

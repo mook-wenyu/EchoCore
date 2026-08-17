@@ -32,7 +32,13 @@ import type { MemoryEntry } from './types.js'
  * 用户拍板删除原 enableAutoInject/topK/minScore/injectBudgetChars 四项配置，
  * 注入行为固定为"全开 + 以下默认值"。
  */
-/** 注入预算（字符）：≈4K token，与 magic-context 的 injection_budget_tokens:4000 对齐 */
+/**
+ * 注入预算：**字符**口径（非 token；Q3 拍板：诚实化标注、保留现状行为）。
+ * 中文 ≈1 字符/1 token → 16384 字符 ≈16K token（远高于"4K token"印象）；
+ * 英文 ≈4 字符/1 token → 仅对 ASCII 才接近 4K。与 magic-context
+ * injection_budget_tokens:4000 的对齐只对英文近似成立。若未来要严格 token
+ * 预算需引入 tokenizer 换算（YAGNI 暂不做，注释不再写误导性的"≈4K token"）。
+ */
 const INJECT_BUDGET_CHARS = 16384
 /** N2（2026-08-16 目录注入）：预算截断跳过的条目标题目录独立预算（字符）。
  * 语义（TencentDB 2026）：目录是"导航"而非"内容"——"列入目录 ≠ 被回忆"，

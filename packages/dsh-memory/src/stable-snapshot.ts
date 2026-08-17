@@ -33,7 +33,11 @@ import type { MemoryStore } from './store.js'
  */
 /** 快照缓存窗口（ms；窗口内字节不变，到期即重建） */
 export const SNAPSHOT_TTL_MS = 300_000
-/** 快照预算上限（字符；超限条目跳过并继续后续） */
+/**
+ * 快照预算上限（**字符**口径，非 token；Q3 拍板：诚实化标注）。
+ * 中文 ≈1 字符/1 token → 8192 字符 ≈8K token；英文 ≈2K token。与注入预算同为
+ * 字符口径——注释不再写"≈N token"误导（token 换算需引入 tokenizer，YAGNI）。
+ */
 export const SNAPSHOT_BUDGET_CHARS = 8192
 /** 快照 Top-K 候选上限（预算之外的保险） */
 export const SNAPSHOT_TOP_K = 30

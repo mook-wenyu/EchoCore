@@ -202,8 +202,14 @@ export class EmbeddingIndex {
     let raw: string
     try {
       raw = await readFile(jsonFile, 'utf8')
-    } catch {
-      return 0 // 无旧文件 = 无迁移
+    } catch (error) {
+      // Q6⑨：ENOENT = 无旧 JSON 文件（正常无迁移）；其它 IO 错误（EACCES 等）→ 仅告警
+      // 并继续——迁移是附属路径，缺失向量由 ensureAll 按当前条目补齐，失败不阻断插件
+      // 加载（与 EmbeddingService 侧"模型目录不可读即 error"语义分界：那是主嵌入路径）。
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.deps.logWarn(`[dsh-memory] 旧嵌入索引读取失败（${jsonFile}）：`, error)
+      }
+      return 0
     }
     let parsed: Record<string, unknown>
     try {
