@@ -9,7 +9,7 @@
  * （:memory: + loadExtension，@photostructure/sqlite-vec 自带 Windows dll）。
  */
 
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -17,10 +17,17 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { EmbeddingIndex } from '../src/embed-index.js'
-import { EmbeddingService, EmbeddingUnavailableError, cosine, remoteEmbedFetch, resolveApiKey } from '../src/embedding.js'
+import { EmbeddingService, EmbeddingUnavailableError, cosine, defaultHasLocalModel, remoteEmbedFetch, resolveApiKey } from '../src/embedding.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeTable } from './helpers.js'
+
+// 全模块拦截（pass-through：默认走真实实现，测试按需覆写）——src 与测试共享同一
+// mock 模块，避免"动态 import 命名空间 ≠ require 命名空间"导致 spy 失效（实测坑）。
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return { ...actual, readFile: vi.fn(actual.readFile), access: vi.fn(actual.access) }
+})
 
 describe('resolveApiKey（env: 前缀解析，用户拍板规则）', () => {
   afterEach(() => {
@@ -781,5 +788,66 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     const dimTables = rows.filter((r) => /^vec_memory_\d+$/.test(r.name)).map((r) => r.name).sort()
     expect(dimTables).toEqual(['vec_memory_384'])
     db.close()
+  })
+
+  it('ensureAll 批次写事务：批次中途一条写入失败 → 该批整批回滚不留半批（Q7/4c）', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const warns: string[] = []
+    const entries = Array.from({ length: 6 }, (_, i) => ({ id: `mem-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+    // embedMany 返回 6 条：第 5 条（j=4）为 512 维错误向量（表中浮点列定 384）→
+    // writeVector 写入该行抛错 → 事务 ROLLBACK → 整批 6 条（含已写的前 4 条）都不落库
+    const service = {
+      state: 'ready',
+      dimension: 384,
+      embed: async (text: string) => {
+        const v = new Float32Array(384)
+        v[1] = text.length
+        return v
+      },
+      embedMany: async (texts: string[]) =>
+        texts.map((_, j) => {
+          // 第 5 条维度错误触发写入失败（其余同维度）
+          const v = new Float32Array(j === 4 ? 512 : 384)
+          v[0] = texts[j]!.length
+          return v
+        }),
+    }
+    const index = new EmbeddingIndex({ db, service, listAll: () => entries, logWarn: (m) => warns.push(m) })
+    await index.ensureAll()
+    // 批次已回滚：表内无任何该批的行（前 4 条也不落库）——"批内全有或全无"
+    expect(index.knn(queryVec(3), 100)).toEqual([])
+    expect(warns.some((m) => m.includes('嵌入批次失败'))).toBe(true)
+    db.close()
+  })
+
+  it('loadLegacy：非 ENOENT 读失败（EACCES）→ logWarn 且返回 0（不阻断挂载，Q6⑨）', async () => {
+    vi.mocked(readFile).mockRejectedValueOnce(Object.assign(new Error('permission denied'), { code: 'EACCES' }))
+    try {
+      const db = new DatabaseSync(':memory:', { allowExtension: true })
+      const warns: string[] = []
+      const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: (m) => warns.push(m) })
+      expect(await index.loadLegacy('/some/legacy-384.json')).toBe(0)
+      expect(warns.some((m) => m.includes('读取失败'))).toBe(true)
+      db.close()
+    } finally {
+      vi.mocked(readFile).mockClear()
+    }
+  })
+})
+
+describe('defaultHasLocalModel（Q6⑨：ENOENT 归为"无模型"，其它 IO 归为真实故障上抛）', () => {
+  it('模型文件不存在（ENOENT）→ false', async () => {
+    const has = defaultHasLocalModel(join(tmpdir(), 'no-such-model-dir-xyz'))
+    expect(await has()).toBe(false)
+  })
+
+  it('非 ENOENT（如 EACCES 不可读）→ 上抛，不静默当作"无模型"', async () => {
+    vi.mocked(access).mockRejectedValueOnce(Object.assign(new Error('permission denied'), { code: 'EACCES' }))
+    try {
+      const has = defaultHasLocalModel('/models')
+      await expect(has()).rejects.toThrow('permission denied')
+    } finally {
+      vi.mocked(access).mockClear()
+    }
   })
 })

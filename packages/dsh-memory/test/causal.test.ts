@@ -425,4 +425,16 @@ describe('MemoryCausalExtractor', () => {
     await Promise.all([p1, p2])
     expect(llm.calls).toHaveLength(1) // 只一次 LLM 调用，不重复
   })
+
+  it('重入互斥：批次结束后 running 复位——再开新批次（两次独立执行，LLM 各一次）', async () => {
+    const { entryTable, llm, extractor } = setupExtractor('{"edges":[]}')
+    await seedPair(entryTable)
+    const route = { provider: 'p', model: 'm' }
+    await extractor.runOnce(route, { force: true })
+    expect(llm.calls).toHaveLength(1)
+    // running 已复位：第二次 force 是一轮**新批次**（再次调用 LLM），非复用旧 promise
+    // ——防 running 复位失败导致"永久锁死"（F2 审计点）
+    await extractor.runOnce(route, { force: true })
+    expect(llm.calls).toHaveLength(2)
+  })
 })

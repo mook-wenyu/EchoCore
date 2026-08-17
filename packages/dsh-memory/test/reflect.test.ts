@@ -371,6 +371,22 @@ describe('MemoryReflector.runOnce', () => {
     expect(s1).toEqual(s2)
     expect(llm.calls).toHaveLength(1) // 只一次 LLM 调用，不重复
   })
+
+  it('重入互斥：批次结束后 running 复位——可再开新批次（两次独立执行，LLM 各一次）', async () => {
+    const { older, newer } = duplicatePair()
+    const { llm, reflector } = makeReflector(
+      [older, newer],
+      '{"decisions":[{"focusId":"older01","peerId":"newer01","action":"none","reason":"x"}]}',
+    )
+    const route = { provider: 'deepseek', model: 'm' }
+    const s1 = await reflector.runOnce(route, { force: true })
+    expect(llm.calls).toHaveLength(1)
+    // running 已复位：第二次 force 是一轮**新批次**（再次调用 LLM），而非复用旧 promise
+    // ——防 running 复位失败导致"永久锁死"（F2 审计点）。同对同裁决 → 观测量一致。
+    const s2 = await reflector.runOnce(route, { force: true })
+    expect(llm.calls).toHaveLength(2)
+    expect(s1).toEqual(s2)
+  })
 })
 
 describe('反思审计详情与观测（A′ 建议：动作需带依据引用、可审计可回滚）', () => {

@@ -244,7 +244,17 @@ export class EmbeddingIndex {
         const chunk = missing.slice(i, i + EMBED_BATCH_SIZE)
         try {
           const vectors = await batch(chunk.map((entry) => entry.content))
-          for (let j = 0; j < chunk.length; j++) this.writeVector(chunk[j]!.id, vectors[j]!)
+          // 4c（Q7 拍板）：单批写包进一个 SQLite 事务——向量落库从"逐行自动提交"
+          // 变"批内全有或全无"（sqlite-vec 官方批写建议）；批次中途写失败整批回滚
+          // 不留半批，由 catch 记录——缺失保持纯关键词检索（与批次错误语义一致）。
+          this.deps.db.exec('BEGIN')
+          try {
+            for (let j = 0; j < chunk.length; j++) this.writeVector(chunk[j]!.id, vectors[j]!)
+            this.deps.db.exec('COMMIT')
+          } catch (error) {
+            this.deps.db.exec('ROLLBACK')
+            throw error
+          }
         } catch (error) {
           // 批次失败显式记录并继续下一批——缺失条目保持纯关键词检索（显式语义）
           this.deps.logWarn(`[dsh-memory] 嵌入批次失败（${chunk.length} 条保持纯关键词检索）：`, error)
@@ -252,10 +262,18 @@ export class EmbeddingIndex {
       }
       return
     }
-    // 无批量能力（测试注入假后端）：逐条回退
-    for (const entry of missing) {
-      const vector = await this.deps.service.embed(entry.content)
-      this.writeVector(entry.id, vector)
+    // 无批量能力（测试注入假后端）：逐条回退（整体包事务——中途失败整批回滚，
+    // 与批量路径的"批内全有或全无"一致）
+    this.deps.db.exec('BEGIN')
+    try {
+      for (const entry of missing) {
+        const vector = await this.deps.service.embed(entry.content)
+        this.writeVector(entry.id, vector)
+      }
+      this.deps.db.exec('COMMIT')
+    } catch (error) {
+      this.deps.db.exec('ROLLBACK')
+      throw error
     }
   }
 }

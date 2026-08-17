@@ -55,8 +55,12 @@ export async function migrateMemoryJson<V>(
   let raw: string
   try {
     raw = await readFile(jsonPath, 'utf8')
-  } catch {
-    return { migrated: 0, skipped: 0, corrupt: false } // 无旧文件 = 首次全新启动
+  } catch (error) {
+    // 仅 ENOENT（无旧 memory.json）= 首次全新启动（正常）；其它 IO 错误（EACCES
+    // 不可读/磁盘故障）**上抛**——迁移被当作"无旧文件"跳过会静默丢失整库迁移
+    // 源（Q6⑨ 补全项 1a，用户拍板）。上抛 → 装配层显式失败可见，由用户修复权限。
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    return { migrated: 0, skipped: 0, corrupt: false }
   }
   let document: { tables?: { entries?: Record<string, unknown> } }
   try {

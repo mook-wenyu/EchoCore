@@ -17,6 +17,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { apply, inject, mountMemory } from '../src/index.js'
 import { DEFAULTS } from '../src/config.js'
 import { EmbeddingService } from '../src/embedding.js'
+import type { MemoryStore } from '../src/store.js'
 import { FakeCtx } from './helpers.js'
 
 /** 访问 mock EmbeddingService 的构造记录（静态计数——断言实时生效器重建后端） */

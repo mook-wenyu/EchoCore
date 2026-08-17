@@ -198,6 +198,10 @@ export interface MountOverrides {
   legacyJsonFile?: string
   /** 配置持久化 seam（apply 注入；测试直连装配可不传——配置端点见 rpcContextFrom） */
   seam?: SettingsSeam
+  /** 1b（2026-08-17 用户拍板）：装配侧 test seam——组合根不返回 store，测试经此
+   * 拿句柄驱动真实写路径（如"create→索引联动失败不崩"集成测试）。运行期不传
+   * 则无作用；仅测试注入，不改变装配语义。 */
+  exposeStore?: (store: MemoryStore) => void
 }
 
 /** 装配各模块：打开 SQLite 存储（含首启迁移）→ 构造存储与提取器 → 挂接生命周期 */
@@ -298,6 +302,8 @@ export async function mountMemory(
       },
     },
   ))
+  // 1b：test seam（装配完成后把 store 句柄交给调用方；运行期不传则无作用）
+  overrides.exposeStore?.(store)
 
   // 语义嵌入初始初始化（远程优先 → 本地回退 → disabled 正常态）。装配用
   // seam 的**当前**生效配置（settings 段若已在注册期生效，此处即合并值）——

@@ -8,15 +8,23 @@
  */
 
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { DomainError } from '@deepseek-ai/dsh-storage-domain'
 
 import { migrateMemoryJson, SqliteKvTable } from '../src/sqlite-kv.js'
+
+// 全模块拦截（pass-through：默认走真实实现，测试按需覆写）——src 与测试共享同一
+// mock 模块，避免"动态 import 命名空间 ≠ require 命名空间"导致 spy 失效（实测坑）。
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return { ...actual, readFile: vi.fn(actual.readFile) }
+})
 
 /** 临时数据库文件（每用例独立目录，防 WAL 残留互扰） */
 function tmpDbPath(): string {
@@ -291,6 +299,20 @@ describe('migrateMemoryJson', () => {
     const { jsonPath, table, db, dir } = make()
     const result = await migrateMemoryJson(jsonPath, table, () => true)
     expect(result).toEqual({ migrated: 0, skipped: 0, corrupt: false })
+    expect(table.size).toBe(0)
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('非 ENOENT 的 IO 错误（EACCES 等）→ 上抛，不静默当作"无旧文件"（Q6⑨ 补全项 1a）', async () => {
+    const { jsonPath, table, db, dir } = make()
+    try {
+      // 注入 EACCES（文件存在但不可读）——旧记忆库迁移被跳过会静默丢迁移源
+      vi.mocked(readFile).mockRejectedValueOnce(Object.assign(new Error('permission denied'), { code: 'EACCES' }))
+      await expect(migrateMemoryJson(jsonPath, table, () => true)).rejects.toThrow('permission denied')
+    } finally {
+      vi.mocked(readFile).mockClear()
+    }
     expect(table.size).toBe(0)
     db.close()
     rmSync(dir, { recursive: true, force: true })
