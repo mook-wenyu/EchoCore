@@ -1,75 +1,48 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-17（自进化反思 + 记忆因果链落地）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-17（全面风险审查 + 六大优化工作包落地，用户拍板 Q1-Q7 全部推荐项）。
 
 ## 一、架构健康度
 
-- 模块总数：22（types / constants / config / settings / memory-domain / scoring / store / extract / extractor / injector / tools / snapshot / stable-snapshot / embedding / embed-index / host-rpc / maintenance / **reflect** / **causal** / render / client.ts 浏览器半 + scripts/build-client.mjs）
-- 依赖方向：`index.ts`（组合根）→ 各模块；模块间仅 store/scoring/types/constants/render/embedding 被复用，无环；`reflect.ts`/`causal.ts` 仅被 `index.ts`/`tools.ts`/`maintenance.ts`（结构类型）引用，无环；`settings.ts` 仅被 `index.ts` 引用（组合根注入，无环）；新增外部依赖 `@photostructure/sqlite-vec`（vec0 扩展，仅 embed-index 使用）
-- 单元测试 **441 个全绿**（25 文件，三次连跑稳定）；类型检查与构建通过
-- 测试基建统一：FakeCtx 五合一（helpers.ts）、FakeTable 失败注入 + 快照迭代、可控 id 序列（vi.mock newMemoryId）、index.test 嵌入 mock（不真实加载 22MB 模型，533ms→15ms）、reflect.test/causal.test 假 llm 流（不真实调模型）
+- 模块总数：22 源模块 + client 面板（本轮无新增模块；新增工程资产 `.github/workflows/ci.yml`）
+- 依赖方向：`index.ts`（组合根）→ 各模块，无环；`reflect/causal` 仅被 index/tools/maintenance（结构类型）引用；`settings` 仅被 index 引用。新增/变更依赖：无新增包；`@photostructure/sqlite-vec` 由 `^1.2.0` 锁精确 `1.2.0`（防 npm 解析漂移）
+- 单元测试 **472 个全绿**（25 文件，typecheck 干净；较上轮 441 +31）
+- INFRA：新增 CI workflow（push/PR → install --frozen-lockfile → typecheck → test）；迁移单事务化；坏 SQLite 逐行容错；真 SQLite 集成测试补入（node:sqlite :memory:）
+- 本轮实现均为 TDD（先写失败测试→实现→绿），每工作包独立提交（7 个 commit）
 
-## 二、本次变更影响范围（P1-P4 + OPTIMIZATION_PLAN_4）
+## 二、本次变更影响范围（全面风险审查 → 六大优化工作包）
 
-- **自进化反思 + 记忆因果链**（本次，用户拍板四项）：①反思 `reflect.ts`——维护周期自动（6h 门控）+ 手动工具/RPC 触发，LLM 判定语义近似重复/跨条目矛盾，只做可逆「归档一侧」动作（归档较旧 + 重要度取更大值），审计 `by:system` + 依据 detail，可回滚；prompt 禁止内容改写/单次 importance 重打分/无来源合成 insight（A′ 负面证据：Manufactured Confidence / AAAI'25 Choice-Supportive Bias / Useful Memories Become Faulty）。②因果链 `causal.ts`——独立边表 `memory_causal_edges`（`SqliteKvTable` 泛型第二张表，复合键 source\0relation\0target 幂等 add-only，边带置信/依据 source/审计），维护周期批量增量抽取（6h 门控，LLM 输出边 → 重读校验 → upsert；已存在跳过）；v1 **保守**：仅 `memory_audit` 因果视图展示（causedBy/causeOf），检索主路径不改（「方向扩散更优」无直接论文证明；CS-RAG 三元组 ~68% 正确率不宜进检索主路径）。③接线：`maintenance.ts` deps 增可选 `reflector?`/`causal?` 结构类型（规则任务后串行调、各自自收容、测试假件可注入）；`index.ts` 装配边表/反射器/因果抽取器（复用 `ctx.llm`）、store onArchive/onSupersede 联动清因果边；`tools.ts` 第 7 工具 `memory_reflect` + audit 因果视图 + `RuntimeHealth` 透出 reflection/causal 观测；`host-rpc.ts` `reflect` 端点 + status 透传。④`store.ts` `archive(id, by, detail?)` 增可选 detail（向后兼容：既有调用不传行为不变——反思归档可携带依据）。**设计/证据**：`docs/design-self-evolution-causal.md` + `docs/research-report-reflection-self-evolution.md`（A′ 完整权威报告）。441 测试全绿（+55：reflect 21 / causal 23 / tools 6 / host-rpc 3 / maintenance 2）
-- **P1-P4**（此前提交）：稳定快照（3af3cea）/ 注入排除（e78ff09）/ 自适应衰减（db77788）/ 语义嵌入（1f2d1d0）
-- **A1 P0-1**（d5a9eda）：embed-index persist 串行互斥（promise 队列）+ 损坏 JSON 降级为空索引+告警（原会让插件整体加载失败）
-- **A2 P1-1**（16a6677）：config 数字边界（minScore 0..1、各字段 ≥1）+ 跨字段互斥（minExtractChars ≤ maxExtractChars，transform + ValidationError；防早期消息永久丢失）
-- **A3 P2-1**（2e20f1f）：supersede 联动移除嵌入向量（onSupersede 钩子）
-- **A4 P1-2**（35911f6）：测试补盲发现并修复**两处真实缺陷**——①维护合并同刻 createdAt 方向 tie-breaker（`>=` 恒选先扫描者，曾归档"新者"）；②create supersede 优先于维护合并（supersededBy 条目不参与配对，防现行表述被误归档双不可见）；补 RPC 错误传播/render 预算边界/dispose 交错/交叠测试
-- **B1 RRF**（8d4a36f）：语义融合改 RRF 排名融合（k=60 归一化），退役 `embeddingFusionWeight` 配置（无存量用户不向后兼容）
-- **B2 频率调制**（cca7d8d）：半衰期 ×(1+log2(1+accessCount))，高频访问召回抬回（Elastic/FadeMem 模式）
-- **B3 评测基线**（2bcd2a5）：contradiction 显式测试（PersonaMem 风格：偏好变化/事实推翻/无关性）
-- **E1 嵌入默认启用**（24543bf）：删除 `embeddingEnabled` 开关——**远程优先 → 自动回退本地 → 都无则关闭**；新增远程 4 项配置（embeddingApiBaseUrl/ApiKey/Model/Dimension，OpenAI 兼容 /embeddings）；EmbeddingService 多后端（远程验证失败回退本地、运行期故障切本地重试）；EmbeddingIndex 动态维度 + 索引文件按维度隔离（memory-embeddings-<dim>.json，本地 384/远程配置值）；远程返回维度 ≠ 配置 → 显式报错防混维；index.test 嵌入 mock 化（533ms→15ms 确定性）
-- **E2 apiKey 双形态**（c1b4885）：embeddingApiKey 支持字面 key 与 `env:NAME` 环境变量引用（env: 前缀显式标记，resolveApiKey 纯函数，字面 key 不被环境变量劫持）
-- **E3 面板配置**（7d34588 + d759bb7）：RPC 端点 getConfig/setConfig（严格载荷校验：未知键/类型/越界/跨字段互斥拒绝；setConfig 经 `ctx.fiber.update` 整体校验 → 写回 cordis.patch.yml → 重启插件生效——Cordis 原生链路，数据不丢）；记忆面板底部配置区块（字段驱动 DRY 表单，apiKey 解析状态展示，保存即生效）
-- **E4 配置面最小化**（707f014）：19 项 → **4 项**（仅远程嵌入 baseUrl/apiKey/model/dimension）；其余 15 项固化为模块内常量——注入（INJECT_BUDGET_CHARS/TOP_K/MIN_SCORE）、提取（MIN/MAX_EXTRACT_CHARS/EXTRACT_MAX_TOKENS）、快照（SNAPSHOT_TTL_MS/BUDGET_CHARS/TOP_K）、维护（MAINTENANCE_INTERVAL_MS）、四个 enable 开关全删（行为恒启用）、本地模型目录固定全局（模型是共享资产，用户修正方向）；依据 12-Factor + FSE'15 Too Many Knobs；净减 216 行；P2 注入测试适配快照恒启用（长尾种子验证"快照管稳定 Top、实时注入补长尾"）
-- **F1-F5 防上下文污染**（126bfcf）：用户质疑"注入相关性不足→污染→失忆"成立（审计：快照 26-29 条来自 9-13 会话无条件注入；0.15 门槛形同虚设；过时记忆无过滤——风险分级高）。五线修复：①快照按来源会话浅聚（SNAPSHOT_PER_SESSION_CAP=3）；②相关性硬门槛 MIN_RELEVANCE_SCORE=0.3（依据：noisy 检索摧毁已知答案 51-64%、mem0 0.65-0.75、magic-context 0.6）；③渲染创建日期（模型可判新旧）；④supersede 30 天时间窗口（SUPERSEDE_WINDOW_MS）；⑤快照重建降频（SNAPSHOT_MIN_REBUILD_INTERVAL_MS=60s 保前缀缓存）。272 测试全绿
-- **G1-G5 腐化治理**（bc38b89）：腐化主因不只是低相关注入——任何额外 token 稀释注意力 + 压缩对未压缩区负溢出（lost-in-compaction：压缩 5% 掉 7pp、未压缩区 68%→39%）。五项：①摘录截断标记（95.7% 条目硬截 400 无提示）；②会话摘要治理（SUMMARY_MAX_CHARS=2000 截断标记 + SUMMARY_MERGE_JACCARD=0.5 同会话旧摘要归档——实测单会话 20 份并存）；③维护升级（imp≤5 降权/批量 200/间隔 1h）；④工具回路去重（快照已含不再重复输出）+ recall 补 createdAt + total→returned；⑤salience floor 90 天活跃窗口（SALIENCE_FLOOR_ACTIVE_WINDOW_MS——防 991 条 imp≥8 霸榜）。284 测试全绿
-- **存储结构性改造（SQLite）**（4008da5）：用户拍板"解决而非缓解"——自建 SqliteKvTable（node:sqlite WAL）替代 storage-json 整文件原子写：写 O(n)→O(1)、检索可索引。实测：单条写 1.34ms vs 11ms（8.2x）；主键点查 0.0066ms；批量 3667 条 18ms。首启自动迁移（memory.json→memory.sqlite，逐条 schema 校验/坏记录跳过/原文件 .bak 保留/幂等）；inject 移除 storageDomain（自建存储）；mountMemory 导出 + MountOverrides 测试路径隔离；备份脚本改 SQLite backup API。291 测试全绿
-- **检索与持久化优化（R1-R3）**（42e68b1）：①tokenize 条目级缓存（读路径主成本 24-58ms/次→零重建；update 变 tags 失效）；②嵌入索引 10s 去抖持久化（PERSIST_DEBOUNCE_MS——消灭每新建 7MB 整写同构病；flush() 公开）；③RPC search 可选 workspace 过滤（面板管理语义保留）。293 测试全绿
-- **jieba 中文分词（J1/J2）**（bb77636）：用户拍板加 jieba——①tokenize 升级「英文词+jieba 中文词+2-gram 兜底」并集（真实词边界修 2-gram 重叠歧义；2-gram 保 OOV 子串召回；jieba 中文单字过滤防稀释分母——实测 '怎么用'→'用' 单字使 0.5→0.4 跌破门槛；输出去重）；②SqliteKvTable content_tokens 预分词列（deriveTokens 可选回调，jieba 词空格分隔——未来 FTS5 unicode61 数据源，当前只写不读）；依赖 @node-rs/jieba 2.0.2（N-API 预编译 Windows 免编译）。298 测试全绿
-- **全量盘点修复（D1/D2/M1/M4-M7）**（c8bf677）：用户拍板全做——①D1 写链失败自恢复（单条写失败不卡死后续链 + writeFailures 计数——消除重启丢断点后记忆的隐蔽丢失路径）；②D2 迁移坏 JSON 降级（corrupt 标记 + .bak 保留 + 空库启动，不阻断插件）；③M1 busy_timeout=5000（多进程并发写有重试窗口）；④M4 删 memoryScore/scoreEntry 生产死路径（评分双源统一）；⑤M5 删 4 个无 import 死依赖；⑥M6 README 过时描述修复；⑦M7 entryTokenCache/lastTrackedAt 超 5000 清空重建（防无界内存）。301 测试全绿
-- **保存配置崩溃修复**（359f99b）：面板 setConfig 报 "Cannot read properties of undefined (reading 'meta')"——根因实测复现：宿主 cordis-plugin-loader 的 internal/update 写回路径裸调用 `Config["simplify"](config)`——schemastery simplify 是原型方法依赖 this，裸调用 this=undefined → this.meta 崩。修复：Config 导出时绑定 simplify（宿主 loader 契约）。315 测试全绿
-- **注入相关性治理（P1-P3）**（8f69dac + 00e3b8a）：用户拍板全做含多查询（hindsight 评估 + Selective Memory/Mixpeek/agent-evolution-kit 2026 最佳实践）——①P2 写端 admission gate（extractor 通道零价值 importance=0/纯噪声 token<2 拒绝——写时过滤结构性优于读时，8:1 distractor 下读端归零写端 100%）；②P1 置信度三档注入（≥0.7 完整行 / 0.4-0.7 摘要行 / <0.4 跳过——替代单一 0.3 门槛）；③P3 会话上下文派生查询（近期 3 条消息拼接——换话题时历史主题词仍参与召回）。326 测试全绿
-- **第三轮全量盘点（R1-R5 + N2 + 需求 A/B）**（7ecf137 + c56b2cb + a4c634c）：用户拍板全做——①R1b 摘要行截断附"（原文 N 字符）"标记（词中间切断损失量可判断）；②R2 P2 拒绝计数入 memory_status（观测闭环——门拦了多少不再黑洞）；③R1a RRF+withScore 标定钉住（语义单榜=0.5 摘要档契约）；④R5 WAL 显式 checkpoint（wal_autocheckpoint=256 + checkpoint() TRUNCATE 回截）；⑤R3 P3 窗口滚动边界测试 + 拼接检索基准；⑥N2 目录注入（未展示条目标题目录 + 模型主动 memory_recall——防 known-information forgetting ICLR 2026，token 减 26-61%）；⑦需求 A 失败教训提取规则（insight + tags:['失败教训']——检索零新码）；⑧需求 B 用户强调提取规则（importance ≥7 自动保活）；⑨Agent 自进化查证（EDV 自我确认陷阱警示/SkillRevise 同构——教训需来源校验，dsh 已有 excerpt/audit）。337 测试全绿
-- **聚焦三项盘点（轻量 IDF + 面板测试 + recall@k）**（c7109f6 + 7798772 + b1490c6）：用户拍板"含轻量 IDF"——①轻量 IDF 加权关键词检索（bm25Idf + idfWeightedRelevance——保留 0-1 标定的 BM25 化：稀有词命中权重 > 常见词，全命中=1.0/零命中=0——注入三档不受影响；检索时按候选集统计 df 零维护；**df=0 修复**：候选集外词不进分母——长查询不再砸分到阈值下）；②面板 jsdom 行为测试（@testing-library/react 5 用例：初始加载/搜索/详情/O1 写失败/竞态守卫——devDeps 加 react/react-dom/jsdom/testing-library 测试依赖不进生产）；③benchmark 补 recall@k 评估（合成库 200 条实测 recall@5=1.0——原全为性能断言无质量评估）；④Agent 自进化评估交付（反思轮写门与流式 extractor 冲突不落地——教训验证规则已内建）。354 测试全绿
-- **面板配置持久化修复（"保存成功但重启后配置丢失"）**（155ed81 + 87dee21 + 0d2a21b）：用户实测报障，根因三条证据链闭合——保存原经 `fiber.update(noSave=false)` → loader internal/update 写回 entry.options.config + tree.write() → 写进 cordis.yml；而 DSH 每次启动 prepareProfile 无条件把 cordis.yml 重写为 []（组合基底文件），保存的配置下次启动被清空。修复（用户拍板：settings.yaml 通道）：①新增 `src/settings.ts` settings seam——命名空间 memory 注册（entry 配置为 base 层）+ setSource/onChange + 面板持久化通道 + 幂等生效门（sameConfig 守卫）；②host-rpc `MemoryRpcContext` 改 `config()/settings/applyChange` 契约，setConfig 先落盘 settings.yaml 再生效，持久化失败整体拒绝（绝不静默"保存成功"）；③依赖新增 @deepseek-ai/dsh-settings（DSH 官方用户设置 seam，内建插件配置页同款通道）。
-- **生效方式二度修正（实时生效，去掉插件重启）**（fb75e89 + 15fb39e）：初版用内存重启（fiber.update noSave=true）生效——同日二次实测**保存即 fatal load failure**：插件 apply 含秒级异步段（加载 22MB 本地 ONNX 模型），进程内重启让**陈旧续体竞态**——被中断的 apply 续体恢复时，要么撞进 inactive 窗口抛 "cannot get required service"（harness 实测可杀进程），要么在 fiber 重新激活后二次注册 memory:snapshot / memory_recall——dsh-system-prompt 与 dsh-tools 都是 NamedEntries 严格重复检测（"already registered"）。用户拍板**实时生效**：settings 变更 → `initEmbedding` 原位重建 EmbeddingService/EmbeddingIndex（epoch 守卫丢弃过期会话；热换前 flush 旧索引）→ store 钩子/注入器/工具/状态展示改**调用时读 EmbeddingHolder**（embedding.ts 新增）→ 零重启零竞态。装配用 seam.effective() 当前值（注册期生效的合并配置直接用于首启）。**实机验证**（`scripts/verify-persist.mjs`，默认 + 真实 systemPrompt 双模式，EXIT 0）：保存后 settings.yaml 出现 memory 段 4 项全含 ✓、cordis.yml 保持 [] ✓、保存实时生效（RPC 保持单次注册）✓、独立进程模拟 dsh 重启后未保存即恢复全部配置 ✓、真实 systemPrompt 下与 NamedEntries 零冲突 ✓。375 测试全绿
-- **遗留风险闭环（A1 远程超时+重试 / B1 存储走 DSH_HOME）**（本次提交）：用户评估后拍板两项全做——①A1 `remoteEmbedFetch` 加 `AbortSignal.timeout`（Node fetch 默认无整体超时，挂起端点会把保存/检索/启动无限卡死——启动最重：apply await initEmbedding 之后的 RPC/六工具/注入器全不挂载）+ 指数退避重试（幂等 /embeddings，openai-node 同集：连接/超时/HTTP 408,409,429,5xx；验证 15s 单发、单条检索 15s+1 重试、批量 90s+2 重试——检索不无限等且瞬断不误降级本地）；②B1 四路径助手 + download/backup 脚本改经 `dsh-home-paths` 的 `dshHomePath('storages', ...)`（DSH_HOME 优先、~/.dsh 回退——与 settings.yaml 同源、多实例/CI 隔离；实机验证脚本由此完全隔离临时 DSH_HOME，不再触碰真实 ~/.dsh）；依赖新增 @deepseek-ai/dsh-home-paths。**实机验证**：`verify-persist.mjs` EXIT 0（插件存储全落临时 home）。375 测试全绿（新增 remoteEmbedFetch 超时/重试 6 项 + 超时策略传参 1 项 + DSH_HOME 落点 1 项）
-- **远程嵌入 dimensions + 状态可见化**（4c17578）：用户实测报障「嵌入状态 ready 但配置写了没生效」——实测钉死根因：`remoteEmbedFetch` 请求体不带 `dimensions` → 端点回默认维度（qwen3.7-text-embedding=1024）≠ 配置 2048 → 维度强校验拦截 → bootstrap 静默回退本地 384（无任何用户可见提示）。修复：①请求体显式携带 `dimensions: config.dimension`（实测带 2048/2560 端点正确返回；OpenAI text-embedding-3 / 百炼 qwen3 兼容层标准参数，官方模型卡 256~2560 维）；②`EmbeddingService.lastInitError` 记录远程验证失败原因（init 重置，不静默）；③面板状态行显示 `嵌入状态：ready（后端：remote|local）` + 远程未生效原因警告行 + 保存后自动刷新（RuntimeHealth 加可选 embeddingBackend/embeddingInitError，host-rpc status 透传）；④保存文案改为指向顶部状态行。**实机复验**：重启后面板显示 `ready（后端：remote）` ✓。381 测试全绿（+6）
-- **全量索引构建批量化（用户拍板 128/批）**（9703f4c）：实机复验发现 `ensureAll → buildMissing` 远程模式下**逐条串行调用 + 全部完成才落盘 + 任一条失败整体中止零落盘**（6569 条 ≈ 30min~2h——用户观察"sqlite 更新了 json 没变"的根因）。修复：①`EmbeddingIndexDeps.service` 加可选 `embedMany`；buildMissing 优先批量（`EMBED_BATCH_SIZE=128`，与 embedMany 内部批次一致）每批**增量落盘**（去抖合并）、失败批 logWarn 跳过继续；②无批量能力回退逐条同样增量落盘；③embedMany 内部批次 64→128。384 测试全绿（+3）
-- **向量存储重构：JSON 文件 → SQLite vec0 虚拟表（用户拍板 `@photostructure/sqlite-vec` 生产 fork，甲方案——存储与检索都走 sqlite-vec）**（本次）：量化与实测——2560 维 JSON ≈ **317MB**（10s 去抖整写/启动全量解析/内存 number[] 膨胀）vs float32 二进制 BLOB ≈ **64MB**；6500×2560 Node 全量余弦 18.8ms（非瓶颈）但 sqlite-vec C+SIMD 更快；FAISS 官方指南"<1M 条直接计算最优"（无 HNSW 需求）。实施：①`embed-index.ts` 重写为 vec0 后端（表 `vec_memory_<dim>` 维度隔离，cosine 度量 + memory_id metadata 列；float32 X'hex' 内联字面量；UPDATE-or-INSERT 行级 upsert O(1) WAL；KNN 检索 `embedding MATCH … AND k = ?`；旧 JSON 一次性迁移 + .bak；ensureAll 128/批 + 失败批跳过）；②`store.SearchOptions` 加 `semanticRank`（语义榜注入 KNN top-k，cosine>0 过滤对齐老路径；`semanticTopK` 榜单宽度 = limit×8 下限 50）；③`searchWithSemantic` 改 KNN 排名器（替换全量内存余弦 + lookupEmbedding）；④`index.ts` db 构造 `allowExtension: true` + initEmbedding 迁移接线；⑤依赖 `@photostructure/sqlite-vec@1.2.0`（0 依赖单包全平台预编译 dll，无 post-install；MIT/Apache-2.0；asg017 上游 → vlasky → PhotoStructure 生产 fork，2026-07 活跃）。**实测证据**：node:sqlite `loadExtension` + 2560 维 KNN 全通；profile .pnpm dll 端到端冒烟 KNN 正常。**已知 vec0 缺陷（实测）**：embedding 列不接受 prepared 绑定参数（INSERT/MATCH/UPDATE 均拒，报 "Input does not start with '['"）——向量字面量一律内联 SQL、memory_id 单引号转义（无注入面）。386 测试全绿（+9 vec0/迁移 +1 semanticRank）
-- **接口契约变更**（累计）：配置项 19→4；`InjectorConfig/ExtractorConfig/SnapshotConfig/MaintenanceConfig` 接口删除；`EmbeddingIndexDeps` 由 `{file, service, listAll, logWarn}` 改为 `{db, service, listAll, logWarn}`（新增 `knn()`，删除 `get()/flush()`，`loadLegacy()` 替代 JSON 文件读写）；`store.SearchOptions` 新增可选 `semanticRank`（保留 queryEmbedding+lookupEmbedding 老路径兼容测试）；`searchWithSemantic` 的 index 形参类型 `{get}` → `{knn}`；`MemoryStableSnapshot.EMPTY_IDS` 删除；`createMemoryRpcHandler(store, rpc)`/`registerMemoryRpc(ctx, store, config)` → `registerMemoryRpc(ctx, store, rpc)`；`MountOverrides` 加 `seam`；`MemoryInjectorDeps`/`MemoryToolsDeps` 合并为 `embedding: EmbeddingHolder`；`EmbeddingServiceDeps.fetchRemoteEmbeddings` 加可选 `opts`；`SettingsSeam` 加 `setApplier`；`remoteEmbedFetch` 加 `opts` 且请求体带 `dimensions`；`EmbeddingService` 加 `lastInitError`、embedMany 批次 128；`RuntimeHealth` 加可选 `embeddingBackend/embeddingInitError`；`MemoryPanelApi` 加 getConfig/setConfig；`MemoryPanelConfigView` 仅 5 字段
-- **提交**：92a2725（PLAN4）→ d5a9eda（A1）→ 16a6677（A2）→ 2e20f1f（A3）→ 35911f6（A4）→ 8d4a36f（B1）→ cca7d8d（B2）→ 2bcd2a5（B3）→ 本轮文档
+**审查（8 并行子代理 + 2 网络调研 + 主代理交叉校验）**：P0 维度漂移/未处理拒绝、P1 迁移非事务/坏 SQLite 无降级/嵌入迁移无维度校验/字符预算失衡、P2 若干（重入互斥/窗口冗余/superseded 漏查/settings 状态漂移/EACCES 吞错/dead code/README 过时）。注入器键空间 agent.id/session.id 混用**经查 DSH 硬保证恒等（dsh-agent lib: 不匹配即 throw）→ 判为可读性改进非 bug**（诚实纠偏子代理高判）。
+
+- **WP1（Q1/A + Q2/A + Q6②③⑫，最高危）**：
+  - `embedding.ts`：**禁止跨维运行期降级**——运行期远程故障仅在本地维度==远程维度（384==384）时切本地顶班；跨维则**一次性显式降级** disabled + `runtimeDegraded`（可观测原因"已降级为关键词，需重新保存配置重建索引"），`backendLabel` 显示 `remote(运行期降级)`；消除"降级后索引维度错乱 → KNN 抛裸错 / onCreate 未处理拒绝 exit(1) 杀进程"（DSH installFailLoud 已实查）。
+  - `index.ts`：**onCreate 索引联动 catch**（与 onArchive/onSupersede 同收容形态，附效果失败不 kill 主链路）；经 `embeddingDegradedReason` runtime getter 透出状态；迁移语义修正——**全坏/全跳过不 rename .bak**（保留原文件可修复重试）。
+  - `embed-index.ts`：**loadLegacy 迁移按表维度校验**（错误维度向量跳过 + logWarn）；**dropOtherDimensionTables**（仅 DROP 纯维度表 `vec_memory_<digits>`，跳过 vec0 影子表 `_info/_rowid` 等——实测"may not be dropped"）。
+  - `host-rpc.ts`/`tools.ts`：status 透传 `embeddingDegradedReason`；setConfig **持久化成功/生效失败中间态显式化**（"已保存、重启后自动生效"，非静默"保存失败"）。
+- **WP4（Q4/A + Q6①）**：坏 SQLite 构造加载**逐行容错**（坏 value 行跳过 + `loadFailures` 计数 + warn，与坏 JSON D2 对称）；`migrateMemoryJson` **单事务化**（`migrateAll`：BEGIN→prepared upsert→COMMIT/ROLLBACK；cache 在 COMMIT 后一次性回填——中断保持空态可重试）。
+- **WP6a（Q6④⑤⑥⑦）**：maintenance/reflect/causal 三处 `runOnce` **重入互斥**（并发合并为同一 promise，防重复审计/重复 LLM）；`CANDIDATE_WINDOW` 解耦（1000 vs BATCH_BUDGET 200，预算真实生效）；`archiveStale`/`normalizeTags` 补查 `supersededBy`；`selectReflectionPairs` **peer 仅限同 workspace**（跨域不喂 LLM）。
+- **WP6b（Q6⑧⑩⑪）**：`applyConfigChange` 失败回滚 `active`（修复幂等门拦死自愈）；删除 `renderPack` 生产死代码；根 README 存储/备份描述修正。
+- **WP7 / WP5**：真 SQLite 集成测试补强 + `failNextWrite` 覆盖 create/put + 弱断言修正 + `listByImportance/tokenJaccard/formatMemoryLineCondensed` 覆盖补盲；CI workflow + sqlite-vec 锁精确版本。
+- **Q3/Q6⑨（补全）**：注入/快照预算注释**诚实化**（字符口径：中文 16384 字符≈16K token，不再写"≈4K token"误导）；`defaultHasLocalModel`/`loadLegacy` 区分 ENOENT（无模型/无迁移）与 EACCES 等（真实故障→上抛/告警，不静默掩盖）。
+- **Q7（defer）**：importance 累积投票、反思质量度量**本轮不做**，记录为后续 A/B 候选（缺多方复现证据，YAGNI）。
+
+**接口契约变更（本轮）**：`EmbeddingService` +`runtimeDegraded`/`degradedReason`/backendLabel `remote(运行期降级)`；`EmbeddingIndex` +`dropOtherDimensionTables()`、`parseJsonVec` 可选维度校验；`RuntimeHealth` +可选 `embeddingDegradedReason`；host-rpc status 透传该字段、setConfig 中间态错误文案；maintenance/reflect/causal `runOnce` 外层改非 async（并发返回同一 promise 身份）；maintenance `CANDIDATE_WINDOW=1000`（原 200）。
 
 ## 三、已知风险点（诚实自曝）
 
-1. **远程嵌入无超时（已修复 A1）**：`remoteEmbedFetch` 现带 AbortSignal.timeout + 重试——挂起端点由"无限卡死保存/检索/启动"变为"15s/90s 内超时 → 回退本地或抛错"。残余：验证 15s 超时 + 本地模型加载（秒级）下，故障端点 + 面板保存的最坏等待 ≈ 20s（可接受）；`embedMany` 无运行期调用点（准死代码，保留供未来批量路径）。
-2. **存储路径硬编码（已修复 B1）**：四路径助手 + download/backup 脚本已改经 `dshHomePath('storages', ...)`（DSH_HOME 优先、~/.dsh 回退）——与 settings.yaml 同源。残余：`EMBEDDING_MODEL_DIR` 为模块级常量（进程启动时环境已定，行为正确；仅"运行中改 DSH_HOME"不可见，非真实场景）。
-3. **profile `pnpm install` 受供应链策略门拦截**（dshmarket@1.9.0 发布年龄不足，存量锁文件问题）：部署需 `pnpm install --trust-lockfile`（已写入 profile 的 pnpm-workspace.yaml minimumReleaseAgeExclude）。
-4. **settings.yaml 手工编辑的并发语义**：settings 提供者热重载，多处编辑器同时写同一文件时以最后提交为准（DSH 官方机制，与本插件无关）；面板保存失败会整体拒绝并提示，不会半写。
-5. **保存期间并发热换的 epoch 守卫**：面板保存触发的 initEmbedding 与首启初始化并发时，epoch 只保留最后一次调用发起的会话（陈旧结果丢弃）——正确性已钉住。
-6. **缓存命中率未实测**：P1 的 cacheReadTokens 收益无基线；观测通道现成（UI"缓存命中 %"行），3 轮 on/off 对照即可量化；业界基线提示工具稳定会话自然 ~90%（permafrost）。
-7. **维护合并与 create supersede 的微竞态**（A4 已加固 supersededBy 检查，但同刻并发窗口仍理论上存在——真实场景提取串行 + 维护 6h 后跑不触发；测试以顺序场景钉住）。
-8. **记忆投毒 L2/L3 未防护**（评估记录于 README）：当前防线挡 L1；升级条件 = 出现多来源写入（第三方工具/子代理写库）。
-9. extractor 失败重试的重复 LLM 调用（已知成本）；opencode-acp 版本轨脱节（外部）。
-10. **远程维度错配已修复（dimensions 显式声明）**（本次）：请求体带 `dimensions` 后配置维度真正生效；残余——老端点不支持 dimensions 会报 400 → 走既有回退链（明确失败而非静默，可观测）；配置维度仍须与供应商文档一致（面板失败原因行会显式提示）。
-11. **400K 自动压缩模型策略漂移（用户环境配置，非插件代码）**：compaction-basic 的 `modelPolicies` 是 provider+model 精确匹配（已读源码 dsh-compaction-basic lib/index.js:84 `find(p => p.provider===target.provider && p.model===target.model)`）；patch 只配 opencode-go，而默认模型已是 teamorouter/deepseek-v4-flash（settings.yaml agent-default-model）→ 0.4 未命中 → 回落默认 0.8 → 触发点 800K 而非 400K（用户观察"长会话不再 400K 自动压缩"吻合）。修复=patch 补 `teamorouter/deepseek-v4-flash` 策略（已按用户拍板补入 ~/.dsh/profiles/web/cordis.patch.yml，重启生效）。
-12. **sqlite-vec 依赖风险（vec0 重构引入）**：`@photostructure/sqlite-vec` 为 asg017 上游的**生产 fork**（PhotoStructure 出资维护，2026-07-07 发版 v1.2.0）但仍是 pre-v1 语义（fork 持续迭代）——锁定版本 ^1.2.0，升级前跑全量测试；已知 vec0 缺陷：embedding 列绑定参数拒绝（内联规避，已记录）；native dll 随平台分发（单包含 win/linux/mac 预编译），Node 大版本升级需复测 loadExtension。
-13. **vec0 全量构建与迁移的启动开销**：重启后旧 JSON（2560 维，若已生成）迁移入表 + ensureAll 补齐缺失——迁移/构建在后台进行；期间语义检索可能部分缺失（纯关键词兜底，显式语义）。
-14. **反思/因果的 LLM 成本与正确性（本次引入）**：维护每小时触发 `runOnce`，但子任务各自 6h 门控（未到期跳过）——首次运行各触发一次 LLM（反思审 ≤60 对、因果审 ≤30 条）。LLM 抽取因果三元组正确率有限（CS-RAG 强实证 ~68%）：v1 以置信 ≥0.6 门槛 + 仅审计展示（不进检索）+ 幂等 add-only + 归档联动删边降低暴露；建边数据可追溯但**可能含误边**，属于"先有数据供将来 A/B"的已知取舍。
-15. **反思候选带收敛（本次引入）**：peer 候选仅限 tokenJaccard ∈ [0.15, 0.85)（规则之上补盲）——完全无词面重叠的语义重复/矛盾不在候选（v1 保守，已注释记录：未来可加嵌入邻居候选）。
+1. **跨维运行期降级由"切本地"改为"显式降级关键词"**（Q1/A）：远程运行期故障且本地维度≠远程维度时，语义能力停用直到重新保存配置/重启——这是设计取舍（保索引维度一致、防检索抛裸错）；同维（384==384）仍可本地顶班。面板经 `embeddingDegradedReason` 可见。
+2. **onCreate 联动的集成级测试缺口**：index.test 用 ready+fail 嵌入覆盖 ensureAll 收容，未直接覆盖"store.create 触发 onCreate 失败"（mountMemory 无 store 句柄 seam）；闭包与 onArchive/onSupersede 同形态、typecheck 通过——已显式记录。
+3. **memory.json 迁移 readFile 仍吞 EACCES**（`migrateMemoryJson` 的 catch 一律视"无旧文件"）：Q6⑨ 只覆盖 embed 侧（hasLocalModel/loadLegacy）；记忆库迁移侧同类区分未做（低，记录）。
+4. **reflect workspace 预过滤后**：applyDecision 的跨域守卫保留为竞态兜底（选择与执行间的 workspace 变化）。
+5. **sqlite-vec 影子表**：DROP 已安全过滤纯维度表名；影子表随 vec0 表生命周期管理（SQLite 托管），非本插件清理范围。
+6. **CI 尚未实际触发**：仓库若不在 GitHub 此 workflow 不运行（文件已备好）；覆盖率门槛未设（保守，避免 CI 红；后续按基线补充）。
+7. **残余历史风险**：400K 自动压缩策略漂移为宿主配置域（用户环境已补位）；extractor 失败重试重复 LLM 调用为已知成本；反思/因果 LLM 成本与 ~68% 精度为 v1 保守取舍。
 
 ## 四、下次最该做的事
 
-1. **重启 3080 实例**：当前进程运行旧代码（dimensions 修复已部署待重启；vec0 重构已部署待重启）——重启后：①面板保存一次配置，状态行应为 `ready（后端：remote）`；②旧 JSON 索引（memory-embeddings-2560.json / -384.json）自动迁移入 vec0 表 `vec_memory_2560/384`（原文件改名 .bak），`memory.sqlite` 体积上升（向量 64MB 级入驻）；③重启后首次语义检索走 SQL KNN（毫秒级）。验证：`~/.dsh/storages/` 出现 `memory-embeddings-*.json.bak`、`memory.sqlite` 增大。
-2. **重启后观察 vec0 迁移/构建日志**：`[dsh-memory] 旧嵌入索引已迁移至 vec0 表（N 条）` + `语义嵌入已就绪（后端：remote，维度：2560，索引 vec_memory_2560）`——确认无 warn 批次失败堆积。
-3. **400K 自动压缩策略补位（用户环境）**：patch 的 compaction-basic modelPolicies 已补 teamorouter 4 模型（0.4）——重启后长会话恢复 400K 触发。 
-4. **⚠️ 已撤销（2026-08-15）：降 settings.yaml maxTokens 384000→65536 是错误方案**——maxTokens 是模型最大输出上限，降它截断生成能力（用户否决）。溢出事故真实根因在宿主域：dsh-token-meter CHARS_PER_TOKEN=4 低估 2-3 倍 + 压缩触发/停止口径分裂 + 收益保护死锁（记忆 #f98ca946，harness 域缺陷，不属于 dsh-memory 修复范围）。正确路径：向宿主报 token-meter 缺陷；dsh-memory 侧已做注入预算上限 + 摘要截断治理。
-5. **备份脚本配计划任务**：`scripts/backup-memory.mjs` 已就绪（默认保留 10 份），建议每日定时运行——vec0 向量已在 memory.sqlite 内，备份即覆盖向量。
-6. 缓存命中率基线实测（零代码）：3 轮同任务会话读 UI"缓存命中 %" + cacheReadTokens，on/off 对照判定 P1 收益。
-7. 观察 memory.sqlite：maintenance 首周期执行效果（降权放宽 imp≤5/批量 200/间隔 1h + 会话摘要归档收敛）。
-8. **重启后实测自进化/因果**（本次功能）：memory_status 新行「反思自进化/因果链」+ memory_audit 因果视图；库内若有近似重复/矛盾可先用 `memory_reflect` 工具 force 触发观察审计 detail（依据引用）。注意：首轮反思会触发 1 次 LLM 调用（成本可预期）。
-9. **后续 A/B（设计文档预留，v1 不做）**：A/B-1 因果路径**精度过滤**（CausalRAG2 式，预期提精度/一致性，有直接影响）；A/B-2 方向扩散 vs 无向扩散对**召回**（无权威证据，需本库 Recall@K 自测后再决定）；A/B-3 importance 累积投票修正（需多轮信号源）。
-10. 复核反思候选带（[0.15,0.85)）在真实库的召回：若发现大量"无词面重叠语义重复"未触达，考虑给 reflect/causal 引入嵌入邻居候选（当前依赖 embedding holder 需要再接线，属增量）。
+1. **重启 3080 实例验证**：面板保存配置后状态行为新契约（远程 ready；无跨维顶班场景；`memory.sqlite` 旧维度表清理日志）。
+2. **CI 真实接线**（若仓库上线 GitHub）：触发 workflow 验证 typecheck+test 门；按需补覆盖率阈值。
+3. **Q7 候选预研**：importance 累积投票（arXiv:2606.12945）需要多轮信号源设计；反思质量度量钩子（consolidation 预算依赖）。
+4. **onCreate 集成测试补强**：若后续给 mountMemory 提供 store 句柄 seam 或经 extractor 驱动写路径，补"create→索引失败→不崩"集成用例。
+5. **memory.json 迁移侧 ENOENT 区分**（风险点 3，微改）。
+6. 既有"下次"项延续：备份脚本配计划任务；缓存命中率基线实测；memory.sqlite 维护效果观察。
