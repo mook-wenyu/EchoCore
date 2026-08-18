@@ -34,6 +34,8 @@
 - **C34（反思合并改语义门，2026-08-18）**：对齐权威（ai-memory `CONSOLIDATE_COSINE_THRESHOLD=0.75`）——`selectReflectionPairs` 双侧有向量时以 **cosine≥0.75** 为主门（抓语义近等价改写、不并仅主题相邻），任一侧无向量回退 token-Jaccard 带；`EmbeddingIndex.getVector` + `cosineSimilarity` 支撑。根因复盘：Jaccard 0.7-0.83"重复"多带内容差异，LLM 保守判 none 正确；语义门给"真同义改写"以可靠判定面。
 - **C35（memory_causal 手动触发，2026-08-18）**：新工具镜像 memory_reflect（force 共享维护批 runOnce；add-only/置信≥0.6 语义不变）；维护批早已接线（maintenance.ts:225），0 边根因=6h 门控未过+无手动入口。**在产验证**：21:49 重启（PID 6872）后 `memory_causal` 执行成功（审 30 条/0 边=候选多为近重复非真因果，诚实结果）。
 
+- **C37（记忆面板高价值束 E+A+F，2026-08-18 拍板）**：ascetic-breaker 轮盘点面板（client.ts + RPC 面）→ 与权威（NN/g/W3C-APG/PatternFly/Carbon/Algolia/Android list-detail/MemLens arXiv）对照出 13 缺口，用户拍板 A 束：**E** 面板加"运行反思"按钮（接既有 RPC reflect 端点）+ 统计区渲染反思累计/上次反思/因果行（status 已下发字段）；**A** master-detail 并排分栏（窄屏叠层，`mainRowStyle` flex-wrap）；**F** 配置区默认折叠渐进披露（标题点击展开）。TDD（红 3 例→绿，513 全绿/typecheck 0）。**在产**：23:37 重启（PID 27868）载入，面板 UI 随 client.js 生效。未做（第二束候选，待拍板）：即时搜索 debounce/筛选 chips 计数、排序、分页 Load More、批量归档+Undo——均需 RPC/store 变更。unarchive 尊重既有 D-D 拍板（store.ts:439 无 restore）不列项。
+
 **接口契约变更（自学习）**：`MemoryEntry/NewMemoryInput/ExtractedMemory` + `selfRelevance?`；`effectiveImportance(importance, accessCount, selfRelevance=0)`（第三参缺省=0，两参调用不变）；`MemoryDetail` + `selfRelevance?`（无则省略键）；`memoryEntrySchema` + `optional`；提取 system prompt 规则 11。
 
 ## 三、已知风险点（诚实自曝）
