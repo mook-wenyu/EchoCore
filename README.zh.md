@@ -78,10 +78,12 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 
 ## 文档
 
-- [包内 README（功能/配置/部署/运维，权威）](packages/dsh-memory/README.md)
-- [生产验证报告](production-validation-report-2026-08-18.md)（部署状态、W2 热生效、语义覆盖、供应链策略）
+- [文档地图（全库索引）](docs/README.md)
+- [包内 README（参考/解释，权威）](packages/dsh-memory/README.md)
+- [部署（How-to）](docs/DEPLOYMENT.md) · [开发与质量门（How-to）](docs/DEVELOPMENT.md)
+- [生产验证报告](docs/reports/production-validation-report-2026-08-18.md)（部署状态、W2 热生效、语义覆盖、供应链策略）
 - 自我学习红线契约测试：`packages/dsh-memory/test/self-learning-contract.test.ts`
-- `docs/`：实现计划与优化计划（中文，含决策记录与查证依据）
+- `docs/reports/`：带日期限定的研究与验证快照（中文，含决策记录与查证依据）
 
 ## 备份
 

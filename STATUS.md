@@ -19,10 +19,11 @@
 - **C11（Q4 死代码/下限束）**：`MIN_RELEVANCE_SCORE=0.3` 从死常量**接线为关键词路径噪声下限**（rel<0.3 弱命中不入检索；语义单榜独立召回不受影响——两条独立门槛，修 0.3/0.15 注释漂移）；删除零引用死 type `EmbeddingFallbackLogger`；benchmark「稀有词权重」契约随之下拨（零重合条目在 minScore=0 下也不返回）。
 - **C12（Q6 覆盖率）**：装 `@vitest/coverage-v8@3.2.x` + vitest.config thresholds + `test:coverage` 脚本 + CI 覆盖率步骤（首度可量化防回归门）。
 - **C13（Q1 轻量融合）**：`effectiveImportance(importance, accessCount)`——存储 LLM 1-10 主因子 + 对数式访问频率证据（1 次=+1 / ≥3 次=+2，封顶 +2，不训学习权重）；仅作用于 `listByImportance`（快照/保留决策），**不动检索主路径**（search 评分仍用存储 importance + 半衰期访问调制，避免同一证据双重计入）。依据 arXiv:2606.12945 LexWisdom 0.770 vs 0.518。
-- **F3 证据报告** 落盘 `research-report-round2-enhanced-candidates.md`（Q7 候选预研素材）。
+- **F3 证据报告** 落盘 `docs/reports/research-report-round2-enhanced-candidates.md`（Q7 候选预研素材）。
 
 **三/四轮（自学习 + 生产验证，2026-08-18）**：
-- **C17-C19（生产验证/部署）**：只读生产审计报告 `production-validation-report-2026-08-18.md`——部署落后仓库 14 提交（缺 `a021648` 至 `b8f77e0`，Q5 缺陷与旧版无条件 384 顶班在产仍存活）、语义向量仅 9% 覆盖、因果 0 产出；用户授权「不停 dsh 停盘部署」①（build lib → 离线直拷 profile store，C19 完成，盘上已为最新，运行进程旧码待重启生效）。
+- **C17-C19（生产验证/部署）**：只读生产审计报告 `docs/reports/production-validation-report-2026-08-18.md`——部署落后仓库 14 提交（缺 `a021648` 至 `b8f77e0`，Q5 缺陷与旧版无条件 384 顶班在产仍存活）、语义向量仅 9% 覆盖、因果 0 产出；用户授权「不停 dsh 停盘部署」①（build lib → 离线直拷 profile store，C19 完成，盘上已为最新，运行进程旧码待重启生效）。
+- **C25-C26（文档架构重构，2026-08-18）**：按 Diátaxis 全文档重构——新增 `docs/README.md`（文档地图）、`docs/DEPLOYMENT.md`、`docs/DEVELOPMENT.md`；两份报告移入 `docs/reports/`；包 README 瘦身为 Reference（部署/运维/开发移至 How-to 指针）；根 README（EN/zh）修复 `docs/` 断链并指向文档地图。
 - **C20/S1（自我学习契约锁线）**：`test/self-learning-contract.test.ts` 锁死三条红线（Echo-Gap 不在检索/保留使用证据改写 stored importance、supersede/archive 不物理删、检索命中→保留提升链路）——均为既有正确行为的可复现断言。
 - **C21/S2（W2 self/user 相关性信号）**：`selfRelevance?`（1-10）从提取 LLM 一次性评定 → 落库（types:75/111/123、schema memory-domain:45 可选向后兼容）→ 并入 `effectiveImportance`（scoring:295，档位 ≥8→+2 / ≥6→+1，封顶 +2）→ 仅 listByImportance（store:669-670）消费 → `memory_detail` 安全省略键透出（tools:91/123）。Echo-Gap 安全：创建期一次性因子、绝不重写；不训权重。
 

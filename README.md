@@ -57,10 +57,12 @@ Embedding backend auto-select: remote first → local fallback → disabled (key
 
 ## Documentation
 
-- [Package README (Chinese, canonical)](packages/dsh-memory/README.md)
-- [Production validation report](production-validation-report-2026-08-18.md) (deploy state, W2 hot-activation, semantic coverage, supply-chain note)
+- [Docs map (index of all repo docs)](docs/README.md)
+- [Package README (Chinese, canonical — reference/explanation)](packages/dsh-memory/README.md)
+- [Deployment (how-to)](docs/DEPLOYMENT.md) · [Development & quality gate (how-to)](docs/DEVELOPMENT.md)
+- [Production validation report](docs/reports/production-validation-report-2026-08-18.md) (deploy state, W2 hot-activation, semantic coverage, supply-chain note)
 - Self-learning redline contract tests: `packages/dsh-memory/test/self-learning-contract.test.ts`
-- `docs/`: implementation & optimization plans (Chinese, with decision records and verified evidence)
+- `docs/reports/`: dated research & validation snapshots (with decision records and verified evidence)
 
 ## Backup
 

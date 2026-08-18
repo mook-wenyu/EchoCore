@@ -6,6 +6,9 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 步骤前自动注入相关记忆（带预算与溯源标记）、全程可审计（"你为何记得这个？依据是哪段原始对话？"），
 并提供浏览器记忆面板。
 
+> **文档地图**：[docs/README.md](../../docs/README.md)（全库文档统一索引）；
+> 部署/运维 → [docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)；开发/质量门 → [docs/DEVELOPMENT.md](../../docs/DEVELOPMENT.md)。
+
 ## 能力
 
 | 能力 | 说明 |
@@ -172,82 +175,28 @@ jieba 中文单字过滤（防稀释相关性分母）+ 输出去重。引擎 @n
 **性能**：tokenize 条目级缓存（R1，检索热路径零重建）+ 嵌入索引 10s 去抖
 持久化（R2，消灭 7MB 整写）+ RPC search 可选 workspace 过滤（R3）。
 
-## 运维：记忆库备份
+## 部署 / 运维 / 备份 / 迁移（How-to）
 
-记忆库存储为 **SQLite**（`$DSH_HOME/storages/memory.sqlite`，未设 DSH_HOME 时
-`~/.dsh/storages/memory.sqlite`，WAL 模式——结构性解决
-storage-json 整文件原子写的 O(n) 写放大，用户拍板 2026-08-15）。存储路径经
-dsh-home-paths 解析（与 settings.yaml 同源；多实例/CI 隔离，2026-08-16 拍板）。
-首启自动从旧
-`memory.json` 迁移（逐条校验、坏记录跳过、原文件改名 `.bak` 保留、幂等）。
+详见 **[docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)**：首次接入 `cordis.patch.yml`、更新闭环
+（`pnpm build` → 刷新 profile `.pnpm` store 或 `dsh plugin add` → HMR 触碰/重启）、
+HMR 机制、供应链 `minimumReleaseAge` 阻断与修复、`nodeLinker: isolated`/`inject`/真机验证等集成约束、
+SQLite WAL 备份脚本、`memory.json` 迁移语义、`BAILIAN_API_KEY` 重启须带 export。
 
-备份须用 SQLite backup API（WAL 活跃期文件复制会丢未 checkpoint 数据），
-仓库提供脚本：
+集成约束要点（全量见 docs/DEPLOYMENT.md §7）：
+1. profile pnpm `nodeLinker` 保持 **`isolated`**（`hoisted` 造成 `@deepseek-ai/*` 双实例、`Symbol` 分裂、全工具崩溃）；
+2. 直接访问的服务必须全部声明在 `inject`（宿主 `['llm','tools','connection','systemPrompt']`、客户端 `['slots','connection']`）；
+3. `standingKeyFor` 只校验组合激活，不校验运行期服务守卫——挂载后必须真机启动验证；
+4. **patch 层加载 + HMR**：改配置免重启；改源码走上面部署闭环三件套。
 
-```bash
-node packages/dsh-memory/scripts/backup-memory.mjs [备份目录] [保留份数]
-# 默认备份到 $DSH_HOME/storages/backups/（未设 DSH_HOME 时 ~/.dsh/storages/backups/），保留最近 10 份（时间戳命名）
-# 建议配合系统计划任务每日运行；源文件缺失/保留 0 份会显式报错（不静默）
-```
+⚠️ **400K 无感自动压缩**：由 profile `cordis.patch.yml` 的 `compaction-basic` 解禁 + `modelPolicies.thresholdRatio: 0.4`
+提供（实测窗口 1M token）；**modelPolicies 是 provider+model 精确匹配**——默认模型换 provider 后必须同步补策略，
+否则回落默认 0.8（触发点 800K）。见 [docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)。
 
-## 集成（已执行，全局启用：所有 Agent 可用）
+## 开发（How-to）
 
-- `~/.dsh/profiles/web/package.json`：`"@echocore/dsh-memory": "file:D:/TSProjects/EchoCore/packages/dsh-memory"`
-- `~/.dsh/profiles/web/cordis.patch.yml`（**宿主组合层，全局生效**）：
-  - `insert: [memory 行]` → 插件在宿主平面挂载，工具对**全部 Agent（含子代理）**可见，
-    提取/注入/快照对所有会话生效（插件按 sessionId 键控，单实例服务所有会话）；
-  - `compaction-basic` 行按 id 解禁（web-app 默认禁用）并配置 `modelPolicies:
-    thresholdRatio 0.4` → **全局 400K 无感自动压缩**（实测窗口 1M token）；各预设实例（0.8）保留为安全网。
-    ⚠️ **modelPolicies 是 provider+model 精确匹配**——默认模型换成
-    `teamorouter/deepseek-v4-flash` 后 0.4 不再命中（回落默认 0.8 → 触发点 800K），
-    需同步补对应策略（2026-08-17 实测：settings.yaml 默认模型换 provider 后 400K
-    自动压缩失效是同一根因）。
-- 设置页出现"记忆"面板（`dsh.client` 扫描捕获宿主行，客户端 bundle 经 `/plugins/@echocore/dsh-memory/client.js` 服务）。
-
-### ⚠️ 集成约束（事故教训 + 权威部署机制，务必遵守）
-
-1. **profile 的 pnpm `nodeLinker` 必须保持 `isolated`**：`hoisted` 会把
-   `@deepseek-ai/*` 提升进 profile 顶层，与 npx 缓存本体形成双实例，
-   `Symbol` 分裂导致全工具崩溃（见 `~/.dsh/notes/INCIDENT-2026-08-15-tool-prepare-双包.md`）。
-2. **插件直接访问的服务必须全部声明在 `inject`**（Cordis 守卫运行时拒绝，
-   宿主与客户端两侧同样适用）：宿主侧 `['llm', 'tools', 'connection', 'systemPrompt']`，
-   客户端侧 `['slots', 'connection']`。
-3. **`standingKeyFor` 只校验组合激活，不校验 apply 运行期服务守卫**：
-   挂载校验通过后必须真机启动验证（`dsh web --port 0` + 浏览器实测面板）。
-4. **装载层 = patch 层（`cordis.patch.yml`），非 bundle 层**：`dsh-memory` 无
-   `dsh.bundle` 声明 → 不经 `dsh.profile.bundles`（bundle 仅 boot 装、需重启），
-   而是由 patch 层 `watchUserPatches` **热重载（HMR）**——`cordis-plugin-hmr`
-   会清 ESM/CJS 模块缓存后重导入。因此：
-   - **改配置/补丁** → 仅触碰 `cordis.patch.yml` 即热生效，免重启；
-   - **改插件源码** → 重建 `lib/` + 让加载路径拿到新 lib（见下述部署闭环）后，
-     触发一次 patch 触碰即可 HMR 热生效（亦可择时重启兜底）。
-5. **部署闭环（权威，2026-08-18 实测）**：`dsh plugin --profile web add @echocore/dsh-memory`
-   是 pnpm 转发 + bundles 对账（无 `dsh.bundle` 的包只重装不登记层栈）。
-   因本 profile `file:` 依赖，等效做法：`pnpm --filter @echocore/dsh-memory build`
-   （把最新 `src/` 编译进 `lib/`）→ 将 `lib/*` 覆盖到 store 包目录
-   （`profiles/web/node_modules/.pnpm/@echocore+dsh-memory@file+D_*/node_modules/@echocore/dsh-memory/lib`）
-   → HMR 触碰或重启。**勿裸手改后跳过验证**。
-   ⚠️ supply-chain 策略：profile 启用 `minimumReleaseAge`，新近发布（如
-   `dshmarket@1.12.2`）会触发 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` 阻断 add；
-   需等截止或放宽策略（安全面决策）后 `pnpm clean --lockfile && pnpm install`。
-6. **生产实机验证**：详见 `production-validation-report-2026-08-18.md`（存量库
-   7256+ 条、语义向量覆盖审计、Q5 lossless 修复、W2 热生效轨迹、密钥 `env:`
-   解析与重启须带 export 的要点）。
-
-## 开发
-
-```bash
-pnpm install          # 根 workspace
-pnpm --filter @echocore/dsh-memory typecheck     # tsc --noEmit
-pnpm --filter @echocore/dsh-memory test          # 单元测试（vitest）
-pnpm --filter @echocore/dsh-memory test:coverage # 覆盖率（阈值在 vitest.config.ts）
-pnpm --filter @echocore/dsh-memory build         # tsc + esbuild 客户端打包
-```
-
-- 源码：`src/`（宿主）+ `src/client.ts`（浏览器面板）+ `scripts/build-client.mjs`（`__ModuleLoader__` 懒 CJS 打包）
-- 测试：`test/`（**26 文件 497 个**，含装配/渲染单源/领域 schema/统一 FakeCtx/O3 性能基准/评测基线/自学习契约锁线）
-- 质量门：typecheck + `@vitest/coverage-v8` 阈值（lines 80 / branches 70 / functions 75，CI 步骤已配）
-
+详见 **[docs/DEVELOPMENT.md](../../docs/DEVELOPMENT.md)**：命令（typecheck/test/test:coverage/build）、
+质量门（覆盖率阈值/CI）、目录结构、TDD 与提交纪律、lossless-JSON 契约、docs-as-code 约定。
+测试规模：`test/` **26 文件 497 例**（含自学习契约锁线）。
 ## 检索与衰减（B1/B2，2026 记忆最佳实践）
 
 - **混合检索 = RRF 排名融合**（B1）：语义嵌入启用时，关键词 relevance 榜与语义
