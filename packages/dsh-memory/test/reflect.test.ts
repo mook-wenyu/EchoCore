@@ -178,6 +178,31 @@ describe('selectReflectionPairs', () => {
     expect(pairs.find((p) => p.focus.id === 'dupOld')?.peers.map((x) => x.id)).toContain('dupNew')
   })
 
+  it('C34 语义门：双侧向量 cosine≥0.75 → 入选（token 零重合的改写也能入审）；<0.75 排除', () => {
+    const a = makeEntry({ id: 'sA', content: 'a b c d e f', importance: 7 })
+    const b = makeEntry({ id: 'sB', content: 'x y z w v u', importance: 6 }) // token 零重合，语义近
+    const c = makeEntry({ id: 'sC', content: 'a b c d e f g h', importance: 7 }) // token 重合高但语义低
+    const vectors = new Map<string, Float32Array>([
+      ['sA', new Float32Array([1, 0])],
+      ['sB', new Float32Array([0.9, Math.sqrt(1 - 0.81)])], // cos(sA,sB)=0.9 → 入选
+      ['sC', new Float32Array([-0.5, Math.sqrt(1 - 0.25)])], // cos(sA,sC)=-0.5、cos(sB,sC)<0.75 → 无合格对
+    ])
+    const embedding = { getVector: (id: string) => vectors.get(id) }
+    const pairs = selectReflectionPairs([a, b, c], embedding)
+    const focusA = pairs.find((p) => p.focus.id === 'sA')
+    expect(focusA?.peers.map((p) => p.id)).toContain('sB') // 语义近等价改写入选
+    expect(focusA?.peers.map((p) => p.id)).not.toContain('sC') // 语义 <0.75 排除
+    expect(pairs.some((p) => p.focus.id === 'sC')).toBe(false) // sC 无合格对 → 不作焦点
+  })
+
+  it('C34 回退：任一侧无向量 → 仍按 token-Jaccard 带判定（既有语义不变）', () => {
+    const a = makeEntry({ id: 'fA', content: 'a b c d e f', importance: 7 })
+    const b = makeEntry({ id: 'fB', content: 'a b c d e f g h', importance: 6 }) // j=6/8=0.75 带内
+    const embedding = { getVector: (id: string) => (id === 'fA' ? new Float32Array([1, 0, 0]) : undefined) }
+    const pairs = selectReflectionPairs([a, b], embedding)
+    expect(pairs.find((p) => p.focus.id === 'fA')?.peers.map((p) => p.id)).toContain('fB')
+  })
+
   it('相似带边界：<0.15 与 ≥0.85 排除，带内按 jaccard 降序取前 N，排除自身', () => {
     const focus = makeEntry({ id: 'focus', content: 'a b c d e f', importance: 10 })
     const below = makeEntry({ id: 'below', content: 'z y x w v u', importance: 1 }) // j=0

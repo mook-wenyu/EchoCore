@@ -64,6 +64,21 @@ function vecLiteral(vector: Float32Array): string {
   return `X'${Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength).toString('hex')}'`
 }
 
+/** 余弦相似度（C34：反思语义门/语义工具共用）。向量未归一化 → 显式除以模长。 */
+export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  const len = Math.min(a.length, b.length)
+  let dot = 0
+  let na = 0
+  let nb = 0
+  for (let i = 0; i < len; i++) {
+    dot += a[i]! * b[i]!
+    na += a[i]! * a[i]!
+    nb += b[i]! * b[i]!
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb)
+  return denom === 0 ? 0 : dot / denom
+}
+
 /** JSON 数字数组 → Float32Array（旧 JSON 索引文件迁移源的读侧换算）。
  * 可选 expectedLength：不等于该值时视为**维度不匹配**（历史配置维度遗留）——
  * 返回 undefined 由调用方跳过并告警，防错误维度行落库（Q2 拍板：免得 KNN
@@ -87,6 +102,8 @@ export class EmbeddingIndex {
   private readonly findRowStmt
   /** 按 memory_id 删除 */
   private readonly deleteStmt
+  /** 按 memory_id 取向量（C34：反思语义门/审计展示） */
+  private readonly getVecStmt
   /** 全量已有 memory_id（ensureAll 差集） */
   private readonly listIdsStmt
   /** 全量构建串行锁（并发 ensureAll/backfill 合并为一次；Promise<unknown> 容纳两条路径的返回值） */
@@ -106,6 +123,7 @@ export class EmbeddingIndex {
     )
     this.findRowStmt = db.prepare(`SELECT rowid FROM "${this.table}" WHERE ${MID_COL} = ? LIMIT 1`)
     this.deleteStmt = db.prepare(`DELETE FROM "${this.table}" WHERE ${MID_COL} = ?`)
+    this.getVecStmt = db.prepare(`SELECT embedding FROM "${this.table}" WHERE ${MID_COL} = ? LIMIT 1`)
     this.listIdsStmt = db.prepare(`SELECT ${MID_COL} FROM "${this.table}"`)
   }
 
@@ -155,6 +173,15 @@ export class EmbeddingIndex {
   /** 归档/覆盖条目移除向量（同步行删；与持久层即时一致） */
   remove(id: string): void {
     this.deleteStmt.run(id)
+  }
+
+  /** 按 memory_id 取向量（C34：反思语义门——双侧有向量时以 cosine≥0.75 为合并
+   * 主门，对齐 ai-memory CONSOLIDATE_COSINE_THRESHOLD；无向量条目回退 Jaccard）。
+   * 未命中返回 undefined（缺失/归档条目）。 */
+  getVector(id: string): Float32Array | undefined {
+    const row = this.getVecStmt.get(id) as { embedding: Uint8Array } | undefined
+    if (row === undefined) return undefined
+    return new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4)
   }
 
   /**

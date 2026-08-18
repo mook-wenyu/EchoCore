@@ -325,7 +325,14 @@ export async function mountMemory(
 
   // LLM 子任务（自进化/因果链）：复用 ctx.llm（与提取器同通道）。维护周期每批
   // 规则任务后按各自周期门控自动执行；工具/RPC 可 force 手动触发。
-  const reflector = new MemoryReflector({ store, llm: ctx.llm, logger, now: () => Date.now() })
+  const reflector = new MemoryReflector({
+    store,
+    llm: ctx.llm,
+    logger,
+    now: () => Date.now(),
+    // C34：语义门取向量（holder.index 调用时求值——热换后新索引即生效）
+    embedding: holder.index,
+  })
   const causalExtractor = new MemoryCausalExtractor({ store, causal: causalStore, llm: ctx.llm, logger, now: () => Date.now() })
   // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）；
   // C33：每周期顺带向量增量补齐（分片限速；holder.index 调用时求值——热换后新索引即生效）

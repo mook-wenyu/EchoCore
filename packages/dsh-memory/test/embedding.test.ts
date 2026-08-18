@@ -16,7 +16,7 @@ import { DatabaseSync } from 'node:sqlite'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { EmbeddingIndex } from '../src/embed-index.js'
+import { EmbeddingIndex, cosineSimilarity } from '../src/embed-index.js'
 import { EmbeddingService, EmbeddingUnavailableError, cosine, defaultHasLocalModel, remoteEmbedFetch, resolveApiKey, searchWithSemantic } from '../src/embedding.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
@@ -737,6 +737,24 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     await index.ensureAll()
     expect(index.knn(queryVec(3), 400)).toHaveLength(5)
     db.close()
+  })
+
+  it('C34 getVector：返回已索引向量（维度=服务维度）；未索引 id → undefined', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const entries = [{ id: 'v-1', content: '内容A' }, { id: 'v-2', content: '内容B' }] as unknown as MemoryEntry[]
+    const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => entries, logWarn: () => {} })
+    await index.ensureAll()
+    const v1 = index.getVector('v-1')
+    expect(v1).toBeInstanceOf(Float32Array)
+    expect(v1?.length).toBe(384)
+    expect(index.getVector('nope')).toBeUndefined()
+    db.close()
+  })
+
+  it('C34 cosineSimilarity：同向=1 / 正交=0 / 反向=-1', () => {
+    expect(cosineSimilarity(new Float32Array([1, 0]), new Float32Array([2, 0]))).toBeCloseTo(1)
+    expect(cosineSimilarity(new Float32Array([1, 0]), new Float32Array([0, 1]))).toBeCloseTo(0)
+    expect(cosineSimilarity(new Float32Array([1, 0]), new Float32Array([-3, 0]))).toBeCloseTo(-1)
   })
 
   it('ensureAll 批次中途失败：logWarn 跳过继续，其余批次已入库', async () => {

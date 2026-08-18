@@ -22,6 +22,7 @@
 import { BlockAssembler, createUserMessage, type LlmRuntime, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 
+import { cosineSimilarity } from './embed-index.js'
 import { MEMORY_PLUGIN_ID } from './constants.js'
 import { tokenize } from './scoring.js'
 import type { MemoryStore } from './store.js'
@@ -39,6 +40,13 @@ export const REFLECT_FOCUS_BUDGET = 20
 /** 每个焦点的候选对比条目数 */
 export const REFLECT_PEERS_PER_FOCUS = 3
 
+/**
+ * C34（2026-08-18 拍板）：语义合并门——双侧有向量时 cosine ≥ 该值才算候选对
+ * （对齐 ai-memory `CONSOLIDATE_COSINE_THRESHOLD=0.75`：抓语义近等价表述，
+ * 不并仅主题相邻；任一侧无向量 → 回退 token-Jaccard 带）。随 C33 覆盖补齐扩大生效。
+ */
+export const REFLECT_SEMANTIC_THRESHOLD = 0.75
+
 /** LLM 输出上限 */
 export const REFLECT_MAX_TOKENS = 1024
 
@@ -54,6 +62,8 @@ export interface ReflectionDeps {
   llm: Pick<LlmRuntime, 'stream'>
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
   now: () => number
+  /** C34：语义门取向量（有向量时 cosine≥0.75 为主门；缺省无向量 → Jaccard 带回退） */
+  embedding?: { getVector(id: string): Float32Array | undefined }
 }
 
 /** 本轮反思观察量 */
@@ -203,37 +213,53 @@ function jaccardOf(a: MemoryEntry, b: MemoryEntry): number {
 
 /**
  * 选取反思焦点 + 各自的候选对比条目（纯函数，供测试）。
- * - 焦点策略（2026-08-18 实证修复）：**去重/矛盾看重合而非重要度 top-20**。
- *   旧策略按重要度降序取前 REFLECT_FOCUS_BUDGET，生产实证把 imp6-7 的逐字重复对
- *   全部排在被审集外（焦点被 imp≥8 占满）——见 docs/reports 生产验证；
- *   新策略：焦点 = window 内"存在 ≥1 个带内 peer"的条目，按【最强带内 jaccard 降序
- *   → 重要度降序 → 创建时间倒序 → id 稳定】取前 REFLECT_FOCUS_BUDGET；
- *   无 peer 的孤条目不占焦点（无对可审，喂 LLM 纯浪费 token）。
- * - 每焦点的 peers = 同 window 内与其 tokenJaccard 落在 [0.15, 0.85) 的 active 条目，
- *   排除自身；按 jaccard 降序取前 REFLECT_PEERS_PER_FOCUS。
- * 注意：≥0.85 由既有规则合并/覆盖域处理，本函数只补 <0.85 的语义盲区。
+ * - 焦点策略（2026-08-18 实证修复 + C34 语义门）：
+ *   ① 焦点 = window 内"存在 ≥1 个合格对比对"的条目，按【最强对相似度降序 → 重要度
+ *      降序 → 创建时间倒序 → id 稳定】取前 REFLECT_FOCUS_BUDGET；无 peer 的孤条目
+ *      不占焦点（无对可审，喂 LLM 纯浪费 token）。
+ *   ② 对级合格判定（相似度来源二选一）：
+ *      - 双侧有向量（embedding.getVector）→ **语义余弦 ≥ REFLECT_SEMANTIC_THRESHOLD
+ *        (0.75)**（C34，对齐 ai-memory CONSOLIDATE_COSINE_THRESHOLD：抓语义近等价
+ *        表述，不并仅主题相邻；token 重合低但语义同义的改写也能入审）；
+ *      - 任一侧无向量 → 回退 token-Jaccard ∈ [0.15, 0.85)（既有带）。
+ * - 每焦点的 peers = 同 workspace 合格对，按相似度降序取前 REFLECT_PEERS_PER_FOCUS。
+ * 注意：≥0.85（Jaccard）由既有规则合并/覆盖域处理，本函数只补盲区。
  */
-export function selectReflectionPairs(entries: MemoryEntry[]): Array<{ focus: MemoryEntry; peers: MemoryEntry[] }> {
-  // 每条目 → 其同 workspace 带内最强 jaccard（maxBandJ；无对为 0，不参与焦点）
-  const maxBandJ = new Map<string, number>()
+export function selectReflectionPairs(
+  entries: MemoryEntry[],
+  embedding?: { getVector(id: string): Float32Array | undefined },
+): Array<{ focus: MemoryEntry; peers: MemoryEntry[] }> {
+  // 对级相似度：{ sim 排序值, ok 是否合格 }。双侧向量 → 余弦；否则 Jaccard。
+  const pairSim = (a: MemoryEntry, b: MemoryEntry): { sim: number; ok: boolean } => {
+    const va = embedding?.getVector(a.id)
+    const vb = embedding?.getVector(b.id)
+    if (va !== undefined && vb !== undefined) {
+      const sim = cosineSimilarity(va, vb)
+      return { sim, ok: sim >= REFLECT_SEMANTIC_THRESHOLD }
+    }
+    const j = jaccardOf(a, b)
+    return { sim: j, ok: j >= PEER_MIN_JACCARD && j < PEER_MAX_JACCARD }
+  }
+  // 每条目 → 其同 workspace 最强合格对相似度（maxSim；无合格对为 0，不参与焦点）
+  const maxSim = new Map<string, number>()
   for (let i = 0; i < entries.length; i++) {
     for (let k = i + 1; k < entries.length; k++) {
       const a = entries[i]
       const b = entries[k]
       if (a === undefined || b === undefined || a.workspace !== b.workspace) continue
-      const j = jaccardOf(a, b)
-      if (j >= PEER_MIN_JACCARD && j < PEER_MAX_JACCARD) {
-        const set = (id: string) => maxBandJ.set(id, Math.max(maxBandJ.get(id) ?? 0, j))
+      const { sim, ok } = pairSim(a, b)
+      if (ok) {
+        const set = (id: string) => maxSim.set(id, Math.max(maxSim.get(id) ?? 0, sim))
         set(a.id)
         set(b.id)
       }
     }
   }
   const focusList = entries
-    .filter((entry) => (maxBandJ.get(entry.id) ?? 0) >= PEER_MIN_JACCARD)
+    .filter((entry) => (maxSim.get(entry.id) ?? 0) > 0)
     .sort(
       (a, b) =>
-        (maxBandJ.get(b.id) ?? 0) - (maxBandJ.get(a.id) ?? 0) ||
+        (maxSim.get(b.id) ?? 0) - (maxSim.get(a.id) ?? 0) ||
         b.importance - a.importance ||
         b.createdAt.localeCompare(a.createdAt) ||
         a.id.localeCompare(b.id),
@@ -241,17 +267,16 @@ export function selectReflectionPairs(entries: MemoryEntry[]): Array<{ focus: Me
     .slice(0, REFLECT_FOCUS_BUDGET)
   const result: Array<{ focus: MemoryEntry; peers: MemoryEntry[] }> = []
   for (const focus of focusList) {
-    const scored: Array<{ peer: MemoryEntry; j: number }> = []
+    const scored: Array<{ peer: MemoryEntry; sim: number }> = []
     for (const entry of entries) {
       if (entry.id === focus.id) continue
       // 跨 workspace 不构成对比对（Q6⑦ 拍板）：LLM 只审同 workspace 内的语义近重复/
-      // 矛盾——跨域对在 applyDecision 也会被 skip，喂 LLM 纯属浪费 token；
-      // undefined 与 undefined（同缺省）视为同域，不影响既有同域 fixture。
+      // 矛盾——跨域对在 applyDecision 也会被 skip，喂 LLM 纯属浪费 token。
       if (entry.workspace !== focus.workspace) continue
-      const j = jaccardOf(focus, entry)
-      if (j >= PEER_MIN_JACCARD && j < PEER_MAX_JACCARD) scored.push({ peer: entry, j })
+      const { sim, ok } = pairSim(focus, entry)
+      if (ok) scored.push({ peer: entry, sim })
     }
-    scored.sort((x, y) => y.j - x.j)
+    scored.sort((x, y) => y.sim - x.sim)
     result.push({ focus, peers: scored.slice(0, REFLECT_PEERS_PER_FOCUS).map((s) => s.peer) })
   }
   return result
@@ -376,7 +401,7 @@ export class MemoryReflector {
   /** 执行反思主体：拉候选 → 选焦点对 → 渲染 → 单次 LLM → 逐条执行 */
   private async runReflection(route: { provider: string; model: string }): Promise<ReflectionSummary> {
     const candidates = this.deps.store.listRecent(REFLECT_WINDOW, 'active')
-    const pairs = selectReflectionPairs(candidates)
+    const pairs = selectReflectionPairs(candidates, this.deps.embedding)
     const reviewed = pairs.filter((pair) => pair.peers.length > 0).length
     const summary: ReflectionSummary = { reviewed, decisions: 0, merged: 0, archived: 0, skipped: 0 }
     if (reviewed === 0) return summary
