@@ -27,12 +27,15 @@
 - **C25-C26（文档架构重构，2026-08-18）**：按 Diátaxis 全文档重构——新增 `docs/README.md`（文档地图）、`docs/DEPLOYMENT.md`、`docs/DEVELOPMENT.md`；两份报告移入 `docs/reports/`；包 README 瘦身为 Reference（部署/运维/开发移至 How-to 指针）；根 README（EN/zh）修复 `docs/` 断链并指向文档地图。
 - **C20/S1（自我学习契约锁线）**：`test/self-learning-contract.test.ts` 锁死三条红线（Echo-Gap 不在检索/保留使用证据改写 stored importance、supersede/archive 不物理删、检索命中→保留提升链路）——均为既有正确行为的可复现断言。
 - **C21/S2（W2 self/user 相关性信号）**：`selfRelevance?`（1-10）从提取 LLM 一次性评定 → 落库（types:75/111/123、schema memory-domain:45 可选向后兼容）→ 并入 `effectiveImportance`（scoring:295，档位 ≥8→+2 / ≥6→+1，封顶 +2）→ 仅 listByImportance（store:669-670）消费 → `memory_detail` 安全省略键透出（tools:91/123）。Echo-Gap 安全：创建期一次性因子、绝不重写；不训权重。
+- **C28（docs-as-code 校验，2026-08-18）**：`scripts/check-docs.mjs`（断链+中英结构一致性，零依赖）+ markdownlint-cli2（根 devDep + `.markdownlint-cli2.jsonc`）接线 CI；存量 29 处空白错误 `--fix` 清理。
+- **C29（反思实证修复 + 生产热载，2026-08-18）**：生产 `memory_reflect` 端到端验证暴露两盲区——①焦点按重要度 top-20 漏检 imp6-7 真重复（生产 267 带内候选、逐字同文对全被 imp≥8 挤出被审集，实证）；②LLM 畸形输出静默当 0。修复：焦点改为**带内重合度优先**（maxBandJ 降序→重要度次级；无 peer 孤条目不占焦点，同对两端双向进集）+ `callLlm` 对无 `decisions` 字段输出显式 warn。TDD（先红 3 例→绿）。已 build+拷 store+HMR 热载至 live 宿主（PID 9116）；局部会话重启不重置进程累计。
 
 **接口契约变更（自学习）**：`MemoryEntry/NewMemoryInput/ExtractedMemory` + `selfRelevance?`；`effectiveImportance(importance, accessCount, selfRelevance=0)`（第三参缺省=0，两参调用不变）；`MemoryDetail` + `selfRelevance?`（无则省略键）；`memoryEntrySchema` + `optional`；提取 system prompt 规则 11。
 
 ## 三、已知风险点（诚实自曝）
 
 1. **关键词噪声下限为检索行为变更**：零重合条目在关键词路径被过滤（即使 minScore=0）；语义单榜仍可独立召回。若未来发现"弱但真实"的关键词召回受损，需重评下限值（benchmark 契约已同步）。
+2. **反思焦点策略变化（C29）**：焦点按"带内重合度优先"——无 peer 的孤条目不进被审集（原高重要度孤条目不再被审，但其本无可审对，语义等价）；同对两端会各作焦点（可能重复喂 LLM，由 PEERS_PER_FOCUS=3 + 带内过滤限流）。C29 修复在产为 HMR 热载（PID 9116 18:54 后），进程内累计已随重载/重启归零。
 2. **Q5 修复只覆盖已发现两处**：未来新增/修改工具输出必须保持"不得含 undefined 属性值"纪律（宿主 lossless-JSON 校验；否则记忆已入库但工具误报失败）。新 `memory_detail` 未命中路径已同法省略键。
 3. **2b 累计为进程内态（重启归零）**：跨轮收敛判断需累积多轮才有意义；"被反思归档条目的后续推翻"追踪未做（显式边界，深度归因留给探测集评估）。
 4. **换维热换 DROP 与旧 holder 飞行写竞态**（F1 记录）：低概率（同连接同步 SQL），已被 onCreate catch 收容，向量丢不崩；仍处 out 列表。
