@@ -87,6 +87,8 @@ export interface MemorySummary {
 export interface MemoryDetail extends MemorySummary {
   workspace: string
   source: { sessionId: string; eventSeqs: number[]; excerpt: string }
+  /** W2：self/user 相关性（1-10，创建期初始因子；无则省略键——lossless-JSON 契约） */
+  selfRelevance?: number
   accessCount: number
   audit: Array<{ action: string; at: string; by: string; detail?: string }>
   /** 被哪条记忆覆盖（supersede 链后向引用；无则缺席） */
@@ -118,6 +120,7 @@ export function toDetail(entry: MemoryEntry): MemoryDetail {
     source: { ...entry.source },
     accessCount: entry.accessCount,
     audit: entry.audit.map((record) => ({ ...record })),
+    ...(entry.selfRelevance !== undefined ? { selfRelevance: entry.selfRelevance } : {}),
     ...(entry.supersededBy !== undefined ? { supersededBy: entry.supersededBy } : {}),
     ...(entry.supersedes !== undefined ? { supersedes: entry.supersedes } : {}),
   }

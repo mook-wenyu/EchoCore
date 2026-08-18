@@ -194,6 +194,19 @@ describe('parseExtractionOutput', () => {
     const result = parseExtractionOutput('好的，以下是提取结果：\n{"memories":[{"kind":"fact","content":"x"}]}\n以上。')
     expect(result).toHaveLength(1)
   })
+
+  it('W2：解析 selfRelevance（1-10 钳制；缺省省略键——可选字段语义）', () => {
+    expect(parseExtractionOutput('{"memories":[{"kind":"fact","content":"自相关高","selfRelevance":9}]}')).toEqual([
+      { kind: 'fact', content: '自相关高', importance: undefined, selfRelevance: 9, tags: undefined },
+    ])
+    const clamped = parseExtractionOutput('{"memories":[{"kind":"fact","content":"x","selfRelevance":99}]}')
+    expect(clamped[0]!.selfRelevance).toBe(10)
+    const negative = parseExtractionOutput('{"memories":[{"kind":"fact","content":"x","selfRelevance":-3}]}')
+    expect(negative[0]!.selfRelevance).toBe(0)
+    // 缺省 → 键不出现（与既有 importance/tags 恒有键的排布不同，见 parse 注释）
+    const absent = parseExtractionOutput('{"memories":[{"kind":"fact","content":"y"}]}')
+    expect(absent[0]!).not.toHaveProperty('selfRelevance')
+  })
 })
 
 describe('resolveRoute', () => {

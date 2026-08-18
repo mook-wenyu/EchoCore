@@ -283,6 +283,17 @@ describe('toDetail supersede 投影', () => {
     expect(detail.supersededBy).toBeUndefined()
     expect(detail.supersedes).toBeUndefined()
   })
+
+  it('W2：带 selfRelevance 时 detail 投影该键；缺省时省略键（lossless-JSON 契约）', async () => {
+    const { store } = setup()
+    const id = await seed(store)
+    const entry = store.getById(id)
+    if (entry === undefined) throw new Error('条目缺失')
+    const withSelf: MemoryEntry = { ...entry, selfRelevance: 8 }
+    expect(toDetail(withSelf).selfRelevance).toBe(8)
+    // 缺省：键不出现（非 undefined 值——与 Q5 lossless 修复同纪律：可选字段省略键）
+    expect(toDetail(entry)).not.toHaveProperty('selfRelevance')
+  })
 })
 
 describe('memory_audit', () => {

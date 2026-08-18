@@ -65,6 +65,14 @@ export interface MemoryEntry {
   content: string
   /** 重要性 0-10（提取器 LLM 自评；手动写入默认 5） */
   importance: number
+  /**
+   * self/user 相关性 1-10（W2，2026-08-18 拍板——Learning What to Remember 主导因子）：
+   * 提取器 LLM 一次性评定的"该信息与用户本人/长期目标/项目主题的相关程度"；
+   * 仅作**创建期初始因子**并入保留决策（effectiveImportance），绝不随后续使用/反思
+   * 重写（Echo-Gap 红线 arXiv:2608.00017——LLM 自评分不得作为持续强化信号）。
+   * 旧记录缺省该字段（undefined → 不参与加分），向后兼容。
+   */
+  selfRelevance?: number
   /** 标签 */
   tags: string[]
   /** 来源锚点 */
@@ -99,6 +107,8 @@ export interface NewMemoryInput {
   kind: MemoryKind
   content: string
   importance?: number
+  /** W2：self/user 相关性 1-10（可选；见 MemoryEntry.selfRelevance 语义） */
+  selfRelevance?: number
   tags?: string[]
   source: MemorySource
   by: AuditActor
@@ -109,6 +119,8 @@ export interface ExtractedMemory {
   kind: MemoryKind
   content: string
   importance?: number
+  /** W2：self/user 相关性 1-10（LLM 输出可缺省 → undefined） */
+  selfRelevance?: number
   tags?: string[]
 }
 

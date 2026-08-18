@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MemoryStore, type SearchOptions } from '../src/store.js'
 import { effectiveImportance } from '../src/scoring.js'
+import { memoryEntrySchema } from '../src/memory-domain.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { createRealSqliteStore, FakeTable, settle } from './helpers.js'
 
@@ -805,5 +806,32 @@ describe('MemoryStore.listByImportance 有效重要度（Q1 轻量融合：存�
     expect(effectiveImportance(cap.importance, store.getById(cap.id)!.accessCount)).toBe(10)
     // 无访问证据时与存储重要度一致（既有排序语义不变）
     expect(effectiveImportance(stored6.importance, stored6.accessCount)).toBe(6)
+  })
+
+  it('W2：self/user 相关性初始因子进保留排序（Learning What to Remember 主导因子）', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    const plain6 = (await store.create(input({ content: '普通重要度 6', importance: 6 }))).entry
+    const self8 = (await store.create(input({ content: '高自相关但重要度 5', importance: 5, selfRelevance: 8 }))).entry
+    const self5 = (await store.create(input({ content: '低自相关重要度 5', importance: 5, selfRelevance: 5 }))).entry
+    const top = store.listByImportance('D:/workspace', 10)
+    // selfRelevance=8 → 初始 +2 → eff7 > plain6 eff6 > self5 eff5
+    expect(top[0]!.id).toBe(self8.id)
+    expect(top[1]!.id).toBe(plain6.id)
+    expect(top[2]!.id).toBe(self5.id)
+    // Echo-Gap：selfRelevance 是创建期一次性字段——stored importance 与 selfRelevance 均不被改写
+    expect(store.getById(self8.id)!.importance).toBe(5)
+    expect(store.getById(self8.id)!.selfRelevance).toBe(8)
+  })
+
+  it('W2：create 透传 selfRelevance 落库，memoryEntrySchema 可选接受（向后兼容）', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    const withSelf = (await store.create(input({ content: '带自相关的新记忆', importance: 6, selfRelevance: 9 }))).entry
+    expect(store.getById(withSelf.id)!.selfRelevance).toBe(9)
+    expect(memoryEntrySchema.safeParse(store.getById(withSelf.id)!).success).toBe(true)
+    // 旧记录缺省（undefined）→ 仍通过校验（可选字段向后兼容，老条目无该字段照常迁移）
+    const noSelf = (await store.create(input({ content: '无自相关字段的记忆' }))).entry
+    expect(store.getById(noSelf.id)!.selfRelevance).toBeUndefined()
+    expect(memoryEntrySchema.safeParse(store.getById(noSelf.id)!).success).toBe(true)
   })
 })

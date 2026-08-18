@@ -253,6 +253,8 @@ export class MemoryExtractor {
         kind: memory.kind,
         content: memory.content,
         importance: memory.importance,
+        // W2：self/user 相关性随提取直落（LLM 未输出时为 undefined）
+        selfRelevance: memory.selfRelevance,
         tags: memory.tags,
         source: { sessionId: session.id, eventSeqs, excerpt },
         by: 'extractor',

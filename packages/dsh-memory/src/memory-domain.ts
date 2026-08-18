@@ -41,6 +41,8 @@ export const memoryEntrySchema = z.object({
   content: z.string(),
   // R3-4：重要度语义域 0..10（提取侧已 clamp；工具侧模型可传任意值——持久层是最后防线，越界拒绝入库）
   importance: z.number().min(0).max(10),
+  // W2：self/user 相关性 0..10（可选——旧记录无此字段，向后兼容）
+  selfRelevance: z.number().min(0).max(10).optional(),
   tags: z.array(z.string()),
   source: memorySourceSchema,
   dedupKey: z.string(),

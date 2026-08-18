@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest'
 import {
   adaptiveHalfLifeDays,
   bm25Idf,
+  effectiveImportance,
   idfWeightedRelevance,
   importanceFactor,
   MIN_RELEVANCE_SCORE,
@@ -410,5 +411,21 @@ describe('rrfScore（RRF 排名融合，B1）', () => {  it('双榜第一 = 1（
 
   it('双榜靠前优于单榜靠前（两通道证据叠加）', () => {
     expect(rrfScore(2, 2)).toBeGreaterThan(rrfScore(1, undefined))
+  })
+})
+
+describe('effectiveImportance（W2：self/user 相关性初始因子并入保留决策）', () => {
+  it('selfRelevance 档位：≥8 → +2、≥6 → +1、<6 → +0（对数式访问证据之上叠加）', () => {
+    expect(effectiveImportance(5, 0, 0)).toBe(5) // 无访问无自相关
+    expect(effectiveImportance(5, 0, 5)).toBe(5) // 低自相关 +0
+    expect(effectiveImportance(5, 0, 6)).toBe(6) // 高自相关 +1
+    expect(effectiveImportance(5, 0, 8)).toBe(7) // 极高自相关 +2
+    expect(effectiveImportance(5, 0, 10)).toBe(7) // 封顶 +2（防自评分过度支配保留面）
+  })
+
+  it('与访问证据叠加但仍封顶 10；第三参缺省默认 0（向后兼容两参调用）', () => {
+    expect(effectiveImportance(5, 3, 8)).toBe(9) // 3次访问 +2 且 极高自相关 +2 → 5+2+2
+    expect(effectiveImportance(9, 7, 9)).toBe(10) // 9+2+2=13 → 钳制 10
+    expect(effectiveImportance(6, 0)).toBe(6) // 缺省第三参 = 0（旧调用点不变）
   })
 })

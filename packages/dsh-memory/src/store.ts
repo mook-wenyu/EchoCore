@@ -299,6 +299,8 @@ export class MemoryStore {
       kind: input.kind,
       content: input.content,
       importance: input.importance ?? 5,
+      // W2：创建期初始因子（无则 undefined；Echo-Gap 红线外——后续访问/反思绝不重写）
+      selfRelevance: input.selfRelevance,
       tags: input.tags ?? [],
       source: input.source,
       dedupKey,
@@ -661,11 +663,11 @@ export class MemoryStore {
       result.push(entry)
     }
     result.sort(
-      // Q1/2c 轻量融合：按**有效重要度**（存储重要性 + 访问频率证据，见
-      // scoring.effectiveImportance）排序——被频繁召回的记忆证据补足单次打分漂移
+      // Q1/2c 轻量融合：按**有效重要度**（存储重要性 + 访问频率证据 + self/user 相关性初始
+      // 因子，见 scoring.effectiveImportance）排序——被频繁召回的记忆证据补足单次打分漂移
       (a, b) =>
-        effectiveImportance(b.importance, b.accessCount) -
-          effectiveImportance(a.importance, a.accessCount) ||
+        effectiveImportance(b.importance, b.accessCount, b.selfRelevance ?? 0) -
+          effectiveImportance(a.importance, a.accessCount, a.selfRelevance ?? 0) ||
         b.createdAt.localeCompare(a.createdAt) ||
         a.id.localeCompare(b.id),
     )

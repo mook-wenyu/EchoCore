@@ -45,9 +45,10 @@ export const EXTRACTION_SYSTEM_PROMPT = `你是一个记忆提取器，为 AI �
 8. 状态变化：若摘录显示既有认知被更新或推翻（如"改用 X 替代 Y"、"不再使用 Z"），按新状态提取
 9. 失败教训（需求 A，2026-08-16）：已出现并被解决的工程失败（含现象、根因与恢复办法）→ kind: insight + 自动 tags 含 '失败教训'；只记录失败而未给出恢复方案的不得入库（防止"卡死无解"污染）
 10. 用户强调（需求 B，2026-08-16）：用户反复提及（≥2 次）或明确使用强调表达（"记住""务必""重点""不要再""强调"）的内容 → importance 应 ≥7（用户主观权重抬升——自动作用于衰减半衰期与快照保活）
+11. self/user 相关性 selfRelevance（1-10，W2，2026-08-18）：该信息与用户本人、长期目标或当前项目主题的相关程度（用户核心诉求、反复出现的域主题 → 高；一次性事务、与用户目标无关的外部常识 → 低）。它是"该记多久/多靠前保留"的创建期初始因子，与 importance（对未来决策影响）是**两个独立维度**——importance 可高但相关性低（影响大但与用户无关的外部事件）也可以相反。
 
 输出严格 JSON（不要输出任何其他文字）：
-{"memories":[{"kind":"fact","content":"...","importance":7,"tags":["标签"]}]}
+{"memories":[{"kind":"fact","content":"...","importance":7,"selfRelevance":7,"tags":["标签"]}]}
 没有可提取内容时输出：{"memories":[]}`
 
 /** 提取用户消息尾部指令 */
@@ -170,13 +171,22 @@ export function parseExtractionOutput(text: string): ExtractedMemory[] {
       typeof record.importance === 'number' && Number.isFinite(record.importance)
         ? Math.min(Math.max(Math.round(record.importance), 0), 10)
         : undefined
+    // W2：self/user 相关性同样钳制到 0..10；LLM 未输出或非法 → undefined（不参与加分）
+    const selfRelevance =
+      typeof record.selfRelevance === 'number' && Number.isFinite(record.selfRelevance)
+        ? Math.min(Math.max(Math.round(record.selfRelevance), 0), 10)
+        : undefined
     const tags = Array.isArray(record.tags) ? record.tags.filter((tag): tag is string => typeof tag === 'string') : undefined
-    result.push({
+    const parsed: ExtractedMemory = {
       kind: record.kind as MemoryKind,
       content: record.content.trim(),
       importance,
       tags,
-    })
+    }
+    // W2：selfRelevance 仅在 LLM 提供时出现（缺省省略键——与"可选字段"语义一致，
+    // 保持既有 importance/tags 恒有键的排布不变，防破坏既有 exact-shape 断言）
+    if (selfRelevance !== undefined) parsed.selfRelevance = selfRelevance
+    result.push(parsed)
   }
   return result
 }

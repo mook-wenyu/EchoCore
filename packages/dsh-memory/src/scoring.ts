@@ -276,19 +276,26 @@ export function importanceFactor(importance: number): number {
 }
 
 /**
- * 有效重要度（Q1/2c 轻量融合，2026-08-17 用户拍板）：保留 LLM 单次 1-10 作为
- * 主因子，叠加「访问频率证据」——对被频繁召回/引用的记忆按对数式增益抬重要度。
+ * 有效重要度（Q1/2c 轻量融合，2026-08-17 用户拍板；W2 扩展 2026-08-18）：保留 LLM 单次 1-10 作为
+ * 主因子，叠加「访问频率证据」——对被频繁召回/引用的记忆按对数式增益抬重要度：
  *   evidenceBoost = accessCount>0 ? min(2, floor(log2(1+accessCount))) : 0
  *   → 1 次 = +1；3 次 = +2；≥7 次 = +2（封顶 +2，防高频访问无界放大/霸榜；
  *      与 B2 半衰期访问调制的对数压缩同源）。
+ * 再叠加 W2「self/user 相关性初始因子」（Learning What to Remember arXiv:2606.12945
+ * 主导因子之一；提取时 LLM 一次性评定，见 types.MemoryEntry.selfRelevance）：
+ *   initialBoost = selfRelevance>=8 ? 2 : selfRelevance>=6 ? 1 : 0
+ *   → 极高自相关 +2、高自相关 +1、其余 +0（同样封顶，防自评分过度支配保留面）。
  * 仅用于「保留/提升」决策面（listByImportance / 快照取数）——**不动检索主路径**
  * （search 评分仍用存储 importance + 半衰期访问调制，避免同一访问证据双重计入）。
- * 依据：LexWisdom 盲区实证 多因子 0.770 vs 单因子 0.518（arXiv:2606.12945）——
- * 频率证据补单次打分漂移；**不训学习权重**（仅单篇无工程复现，YAGNI）。
+ * 依据：LexWisdom 盲区实证 多因子 0.770 vs 单因子 0.518（arXiv:2606.12945）。
+ * **Echo-Gap 红线（arXiv:2608.00017）**：selfRelevance 是创建期一次性初始因子，
+ * 与访问证据一样**绝不**由后续 LLM 自评/反思结果重写或回写 stored importance——
+ * 防止自评分误差被反复强化复合放大。**不训学习权重**（YAGNI）。
  */
-export function effectiveImportance(importance: number, accessCount: number): number {
+export function effectiveImportance(importance: number, accessCount: number, selfRelevance = 0): number {
   const evidence = accessCount > 0 ? Math.min(2, Math.floor(Math.log2(1 + accessCount))) : 0
-  return Math.min(10, Math.max(0, importance + evidence))
+  const initial = selfRelevance >= 8 ? 2 : selfRelevance >= 6 ? 1 : 0
+  return Math.min(10, Math.max(0, importance + evidence + initial))
 }
 
 /**
