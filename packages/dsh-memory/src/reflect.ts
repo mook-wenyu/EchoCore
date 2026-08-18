@@ -203,14 +203,41 @@ function jaccardOf(a: MemoryEntry, b: MemoryEntry): number {
 
 /**
  * 选取反思焦点 + 各自的候选对比条目（纯函数，供测试）。
- * - 焦点 = 按重要度降序 → 创建时间倒序（同刻按 id 稳定）取前 REFLECT_FOCUS_BUDGET；
+ * - 焦点策略（2026-08-18 实证修复）：**去重/矛盾看重合而非重要度 top-20**。
+ *   旧策略按重要度降序取前 REFLECT_FOCUS_BUDGET，生产实证把 imp6-7 的逐字重复对
+ *   全部排在被审集外（焦点被 imp≥8 占满）——见 docs/reports 生产验证；
+ *   新策略：焦点 = window 内"存在 ≥1 个带内 peer"的条目，按【最强带内 jaccard 降序
+ *   → 重要度降序 → 创建时间倒序 → id 稳定】取前 REFLECT_FOCUS_BUDGET；
+ *   无 peer 的孤条目不占焦点（无对可审，喂 LLM 纯浪费 token）。
  * - 每焦点的 peers = 同 window 内与其 tokenJaccard 落在 [0.15, 0.85) 的 active 条目，
  *   排除自身；按 jaccard 降序取前 REFLECT_PEERS_PER_FOCUS。
  * 注意：≥0.85 由既有规则合并/覆盖域处理，本函数只补 <0.85 的语义盲区。
  */
 export function selectReflectionPairs(entries: MemoryEntry[]): Array<{ focus: MemoryEntry; peers: MemoryEntry[] }> {
-  const focusList = [...entries]
-    .sort((a, b) => b.importance - a.importance || b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id))
+  // 每条目 → 其同 workspace 带内最强 jaccard（maxBandJ；无对为 0，不参与焦点）
+  const maxBandJ = new Map<string, number>()
+  for (let i = 0; i < entries.length; i++) {
+    for (let k = i + 1; k < entries.length; k++) {
+      const a = entries[i]
+      const b = entries[k]
+      if (a === undefined || b === undefined || a.workspace !== b.workspace) continue
+      const j = jaccardOf(a, b)
+      if (j >= PEER_MIN_JACCARD && j < PEER_MAX_JACCARD) {
+        const set = (id: string) => maxBandJ.set(id, Math.max(maxBandJ.get(id) ?? 0, j))
+        set(a.id)
+        set(b.id)
+      }
+    }
+  }
+  const focusList = entries
+    .filter((entry) => (maxBandJ.get(entry.id) ?? 0) >= PEER_MIN_JACCARD)
+    .sort(
+      (a, b) =>
+        (maxBandJ.get(b.id) ?? 0) - (maxBandJ.get(a.id) ?? 0) ||
+        b.importance - a.importance ||
+        b.createdAt.localeCompare(a.createdAt) ||
+        a.id.localeCompare(b.id),
+    )
     .slice(0, REFLECT_FOCUS_BUDGET)
   const result: Array<{ focus: MemoryEntry; peers: MemoryEntry[] }> = []
   for (const focus of focusList) {
@@ -388,7 +415,16 @@ export class MemoryReflector {
       .filter((block) => block.type === 'text')
       .map((block) => (block as { text: string }).text)
       .join('')
-    return parseReflectionDecisions(textOut)
+    const decisions = parseReflectionDecisions(textOut)
+    // 2026-08-18 实证修复（可观测性）：畸形/跑题的 LLM 输出（如通篇无 decisions 字段）
+    // 会被解析器静默当 0 裁决——与"诚实判无动作"不可区分，掩盖模型质量问题。
+    // 非空但无 decisions 字段 → 显式 warn（合法 `{"decisions":[]}` 不触发）。
+    if (textOut.trim().length > 0 && !textOut.includes('decisions')) {
+      this.deps.logger.warn(
+        `[dsh-memory] 反思输出未含 decisions 字段，按 0 裁决处理（原文片段：${textOut.trim().slice(0, 120)}）`,
+      )
+    }
+    return decisions
   }
 
   /**

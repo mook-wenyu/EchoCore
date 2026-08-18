@@ -142,12 +142,40 @@ describe('parseReflectionDecisions', () => {
 })
 
 describe('selectReflectionPairs', () => {
-  it('焦点按重要度降序 → 创建时间倒序（同刻按 id 稳定）', () => {
-    const hiNew = makeEntry({ id: 'hiNew', content: 'w1', importance: 9, createdAt: new Date(NOW).toISOString() })
-    const hiOld = makeEntry({ id: 'hiOld', content: 'w2', importance: 9, createdAt: new Date(NOW - MS_PER_DAY).toISOString() })
-    const mid = makeEntry({ id: 'mid', content: 'w3', importance: 5, createdAt: new Date(NOW - 2 * MS_PER_DAY).toISOString() })
-    const pairs = selectReflectionPairs([mid, hiNew, hiOld])
-    expect(pairs.map((p) => p.focus.id)).toEqual(['hiNew', 'hiOld', 'mid'])
+  it('焦点=有带内 peer 的条目，按最强带内 jaccard 降序 → 重要度降序（无 peer 的孤条目不占焦点）', () => {
+    // 2026-08-18 实证修复：去重看重合而非重要度 top-20。生产发现 imp6-7 逐字重复对
+    // 被重要度前 20 焦点挤掉从未被审；新策略让"带内重合最强的条目"先进被审集。
+    const pairA = [
+      makeEntry({ id: 'A1', content: 'a b c d e f g h', importance: 7 }),
+      makeEntry({ id: 'A2', content: 'a b c d e f', importance: 6 }), // j(A1,A2)=6/8=0.75
+    ]
+    const pairB = [
+      makeEntry({ id: 'B1', content: 'm n o p q r', importance: 9 }),
+      makeEntry({ id: 'B2', content: 'm n o p', importance: 8 }), // j=4/6≈0.667
+    ]
+    const isolated = makeEntry({ id: 'xIso', content: 'z z z z', importance: 10 }) // 无带内 peer → 不进被审集
+    const pairs = selectReflectionPairs([...pairA, ...pairB, isolated])
+    // 焦点按 maxJ desc：A 组 .75 优先于 B 组 .667；同 maxJ 内按重要度；
+    // 同对**两端均进入被审集**（各自以对方为 peer——重复对从两侧都被审，更彻底）
+    expect(pairs.map((p) => p.focus.id)).toEqual(['A1', 'A2', 'B1', 'B2'])
+    // 孤条目（无 peer）不占焦点
+    expect(pairs.some((p) => p.focus.id === 'xIso')).toBe(false)
+    // A1 的 peer 含 A2（双向可审）
+    expect(pairs[0]?.peers.map((p) => p.id)).toContain('A2')
+  })
+
+  it('实证修复：中重要度带内高重合对不被重要度前 20 焦点挤掉（生产真重复场景）', () => {
+    // 生产回放：37 条 imp≥8 占据焦点预算时，imp6-7 的逐字同文对仍须进入被审集。
+    const entries: MemoryEntry[] = []
+    for (let i = 0; i < 25; i++) entries.push(makeEntry({ id: `hi${i}`, content: `isolated ${i}`, importance: 9 }))
+    const older = makeEntry({ id: 'dupOld', content: 'CourtGrantTypes 迁至 Project persistence', importance: 7 })
+    const newer = makeEntry({ id: 'dupNew', content: 'CourtGrantTypes 迁至 Project persistence 机制', importance: 6 }) // 高重合
+    entries.push(older, newer)
+    const pairs = selectReflectionPairs(entries)
+    const focusIds = pairs.map((p) => p.focus.id)
+    // 新旧两端至少其一进入被审焦点集（带内高重合对优先，不被 imp9 孤条目挤掉）
+    expect(focusIds).toContain('dupOld')
+    expect(pairs.find((p) => p.focus.id === 'dupOld')?.peers.map((x) => x.id)).toContain('dupNew')
   })
 
   it('相似带边界：<0.15 与 ≥0.85 排除，带内按 jaccard 降序取前 N，排除自身', () => {
@@ -402,6 +430,23 @@ describe('MemoryReflector.runOnce', () => {
     // 次轮（force 无视门控）：累计继续增长（"反思是否在收敛"可观测）
     await reflector.runOnce(route, { force: true })
     expect(reflector.cumulativeSummary).toEqual({ runs: 2, decisions: 2, merged: 0, archived: 0, skipped: 2 })
+  })
+
+  it('callLlm：畸形输出（不含 decisions 字段）→ warn 可观测 + 0 裁决', async () => {
+    const { older, newer } = duplicatePair()
+    const { reflector, warns } = makeReflector([older, newer], '这只是一段随机文本，不是裁决 JSON')
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(summary?.decisions).toBe(0)
+    // 2026-08-18 实证修复：畸形输出不再与"诚实 0 裁决"不可区分
+    expect(warns.some((w) => String(w).includes('未含 decisions'))).toBe(true)
+  })
+
+  it('合法空裁决 {"decisions":[]} 不触发畸形 warn', async () => {
+    const { older, newer } = duplicatePair()
+    const { reflector, warns } = makeReflector([older, newer], '{"decisions":[]}')
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(summary?.decisions).toBe(0)
+    expect(warns.some((w) => String(w).includes('未含 decisions'))).toBe(false)
   })
 })
 
