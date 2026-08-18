@@ -17,7 +17,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { EmbeddingIndex } from '../src/embed-index.js'
-import { EmbeddingService, EmbeddingUnavailableError, cosine, defaultHasLocalModel, remoteEmbedFetch, resolveApiKey } from '../src/embedding.js'
+import { EmbeddingService, EmbeddingUnavailableError, cosine, defaultHasLocalModel, remoteEmbedFetch, resolveApiKey, searchWithSemantic } from '../src/embedding.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeTable } from './helpers.js'
@@ -544,6 +544,55 @@ describe('store 语义融合检索', () => {
     // a 经单榜上榜召回；b 无关键词分且不在语义榜 → 不上榜
     expect(results.some((entry) => entry.id === a)).toBe(true)
     expect(results.some((entry) => entry.id === b)).toBe(false)
+  })
+
+  it('降级后检索契约：语义停用（disabled）→ searchWithSemantic 纯关键词命中、不抛裸 sqlite 维度错（F2 P2 定点）', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => now)
+    await seed(store, { content: 'pnpm workspace 规则' })
+    // 构造并触发跨维降级：512 维远程 + 384 维本地（Q1/A 禁止跨维顶班 → disabled）
+    const fakeLocal = {
+      async embed(text: string): Promise<Float32Array> {
+        const v = new Float32Array(384)
+        v[0] = text.length
+        return v
+      },
+    }
+    const fakeRemote = (input: string[], config: { dimension: number }) =>
+      Promise.resolve(input.map(() => {
+        const v = new Float32Array(config.dimension)
+        v.fill(1)
+        return v
+      }))
+    let remoteCalls = 0
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      remote: { baseUrl: 'https://api.example.com/v1', apiKey: 'k', model: 'm', dimension: 512 },
+      hasLocalModel: async () => true,
+      loadLocalBackend: async () => fakeLocal,
+      fetchRemoteEmbeddings: async (input, config) => {
+        remoteCalls++
+        if (remoteCalls === 1) return fakeRemote(input, config)
+        throw new Error('网络抖动')
+      },
+    })
+    await service.init()
+    await expect(service.embed('x')).rejects.toThrow() // 触发跨维降级
+    expect(service.state).toBe('disabled')
+    // 语义不可用但检索必须可用：searchWithSemantic 经 state 门控走**纯关键词**，
+    // 返回命中且不抛裸错（无维度不匹配 → KNN 的裸 SQL 维度错）——检索契约端到端
+    const warns: string[] = []
+    const results = await searchWithSemantic(
+      store,
+      service,
+      undefined, // index 缺省：disabled 下不触及
+      'pnpm workspace',
+      { workspace: 'D:/ws', limit: 5, minScore: 0.1 },
+      (message, error) => warns.push(error instanceof Error ? `${message}::${error.message}` : message),
+    )
+    expect(results.length).toBeGreaterThan(0)
+    // 状态门控路径（非异常）不产生"降级"告警，也不抛维度错
+    expect(warns).toEqual([])
   })
 })
 
