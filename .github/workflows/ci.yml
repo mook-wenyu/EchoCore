@@ -48,5 +48,8 @@ jobs:
       - name: 运行测试
         run: pnpm --filter @echocore/dsh-memory test
 
-      # 覆盖率门槛待主代理按基线补充：当前不在此处设置覆盖率阈值，
-      # 因为其它并行任务改动尚未完成，阈值需等基线确定后由主代理决策再添加。
+      # 7. 覆盖率门槛（Q6，2026-08-17）：阈值在 vitest.config.ts coverage.thresholds
+      #    （lines80/functions75/statements80/branches70——据实测基线
+      #    Stmts93.9/Branch90.8/Funcs94 各留 ~10pt 余量，防 CI 红）。
+      - name: 覆盖率门槛
+        run: pnpm --filter @echocore/dsh-memory test:coverage
