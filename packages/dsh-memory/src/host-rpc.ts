@@ -98,6 +98,8 @@ export function createMemoryRpcHandler(
           // 自进化/因果观测（null = 未运行/未接线——度量"反思是否变好"的可观测起点）
           reflection: runtime?.reflection ?? null,
           lastReflectionAt: runtime?.lastReflectionAt ?? null,
+          // 2b：反思跨轮累计观测量（轻量质量钩子；未运行/未接线 null）
+          reflectionCumulative: runtime?.reflectionCumulative ?? null,
           causal: runtime?.causal ?? null,
           lastCausalAt: runtime?.lastCausalAt ?? null,
         })

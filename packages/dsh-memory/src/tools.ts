@@ -19,7 +19,7 @@ import { resolveRoute } from './extract.js'
 import { searchWithSemantic, type EmbeddingHolder } from './embedding.js'
 import type { CausalSummary } from './causal.js'
 import { formatMemoryLine } from './render.js'
-import type { ReflectionSummary } from './reflect.js'
+import type { ReflectionCumulative, ReflectionSummary } from './reflect.js'
 import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry, MemoryKind } from './types.js'
@@ -58,6 +58,8 @@ export interface RuntimeHealth {
   embeddingInitError?: string
   /** Q1/A：运行期跨维降级原因（语义已降级为关键词时展示——状态可见化，非静默） */
   embeddingDegradedReason?: string
+  /** 2b：反思跨轮累计观测量（轻量质量钩子；未运行/未接线 null） */
+  reflectionCumulative?: ReflectionCumulative | null
   /** 反思观测：最近一次成功执行的观察量（审/决/合并/归档/跳过；未运行 null） */
   reflection?: ReflectionSummary | null
   /** 反思最近一次成功执行时刻（ISO；未运行 null） */
@@ -387,7 +389,11 @@ function registerNote(ctx: Context, deps: MemoryToolsDeps): void {
         return {
           id: result.entry.id,
           merged: result.outcome.merged,
-          mergedWithId: result.outcome.merged ? result.outcome.existingId : undefined,
+          // Q5 修复（2026-08-17 实查宿主）：返回值不得含 undefined 属性值——宿主
+          // dsh-tools 对工具 output 做 lossless-JSON 校验（snapshotToolValue），
+          // 对象带 undefined 属性即抛 "value is not lossless JSON"（记忆已入库但
+          // 工具误报失败）。与 toDetail 一致的安全省略键：非合并时不带该键。
+          ...(result.outcome.merged ? { mergedWithId: result.outcome.existingId } : {}),
         }
       },
     }),
@@ -560,7 +566,9 @@ function registerAudit(ctx: Context, deps: MemoryToolsDeps): void {
       },
       async execute(args) {
         const entry = deps.store.getById(args.id)
-        if (entry === undefined) return { found: false, entry: undefined }
+        // Q5 修复：未命中不返回 {entry: undefined}（宿主 lossless-JSON 校验拒绝
+        // undefined 属性值 → 工具误报失败）；省略键即可，render 已处理 entry 缺失
+        if (entry === undefined) return { found: false }
         const detail = toDetail(entry)
         if (deps.causal === undefined) return { found: true, entry: detail }
         // 因果装订：out（本条→target）= 本条支撑/导致谁；in（source→本条）= 谁影响/支撑本条
@@ -665,12 +673,20 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
             },
             writeFailures: { type: 'integer', required: true },
             embeddingState: { type: 'string', required: true },
+            // Q3（2026-08-17 拍板）：嵌入后端标签与原因透出（模型可直接看到
+            // "remote/local/remote(验证失败)/remote(运行期降级)"与详因，不靠猜）。
+            // 与 lastMaintenanceAt 同形：'json' + required:true 承载 string|null
+            // （ValueSchemaSpec 无 required:false 先例，不用布尔拓宽破坏判别联合）。
+            embeddingBackend: { type: 'json', required: true },
+            embeddingInitError: { type: 'json', required: true },
+            embeddingDegradedReason: { type: 'json', required: true },
             // O1：string|null 形态——ValueSchemaSpec 无联合 type，用 'json' 声明
             lastMaintenanceAt: { type: 'json', required: true },
             rejectedCount: { type: 'integer', required: true },
             // 自进化/因果链观测（null = 未运行/未接线；'json' 承载对象或 null）
             reflection: { type: 'json', required: true },
             lastReflectionAt: { type: 'json', required: true },
+            reflectionCumulative: { type: 'json', required: true },
             causal: { type: 'json', required: true },
             lastCausalAt: { type: 'json', required: true },
           },
@@ -682,13 +698,22 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
             text: [
               `记忆库统计：共 ${value.total} 条（active ${value.active} / archived ${value.archived}）`,
               `fact ${value.byKind.fact} · preference ${value.byKind.preference} · decision ${value.byKind.decision} · todo ${value.byKind.todo} · insight ${value.byKind.insight}`,
-              `运行健康：写失败 ${value.writeFailures} 次 · 嵌入 ${value.embeddingState} · 上次维护 ${value.lastMaintenanceAt ?? '未运行'}`,
+              `运行健康：写失败 ${value.writeFailures} 次 · 嵌入 ${value.embeddingState}${
+                value.embeddingBackend ? `（${value.embeddingBackend}）` : ''
+              } · 上次维护 ${value.lastMaintenanceAt ?? '未运行'}`,
+              // Q3：嵌入未生效/降级详因（模型可直接看到，不靠猜）
+              ...(value.embeddingInitError ? [`嵌入未生效原因：${value.embeddingInitError}`] : []),
+              ...(value.embeddingDegradedReason ? [`嵌入降级原因：${value.embeddingDegradedReason}`] : []),
               `写端门：已拦截 ${value.rejectedCount} 条噪声（extractor 通道）`,
               // 自进化/因果观测（A′ 建议 5：度量"反思是否真正变好"的起点——先可观测，再谈优化；
               // schema 为 json 承载 null/对象，读取时经 unknown 收窄为行为形状）
               `反思自进化：上次 ${value.lastReflectionAt ?? '未运行'}${
                 value.reflection ? `（审定 ${(value.reflection as unknown as ReflectionSummary).reviewed} · 合并 ${(value.reflection as unknown as ReflectionSummary).merged} · 矛盾归档 ${(value.reflection as unknown as ReflectionSummary).archived} · 跳过 ${(value.reflection as unknown as ReflectionSummary).skipped}）` : ''
               }`,
+              // 2b：反思跨轮累计（轻量质量钩子——"反思是否在收敛"可观测）
+              ...(value.reflectionCumulative
+                ? [`反思累计：${(value.reflectionCumulative as unknown as ReflectionCumulative).runs} 轮 · 裁决 ${(value.reflectionCumulative as unknown as ReflectionCumulative).decisions} · 合并 ${(value.reflectionCumulative as unknown as ReflectionCumulative).merged} · 矛盾归档 ${(value.reflectionCumulative as unknown as ReflectionCumulative).archived} · 跳过 ${(value.reflectionCumulative as unknown as ReflectionCumulative).skipped}`]
+                : []),
               `因果链：上次 ${value.lastCausalAt ?? '未运行'}${
                 value.causal ? `（审 ${(value.causal as unknown as CausalSummary).reviewed} · 建边 ${(value.causal as unknown as CausalSummary).created} · 跳过 ${(value.causal as unknown as CausalSummary).skipped}）` : ''
               }`,
@@ -707,12 +732,18 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
           byKind: stats.byKind,
           writeFailures: runtime?.writeFailures ?? stats.writeFailures,
           embeddingState: runtime?.embeddingState ?? stats.embeddingState,
+          // Q3：'json' 形态承载 string|null（未装配/未就绪 → null）
+          embeddingBackend: runtime?.embeddingBackend ?? null,
+          embeddingInitError: runtime?.embeddingInitError ?? null,
+          embeddingDegradedReason: runtime?.embeddingDegradedReason ?? null,
           lastMaintenanceAt: runtime?.lastMaintenanceAt ?? stats.lastMaintenanceAt,
           // R2：P2 写端门拒绝计数（store 自身可观测，直读 stats）
           rejectedCount: stats.rejectedCount,
           // json 承载对象或 null（schema 为 'json'）；运行时对象即为 JsonValue（显式收窄）
           reflection: (runtime?.reflection ?? null) as JsonValue,
           lastReflectionAt: runtime?.lastReflectionAt ?? null,
+          // 2b：跨轮累计观测量（缺省 null——未接线）
+          reflectionCumulative: (runtime?.reflectionCumulative ?? null) as JsonValue,
           causal: (runtime?.causal ?? null) as JsonValue,
           lastCausalAt: runtime?.lastCausalAt ?? null,
         }

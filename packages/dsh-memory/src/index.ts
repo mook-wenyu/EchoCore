@@ -358,6 +358,10 @@ export async function mountMemory(
     get lastReflectionAt() {
       return reflector.lastRunAt
     },
+    // 2b：反思跨轮累计观测量（轻量质量钩子——"反思是否在收敛"可观测）
+    get reflectionCumulative() {
+      return reflector.cumulativeSummary
+    },
     get causal() {
       return causalExtractor.lastSummary
     },

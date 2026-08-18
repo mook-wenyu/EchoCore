@@ -387,6 +387,22 @@ describe('MemoryReflector.runOnce', () => {
     expect(llm.calls).toHaveLength(2)
     expect(s1).toEqual(s2)
   })
+
+  it('2b 轻量累计钩子：成功批次跨轮累加 cumulative（runs/裁决/跳过）；仅成功路径计数', async () => {
+    const { older, newer } = duplicatePair()
+    // 用 none（非变更）裁决：两轮看到同一对、各 1 条裁决入 skipped——累计可线性断言
+    // （若用 merge，首轮归档旧者后次轮无对可判，decisions 不递增，不便断言）。
+    const { reflector } = makeReflector(
+      [older, newer],
+      '{"decisions":[{"focusId":"older01","peerId":"newer01","action":"none","reason":"x"}]}',
+    )
+    const route = { provider: 'deepseek', model: 'm' }
+    await reflector.runOnce(route, { force: true })
+    expect(reflector.cumulativeSummary).toEqual({ runs: 1, decisions: 1, merged: 0, archived: 0, skipped: 1 })
+    // 次轮（force 无视门控）：累计继续增长（"反思是否在收敛"可观测）
+    await reflector.runOnce(route, { force: true })
+    expect(reflector.cumulativeSummary).toEqual({ runs: 2, decisions: 2, merged: 0, archived: 0, skipped: 2 })
+  })
 })
 
 describe('反思审计详情与观测（A′ 建议：动作需带依据引用、可审计可回滚）', () => {

@@ -214,6 +214,9 @@ describe('memory_note', () => {
       fakeExec() as never,
     )) as { id: string; merged: boolean }
     expect(result.merged).toBe(false)
+    // Q5 修复：非合并时返回对象**不含** mergedWithId 键（宿主 dsh-tools 对工具 output
+    // 做 lossless-JSON 校验，undefined 属性值会整体拒绝 → 记忆已入库但工具误报失败）
+    expect('mergedWithId' in result).toBe(false)
     const entry = store.getById(result.id)
     expect(entry?.kind).toBe('preference')
     expect(entry?.source.sessionId).toBe('s1')

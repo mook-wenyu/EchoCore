@@ -70,12 +70,29 @@ export interface ReflectionSummary {
   skipped: number
 }
 
-/** 一条反思裁决 */
+/** 一轮反思裁决 */
 export interface ReflectionDecision {
   focusId: string
   peerId: string
   action: 'merge' | 'archive' | 'none'
   reason: string
+}
+
+/**
+ * 反思累计观测量（Q4/2b 拍板 2026-08-17：轻量质量钩子——跨轮累计，度量"反思是否
+ * 在收敛"：如 archived/merged 逐轮递减 → 近似重复与矛盾已清完；skipped 持续偏高 →
+ * 候选对噪声大。进程内态（重启归零），经 memory_status/RPC status 透出。
+ * 显式边界：不做"被反思归档条目的后续被 supersede 追踪"——被反思归档（archive）
+ * 的条目不参与 supersede 语义，跨链路追踪超出轻量范畴（可观测底座先立，深度
+ * 归因留给 F3 建议的探测集评估立项下轮）。
+ */
+export interface ReflectionCumulative {
+  /** 已成功执行批次（含空批次；失败批次不计入） */
+  runs: number
+  decisions: number
+  merged: number
+  archived: number
+  skipped: number
 }
 
 /** 反思系统提示词（只判定近似重复/矛盾，禁止其它动作） */
@@ -249,6 +266,8 @@ export class MemoryReflector {
   private lastRoute: { provider: string; model: string } | undefined
   /** 最近一次成功执行的观察量（memory_status/RPC status 透出；未运行 null） */
   private lastSummaryValue: ReflectionSummary | null = null
+  /** 2b：跨轮累计观测量（轻量质量钩子，见 ReflectionCumulative 说明；进程内态） */
+  private cumulativeValue: ReflectionCumulative = { runs: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 }
 
   constructor(deps: ReflectionDeps) {
     this.deps = deps
@@ -262,6 +281,11 @@ export class MemoryReflector {
   /** 最近一次成功执行的观察量（审/决/合并/归档/跳过；未运行 null） */
   get lastSummary(): ReflectionSummary | null {
     return this.lastSummaryValue
+  }
+
+  /** 2b：跨轮累计观测量（透出用；重启归零） */
+  get cumulativeSummary(): ReflectionCumulative {
+    return this.cumulativeValue
   }
 
   /**
@@ -300,6 +324,12 @@ export class MemoryReflector {
         this.lastRunAtMs = this.deps.now()
         this.lastRoute = resolved
         this.lastSummaryValue = summary
+        // 2b：仅成功路径累加累计观测量（失败批不计入，防噪声）
+        this.cumulativeValue.runs++
+        this.cumulativeValue.decisions += summary.decisions
+        this.cumulativeValue.merged += summary.merged
+        this.cumulativeValue.archived += summary.archived
+        this.cumulativeValue.skipped += summary.skipped
         return summary
       } catch (error) {
         this.deps.logger.warn('[dsh-memory] 反思批次执行失败：', error)
