@@ -53,3 +53,13 @@ jobs:
       #    Stmts93.9/Branch90.8/Funcs94 各留 ~10pt 余量，防 CI 红）。
       - name: 覆盖率门槛
         run: pnpm --filter @echocore/dsh-memory test:coverage
+
+      # 8. 文档校验 —— docs-as-code（2026-08-18）：断链 + 中英标题一致性/语言条
+      #    （scripts/check-docs.mjs，零依赖；相对 .md 链接断链即失败、zh 漏翻整节即失败）。
+      - name: 文档断链与中英一致性
+        run: node scripts/check-docs.mjs
+
+      # 9. markdownlint（markdownlint-cli2，根 devDep；配置 .markdownlint-cli2.jsonc——
+      #    关 MD013/024/033/034/036/040/041/060 噪声规则，其余结构规则强制）。
+      - name: markdownlint
+        run: pnpm exec markdownlint-cli2

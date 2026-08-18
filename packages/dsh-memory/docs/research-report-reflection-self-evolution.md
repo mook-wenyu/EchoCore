@@ -46,6 +46,7 @@ HippoRAG / HippoRAG 2（NeurIPS'24）核心是 **知识图谱 + Personalized Pag
 ## 2. 选择哪些条目给 LLM 审（子集 vs 全量）
 
 ### 结论
+
 **子集审是行业/学术主流，且有效率与成本双重动机；但「按 importance/recency 选子集」相对「全量审」没有一份把两者直接对比、证明子集更优的受控论文 —— 这是工程共识，不是基准实证。** 没有找到「全量审反而更好」的证据。
 
 ### 支持的证据
@@ -67,6 +68,7 @@ HippoRAG / HippoRAG 2（NeurIPS'24）核心是 **知识图谱 + Personalized Pag
   - 级别：**【实证/综述共识】**
 
 ### 未找到直接证据
+
 - **没有找到**「按 importance/recency 打分选子集 vs 全量审」在一份受控实验里直接对比、并量化证明「子集更优且不漏」的论文。业界普遍这么做的理由主要是**成本（全量 LLM 审在百万级条目上不可行）与噪声控制（低 importance/旧条目不该占评审预算）**，属于工程共识。
 - 因此：dsh-memory 的「≤200 条/次 + 只审子集」方向与业界一致，但**建议在落地时把「选子集规则」做成可配置、可测**，并承认它是工程权衡而非被验证的最优解。
 
@@ -115,6 +117,7 @@ HippoRAG / HippoRAG 2（NeurIPS'24）核心是 **知识图谱 + Personalized Pag
 ## 4. 重要性重打分（LLM 重打分 importance 是否有效/有反噬）
 
 ### 结论
+
 **没有找到「LLM 重打分 importance 显著提升检索/记忆质量」的受控实证；反向证据（模型把自身已有选择/记忆当偏置来源）较充分。** 因此把「LLM 改 importance」当作核心功能要有警惕，倾向用**累积/多方信号**而非单次 LLM 主观分。
 
 ### 证据
@@ -190,6 +193,7 @@ HippoRAG / HippoRAG 2（NeurIPS'24）核心是 **知识图谱 + Personalized Pag
 ---
 
 ### 附：检索过程与来源可信度说明
+
 - 检索工具：本次使用 `web_search`（系统内置）、`mcp__exa__web_fetch_exa`、`mcp__tavily__tavily_search` / `tavily_extract`，并在可用时抓取页面正文核对，而非只凭搜索摘要。
 - 直接抓到正文并核对的关键来源：mem0 官方 README、Zep/Graphiti 论文 §2.2.3、ExpeL ar5iv 全文、Evo-Memory ar5iv 全文、Manufactured Confidence ar5iv 全文、EDV GitHub、AAAI Choice-Supportive Bias 页面、Recalling Too Well ar5iv。
 - 未验证正文（仅据标题/摘要/搜索命中，已在文中标注）：Memory Reward Inflation（2608.00017）、Even the SOTA Memory System Struggles（2605.18565）、SkillRevise（部分）、agent-evolution-kit（部分）。

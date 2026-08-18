@@ -45,8 +45,8 @@ insert:
 
 > 部署机制（已实测）：插件经 **patch 层**加载（非 `dsh.bundle`）——**改配置/补丁**由宿主
 > `cordis-plugin-hmr` 热重载**免重启**；**改源码**需 `pnpm --filter @echocore/dsh-memory build`
-> + 刷新 profile 的 `.pnpm` store 副本（或 `dsh plugin --profile <name> add @echocore/dsh-memory`）
-> + 一次 patch 触碰或重启。profile 的 pnpm 供应链 `minimumReleaseAge` 策略会拒绝**新近发布**
+> 后刷新 profile 的 `.pnpm` store 副本（或 `dsh plugin --profile <name> add @echocore/dsh-memory`），
+> 再经一次 patch 触碰或重启生效。profile 的 pnpm 供应链 `minimumReleaseAge` 策略会拒绝**新近发布**
 > 的包（`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`）——详见包内 README / 生产验证报告。
 
 本地模型（可选语义检索，hf-mirror 国内可达）：

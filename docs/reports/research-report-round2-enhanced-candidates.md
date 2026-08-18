@@ -10,6 +10,7 @@
 **结论：值得做，但别上「学习权重」——做轻量多因子融合 + 累积/访问反馈强化，收益明确。** 单次 LLM 打分被多条独立来源证明既不可靠（随模型版本漂移）又贵（每次写多一次调用）。
 
 **来源：**
+
 - arXiv:2606.12945（Learn What to Remember）——学习多因子 0.770 ±0.011 vs 均匀权重 0.657 vs 最优单因子 0.518 vs recency-only 0.368（盲区 479 例，bootstrap 95% CI）。https://arxiv.org/html/2606.12945v1
 - Hindsight《The Consolidation Problem》——明确批评 Generative Agents 式 LLM 单次 1-10 打分「ratings drift across model versions」「adds a model call per write，高吞吐下贵」。https://hindsight.vectorize.io/blog/2026/05/21/agent-memory-consolidation
 - mem0《Memory eviction and forgetting》——纯访问频率（LRU）代理「breaks for low-frequency, high-stakes data」（低频高价值事实如过敏史会被剪掉），主张多信号融合而非任一单信号。https://mem0.ai/blog/memory-eviction-and-forgetting-in-ai-agents
@@ -24,6 +25,7 @@
 **结论：值得做——但度量的不是「反思后是否更准」，而是「不劣化 + 矛盾率/过时率下降」。** 关键事实：**consolidation/dedup 没有公开标准基准**（Mnemoverse 评测表明确标注 "Consolidation / dedup — no standard public benchmark"）。
 
 **来源：**
+
 - Mnemoverse《How to Evaluate AI Agent Memory》——明确 consolidation/dedup 用「contradiction rate + staleness」度量（无标准基准），并给出 recall@k / precision@k 定义。https://mnemoverse.com/docs/research/evaluation/evaluating-agent-memory
 - PrecisionMemBench（tenurehq）——专门测 retrieval precision / noise isolation（drift）/ belief mutability，且实测「多数系统 recall 高但 precision 仅 0.05-0.09」——高 recall 不等于精确检索。https://github.com/tenurehq/precisionmembench
 - arXiv:2605.15384（SEQMEM-EVAL）——**最重要方法论警告**：单分聚合指标（最终正确率）会掩盖遗忘与负迁移，「higher final accuracy ≠ better memory」；应测 online utility / hold-out generalization / backward transfer / forgetting。https://arxiv.org/html/2605.15384
@@ -39,6 +41,7 @@
 **结论：值得做，且是四者中权威证据最「直接命中」的一个——但要做的是「因果边建边时加置信/来源校验」，不是建完整 RAG 因果图。** CausalRAG2 的消融直接证明「门/边的精度决定检索质量」。
 
 **来源：**
+
 - arXiv:2602.05143（CausalRAG2, ICML 2026）——表 6 消融：Causal 门 F1 31.62，但 **FP+25%（掺 25% 随机假因果门）F1 掉到 27.87**，FN-25% 掉到 28.60；结论「retrieval quality scales with the precision of the gates」。专家双盲验证因果门 95.5% 有效（92% 一致率）。https://arxiv.org/html/2602.05143v2
 - 同上附录 H.2——因果判定稳定性依赖模型容量：Qwen3-4B Jaccard 0.96、GPT-oss-120B 0.85、Llama-3.2-3B 只有 **0.53**。→ 小模型做因果校验不可靠，需大模型或降级策略。
 - arXiv:2503.19878（CausalRAG 原版）——识别因果路径时多一次 LLM 若、LLM 内部知识在医学/法律等专用域会不够。https://arxiv.org/html/2503.19878v3
@@ -54,6 +57,7 @@
 **结论：建议改——dsh-memory 当前「关键词独立召回路径 + RRF 双榜融合」与 2026 主流（mem0 v3）「BM25 仅作 boost、只提升排序不加候选」直接冲突，而主流是被 +20/+26 benchmark 点验证的。** 但需权衡：dsh-memory 的 IDF 关键词路径有「纯语义抓不到的精确词/专名召回」价值，改成纯 boost 会损失这一召回能力——所以正确做法是「保留关键词候选能力，但把权重/排名逻辑从平行双榜改为带增益的融合」。
 
 **来源：**
+
 - mem0 v3 官方迁移文档（权威，一手）——原话：「**BM25 is a boost signal, not a recall expander.** Only semantic search results are candidates: BM25 and entity scores boost ranking but don't add new candidates.」https://docs.mem0.ai/migration/oss-v2-to-v3
 - mem0 PR #4805——v3 实现：hybrid = (semantic + bm25 + entity_boost)/max_possible，additive scoring；LoCoMo 71.4→91.6、LongMemEval 67.8→93.4。https://github.com/mem0ai/mem0/pull/4805
 - Supermemory 混合检索指南——数据：dense-only recall@10 78%、BM25-only 65%、hybrid+RRF 91%；BM25 强在精确标识符（SKU/错误码/专名）。https://supermemory.ai/blog/hybrid-search-guide
@@ -74,6 +78,7 @@
 | 4. BM25-as-boost vs 独立召回 | ★★★★（mem0 v3 一手「boost not recall expander」+20/+26 vs 混合文献「关键词独立召回在精确词场景有价值」）| 低-中（保留关键词候选，加 threshold 下限；或加 additive 开关 A/B）| 中：当前 RRF 双榜并非错误，但可吸收 mem0 的噪声控制教训 | **改（保守）**：保留关键词独立召回，加噪声阈值；不当成 recall 展开器去重复召回 |
 
 ### 未找到权威来源 / 存疑点
+
 - 「学习权重的 importance 累积」除单篇 Learn What to Remember 外**未找到工程复现**（mem0/LangMem 均用硬编码加权而非学习权重）——学习权重路径证据孤立，不推荐在插件里做。
 - 反思的「consolidation_quality /10」分数（remem）是启发式自评，无外部标准，只作内部回归基线，不可作绝对质量度量。
 - CS-RAG ~68% 三元组正确率这个具体数字本轮未在我检索到的正文里直接核到（多为二手引用）——标注**未核实的二手数字**；但 CausalRAG2 的 95.5% 与 FP 消融是本轮直接抓到的正文数据，可作替代依据。

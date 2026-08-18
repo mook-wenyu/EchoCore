@@ -22,6 +22,7 @@
 - **F3 证据报告** 落盘 `docs/reports/research-report-round2-enhanced-candidates.md`（Q7 候选预研素材）。
 
 **三/四轮（自学习 + 生产验证，2026-08-18）**：
+
 - **C17-C19（生产验证/部署）**：只读生产审计报告 `docs/reports/production-validation-report-2026-08-18.md`——部署落后仓库 14 提交（缺 `a021648` 至 `b8f77e0`，Q5 缺陷与旧版无条件 384 顶班在产仍存活）、语义向量仅 9% 覆盖、因果 0 产出；用户授权「不停 dsh 停盘部署」①（build lib → 离线直拷 profile store，C19 完成，盘上已为最新，运行进程旧码待重启生效）。
 - **C25-C26（文档架构重构，2026-08-18）**：按 Diátaxis 全文档重构——新增 `docs/README.md`（文档地图）、`docs/DEPLOYMENT.md`、`docs/DEVELOPMENT.md`；两份报告移入 `docs/reports/`；包 README 瘦身为 Reference（部署/运维/开发移至 How-to 指针）；根 README（EN/zh）修复 `docs/` 断链并指向文档地图。
 - **C20/S1（自我学习契约锁线）**：`test/self-learning-contract.test.ts` 锁死三条红线（Echo-Gap 不在检索/保留使用证据改写 stored importance、supersede/archive 不物理删、检索命中→保留提升链路）——均为既有正确行为的可复现断言。

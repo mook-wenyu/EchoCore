@@ -41,7 +41,9 @@
 ## 三、关键异常（决定性取证）
 
 ### ① 部署的是陈旧构建（落后 14 个提交，且最严重历史缺陷在产仍存活）
+
 部署 `lib/*.js` 时间戳 2026-08-17 20:41（实际 8/17 23:33 拷贝入 store）；对照标记检索（子代理 + 主代理 grep 双重确认）：
+
 - ❌ 无 `runtimeDegraded` / `embeddingDegradedReason`（WP1 跨维降级观测面）
 - ❌ 无 `dropOtherDimensionTables` / 迁移维度校验（Q2）
 - ❌ 无 `migrateAll`（Q4 迁移单事务）
@@ -52,7 +54,9 @@
 结论：**生产代码比仓库落后 14 个提交**（`a021648` 及 8/18 全部）；485 测试验证的最新修复在产**均未生效**。当前 DB 仅有 2560 表（未触顶班），但**旧版错误的降级逻辑就位，随时可能在远程抖动时触发**。
 
 ### ② 语义向量索引近乎冻结（覆盖 ~9% 老条目）
+
 只读审计 `vec_memory_2560_rowids`（704 向量，全 active）：
+
 - 按 rowid 分桶：`[1-500] vec=464 / [501-1000] vec=240 / [1001-7318] vec=0`
 - 向量创建时间全落在 **2026-08-15 04:11 ~ 08:16**（库首日的约 4 小时内）
 - 其后 6600+ 条（含最近三日全部新记忆）**零向量**；向量计数在验证期间略增长（646→704），说明宿主仅在极低速补少量。
@@ -60,16 +64,19 @@
 影响：RRF 语义榜实际上只能命中首日 ~750 条的极小子集；**最近记忆的召回完全依赖关键词榜**——语义增强检索在生产等于虚设。
 
 ### ③ 反思/因果/维护产出≈0
+
 - `memory_causal_edges` = 0 行（因果建边零产出）
 - archived 仅 3（反思/矛盾归档未发生；可能与陈旧构建+未触发 LLM 反思有关，或从未显式运行 memory_reflect）
 
 ### ④ 嵌入密钥来源（重启易失）
+
 - `.credentials.yaml` 仅含 `OPENCODE_GO_API_KEY`/`TEAMOROUTER_API_KEY`；`~/.dsh/.env`、主目录 `.env`、profile `.env` 均不存在。
 - 宿主 `bin.js:134 loadLayeredEnv('dsh')` 从【继承 env → 项目/`~/.dsh` `.env`】注入；插件 `embedding.js:59 process.env[name]` 解析。
 - 运行期实证：DB 已建 `vec_memory_2560` → 远程 2560 已生效 = 密钥**已从宿主 shell 继承环境解析可用**（面板亦显示“已解析可用”）。
 - ⚠️ **重启若不带 `BAILIAN_API_KEY` export，嵌入将静默失效**（无 .env/.credentials 兜底）。
 
 ## 四、输入侧确认
+
 - `~/.dsh/settings.yaml` memory 段与面板一致；`embeddingDimension: 2560` 符合 schema（`z.number().min(1)` → 合法）。
 - 嵌入密钥 `env:BAILIAN_API_KEY` 在宿主侧**已解析可用**（面板断言）；本地 shell 的 `$env:BAILIAN_API_KEY` 为空属正常（密钥由宿主进程注入，非我的 shell 环境）——已交由宿主子代理进一步核实注入链。
 
@@ -83,6 +90,7 @@
 6. **【中】向量覆盖监控**：status 增加“向量覆盖/总数”观测（当前 9%），避免“ready 但语义虚设”再次静默。
 
 ## 六、证据清单
+
 - 宿主：`Get-Process`（PID 22644 `@deepseek-ai/dsh/lib/bin.js web`）+ `Get-CimInstance` 命令行
 - 配置：`~/.dsh/settings.yaml` memory 段；面板配置区读数（baseURL/model/2560/“已解析可用”）
 - 部署包：`profiles/web/node_modules/@echocore/dsh-memory/lib/*.js` 时间戳 + 标记 grep（子代理 + 主代理双重确认 14 提交缺失）
@@ -91,12 +99,14 @@
 - 宿主侧：PID 存活 + WAL 8/18 12:42 持续写（插件加载活跃证明）；`.credentials.yaml` 字段名（无 BAILIAN）；`bin.js:134 loadLayeredEnv` 注入链
 
 ## 七、权威实践对照（网络第二轮子代理，仅列已核实项）
+
 - **生产 SQLite 只读健康检查**（sqlite.org/pragma.html 已核实）：`PRAGMA integrity_check` / `quick_check`（生产高频用）/ `foreign_key_check`、`cell_size_check=ON` 均只读；`PRAGMA wal_checkpoint(PASSIVE)` 非阻塞、适合运行中库。→ 建议定期跑 quick_check 纳入运维。
 - **向量索引一致性**（sqlite-vec 官方 + issues #54/#269/#243）：维度在 CREATE 时固定、写入维度不符即报错；DELETE 仅把 validity 位置零、shadow 表残留“孤儿”行；无内置 optimize → 主表行数 vs vec0 行数需运维对账、缺失向量重建。→ 印证本报告语义索引补齐/对账为运维必需。
 - **嵌入维度一致性**（QwenLM/qwen3-embedding）：输出维度随模型/配置固定（0.6B=1024、4B=2560，支持 MRL）；声明维度与 endpoint 实际返回不一致则写入必失败。→ 生产 2560 与 4B 模型匹配，且已实证写入 704 条成功。sqlite-rembed 模式（OpenAI 兼容 `/v1/embeddings` + env key）与本插件架构一致。
 - **本地热更闭环**（pnpm.io/cli/link、pack）：dev 用 `pnpm link`（即时生效）、稳定分发用 `pnpm pack` → 目标 node_modules 安装 tarball。→ 附录 A 采用 pack/重装路径。
 
 ## 八、附录 A：热更生产到最新代码的精确步骤（用户拍板：不自动热更，仅提供步骤）
+>
 > 前提与警示：① 重启会中断所有运行中会话（含其它项目会话）；② 重启 shell **必须已 export `BAILIAN_API_KEY`**（否则嵌入静默失效，无 .env/credentials 兜底）；③ 重启后新构建会于首启自动补齐缺失向量（一次性成本见 §五-2）。
 
 1. **备份**（可选，稳妥）：复制 `~/.dsh/storages/memory.sqlite`、`memory.sqlite-wal`、`memory.sqlite-shm` 到备份目录。
@@ -109,6 +119,7 @@
    - （可选）`PRAGMA quick_check`；手动 `memory_reflect` 后复查 `memory_causal_edges` 是否有行。
 
 ### 附录 A.1 部署执行记录（2026-08-18 13:05，用户授权「不停 dsh，帮我部署」）
+
 - 已完成：仓库重建 `pnpm --filter @echocore/dsh-memory build`（lib 13:04:42）→ 将 23 个 lib 文件**直接覆盖**到 profile 链接指向的 pnpm store 包目录 `~/.dsh/profiles/web/node_modules/.pnpm/@echocore+dsh-memory@file+D_74875032194c9337fdfaa35b753fddb3/node_modules/@echocore/dsh-memory/lib`。
 - 验证：部署 lib 已含全部修复标记（`runtimeDegraded`/`dropOtherDimensionTables`/`migrateAll`/`reflectionCumulative`/`effectiveImportance`/lossless 安全省略键）；**Q5 旧缺陷（`mergedWithId: … : undefined`）已消失**。
 - 诚实边界：**运行中进程（PID 22644）不受影响、仍用旧码**（Node 模块内存缓存、宿主无插件热载机制——已查证）；**新码下一次重启生效**。
@@ -116,7 +127,7 @@
 - 重启须知（下次方便时）：在已 export `BAILIAN_API_KEY` 的 shell 重启 `dsh web`；重启后首启 `ensureAll` 会自动补齐缺失语义向量（约 6600 条 × 2560 维，一次性成本，见 §五-2）。
 
 ### 附录 A.2 部署状态增补（2026-08-18 16:40 · host 重启 + W2 热生效）
+
 - **宿主已于 2026-08-18 16:29:56 重启为新 PID 24868**（C19 停盘修复随之在产生效；此时加载路径为 C19 版 lib，含 WP1 起全部修复但无 W2）。
 - 随后：工作区重建为含 **W2 selfRelevance** 的 lib（3 参 `effectiveImportance`）→ 覆盖拷贝至当前 store 条目（`@echocore+dsh-memory@file+D_92661a...`；旧 D_748 条目已被先前的 pnpm add 尝试替换）→ 经**宿主原生 patch 层 HMR**（`cordis-plugin-hmr`：清 ESM/CJS 模块缓存后重导入；仅触碰 `cordis.patch.yml` memory 条目加零语义注释）触发热重载 → **新 PID 存活、无 fatal、YAML 解析完好（mem_item={'id':'memory','name':'@echocore/dsh-memory'}）**。机制上 W2 已热生效（免重启）；**行为级确认**＝下次真实提取后 `memory_detail` 出现 `selfRelevance`。
 - **`dsh plugin --profile web add @echocore/dsh-memory` 两度失败**：① network（registry 对 `@deepseek-ai/dsh-*` 解析 `UND_ERR_DESTROYED`）；② 供应链接策略（`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`：`dshmarket@1.12.2` 发布于 08-18 07:10，晚于策略截止 08-17 08:41）。dsh-memory 非 bundle 层，add 仅作 file: 重装的规范化（C19+C21 直拷已达成同等效果）；**修复路径（用户择时）**：`pnpm clean --lockfile && pnpm install`（需先等 minimumReleaseAge 截止或按需放宽该供应链策略——属安全面决策，由用户定夺）。
-

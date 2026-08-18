@@ -86,6 +86,7 @@ enable 开关）已固化为各模块内代码常量——依据 12-Factor（仅
 
 **向量存储 = SQLite vec0 虚拟表**（2026-08-17 用户拍板 `@photostructure/sqlite-vec`
 生产 fork；与条目存储同一 memory.sqlite，表名 `vec_memory_<dim>` 按维度隔离）：
+
 - 向量 float32 二进制（X'hex'）驻库——2560 维 × 6500 条 ≈ **64MB**（原 JSON
   数字数组文本 ≈ 317MB，10s 去抖整写/启动全量解析/内存 number[] 膨胀）；
 - 检索 = SQL KNN（`embedding MATCH … AND k = …`，C+SIMD brute-force，cosine
@@ -183,6 +184,7 @@ HMR 机制、供应链 `minimumReleaseAge` 阻断与修复、`nodeLinker: isolat
 SQLite WAL 备份脚本、`memory.json` 迁移语义、`BAILIAN_API_KEY` 重启须带 export。
 
 集成约束要点（全量见 docs/DEPLOYMENT.md §7）：
+
 1. profile pnpm `nodeLinker` 保持 **`isolated`**（`hoisted` 造成 `@deepseek-ai/*` 双实例、`Symbol` 分裂、全工具崩溃）；
 2. 直接访问的服务必须全部声明在 `inject`（宿主 `['llm','tools','connection','systemPrompt']`、客户端 `['slots','connection']`）；
 3. `standingKeyFor` 只校验组合激活，不校验运行期服务守卫——挂载后必须真机启动验证；
@@ -197,6 +199,7 @@ SQLite WAL 备份脚本、`memory.json` 迁移语义、`BAILIAN_API_KEY` 重启�
 详见 **[docs/DEVELOPMENT.md](../../docs/DEVELOPMENT.md)**：命令（typecheck/test/test:coverage/build）、
 质量门（覆盖率阈值/CI）、目录结构、TDD 与提交纪律、lossless-JSON 契约、docs-as-code 约定。
 测试规模：`test/` **26 文件 497 例**（含自学习契约锁线）。
+
 ## 检索与衰减（B1/B2，2026 记忆最佳实践）
 
 - **混合检索 = RRF 排名融合**（B1）：语义嵌入启用时，关键词 relevance 榜与语义
