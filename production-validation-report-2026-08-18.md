@@ -115,3 +115,8 @@
 - 备选路径说明：`pnpm update @echocore/dsh-memory` 因 registry 网络抖动（解析其它 `@deepseek-ai/*` 依赖失败）未成，改用离线直拷；因 profile 依赖为 `file:D:/TSProjects/EchoCore/packages/dsh-memory` 且源包 `lib` 已重建，**将来任何成功的 `pnpm install` 会从新源重新打包，保持一致**。
 - 重启须知（下次方便时）：在已 export `BAILIAN_API_KEY` 的 shell 重启 `dsh web`；重启后首启 `ensureAll` 会自动补齐缺失语义向量（约 6600 条 × 2560 维，一次性成本，见 §五-2）。
 
+### 附录 A.2 部署状态增补（2026-08-18 16:40 · host 重启 + W2 热生效）
+- **宿主已于 2026-08-18 16:29:56 重启为新 PID 24868**（C19 停盘修复随之在产生效；此时加载路径为 C19 版 lib，含 WP1 起全部修复但无 W2）。
+- 随后：工作区重建为含 **W2 selfRelevance** 的 lib（3 参 `effectiveImportance`）→ 覆盖拷贝至当前 store 条目（`@echocore+dsh-memory@file+D_92661a...`；旧 D_748 条目已被先前的 pnpm add 尝试替换）→ 经**宿主原生 patch 层 HMR**（`cordis-plugin-hmr`：清 ESM/CJS 模块缓存后重导入；仅触碰 `cordis.patch.yml` memory 条目加零语义注释）触发热重载 → **新 PID 存活、无 fatal、YAML 解析完好（mem_item={'id':'memory','name':'@echocore/dsh-memory'}）**。机制上 W2 已热生效（免重启）；**行为级确认**＝下次真实提取后 `memory_detail` 出现 `selfRelevance`。
+- **`dsh plugin --profile web add @echocore/dsh-memory` 两度失败**：① network（registry 对 `@deepseek-ai/dsh-*` 解析 `UND_ERR_DESTROYED`）；② 供应链接策略（`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`：`dshmarket@1.12.2` 发布于 08-18 07:10，晚于策略截止 08-17 08:41）。dsh-memory 非 bundle 层，add 仅作 file: 重装的规范化（C19+C21 直拷已达成同等效果）；**修复路径（用户择时）**：`pnpm clean --lockfile && pnpm install`（需先等 minimumReleaseAge 截止或按需放宽该供应链策略——属安全面决策，由用户定夺）。
+
