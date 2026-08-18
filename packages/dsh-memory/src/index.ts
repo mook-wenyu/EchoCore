@@ -327,8 +327,16 @@ export async function mountMemory(
   // 规则任务后按各自周期门控自动执行；工具/RPC 可 force 手动触发。
   const reflector = new MemoryReflector({ store, llm: ctx.llm, logger, now: () => Date.now() })
   const causalExtractor = new MemoryCausalExtractor({ store, causal: causalStore, llm: ctx.llm, logger, now: () => Date.now() })
-  // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）
-  const maintenance = new MemoryMaintenance({ store, logger, now: () => Date.now(), reflector, causal: causalExtractor })
+  // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）；
+  // C33：每周期顺带向量增量补齐（分片限速；holder.index 调用时求值——热换后新索引即生效）
+  const maintenance = new MemoryMaintenance({
+    store,
+    logger: { warn: (...args) => logger.warn(...args), info: (...args) => logger.info(...args) },
+    now: () => Date.now(),
+    reflector,
+    causal: causalExtractor,
+    backfill: (budget) => holder.index?.backfill(budget) ?? Promise.resolve(0),
+  })
   maintenance.install(ctx)
 
   // O1：运行健康指标组装（写链失败/嵌入状态/上次维护/反思因果——tools status 与 RPC status 共用）

@@ -10,7 +10,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { MAINTENANCE_INTERVAL_MS, MemoryMaintenance } from '../src/maintenance.js'
+import { BACKFILL_BUDGET, MAINTENANCE_INTERVAL_MS, MemoryMaintenance } from '../src/maintenance.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
@@ -487,6 +487,29 @@ describe('MemoryMaintenance LLM 子任务接线（反思/因果）', () => {
     await maintenance.runOnce()
     // 规则任务后按序调用：反思 → 因果；路由来自会话 request/header
     expect(calls).toEqual(['reflect:deepseek/m', 'causal:deepseek/m'])
+  })
+
+  it('C33：注入 backfill 后 runOnce 调用一次且预算恒为 BACKFILL_BUDGET', async () => {
+    const calls: string[] = []
+    const backfill = async (budget: number) => {
+      calls.push(`backfill:${budget}`)
+      return 0
+    }
+    const ctx = new FakeCtx()
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => NOW)
+    const maintenance = new MemoryMaintenance({
+      store,
+      logger: { warn: () => {}, info: () => {} },
+      now: () => NOW,
+      backfill,
+    })
+    maintenance.install(ctx as unknown as Context)
+    const sessionEvent = ctx.listener('session/event') as (session: Session, event: SessionEvent) => void
+    activate(sessionEvent, makeSession('s1'))
+    await maintenance.runOnce()
+    // 每维护周期补一档（限速防限流）；常量必须导出且唯一
+    expect(calls).toEqual([`backfill:${BACKFILL_BUDGET}`])
   })
 
   it('子任务抛错不打断批次：warn 后继续执行其余子任务，批次完成记录照常更新', async () => {

@@ -712,6 +712,33 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     db.close()
   })
 
+  it('backfill(budget) 只补预算内缺失并返回处理数；再次调用续补剩余', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const entries = Array.from({ length: 10 }, (_, i) => ({ id: `b-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+    const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => entries, logWarn: () => {} })
+    const first = await index.backfill(4)
+    expect(first).toBe(4)
+    expect(index.knn(queryVec(3), 400)).toHaveLength(4)
+    const second = await index.backfill(4)
+    expect(second).toBe(4)
+    expect(index.knn(queryVec(3), 400)).toHaveLength(8)
+    const third = await index.backfill(4)
+    expect(third).toBe(2) // 剩 2 条
+    expect(index.knn(queryVec(3), 400)).toHaveLength(10)
+    db.close()
+  })
+
+  it('backfill(0) 不处理；ensureAll 全量补齐不受预算限制', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const entries = Array.from({ length: 5 }, (_, i) => ({ id: `c-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+    const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => entries, logWarn: () => {} })
+    expect(await index.backfill(0)).toBe(0)
+    expect(index.knn(queryVec(3), 400)).toHaveLength(0)
+    await index.ensureAll()
+    expect(index.knn(queryVec(3), 400)).toHaveLength(5)
+    db.close()
+  })
+
   it('ensureAll 批次中途失败：logWarn 跳过继续，其余批次已入库', async () => {
     const db = new DatabaseSync(':memory:', { allowExtension: true })
     const warns: string[] = []

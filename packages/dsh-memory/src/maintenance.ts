@@ -39,6 +39,13 @@ import type { MemoryEntry } from './types.js'
 
 /** 每批处理的候选条目数预算（只处理最新前 N 条，控制单次负载；G2 由 20→200，对 3441 条规模更游刃有余） */
 const BATCH_BUDGET = 200
+
+/**
+ * C33（2026-08-18 拍板）：向量增量补齐每周期预算（条）。语义补齐是"持续分片"：
+ * 每维护周期只补一档，限速防启动/周期瞬间打满远程嵌入 API 触发限流；覆盖随周期
+ * 收敛（与启动时 ensureAll 全量路径并存——启动补一次、周期续补）。
+ */
+export const BACKFILL_BUDGET = 256
 /**
  * 候选拉取窗口（预算应用前的拉取量）。
  * G2 起与 BATCH_BUDGET 解耦：窗口放大到 1000，使「拉取后按预算 slice(0, BATCH_BUDGET)」
@@ -91,6 +98,8 @@ export interface MemoryMaintenanceDeps {
   reflector?: Subtask
   /** 因果抽取子任务（可选；注入则每批规则后按其自身周期门控执行，缺省不调 LLM） */
   causal?: Subtask
+  /** C33：语义向量增量补齐（可选；注入则每批规则后补 BACKFILL_BUDGET 条缺失——限速分片） */
+  backfill?: (budget: number) => Promise<number>
 }
 
 /** 最近一次活跃会话（供批处理的模型路由解析） */
@@ -221,6 +230,7 @@ export class MemoryMaintenance {
         await this.normalizeTags(window)
         // LLM 子任务（反思/因果抽取）：规则任务之后串行执行（各自带周期门控与自收容）。
         // 与规则任务同处 runOnce 成功路径——任一段失败仅告警不影响后续与批次完成记录。
+        await this.runSubtask('向量补齐', this.deps.backfill?.(BACKFILL_BUDGET))
         await this.runSubtask('反思', this.deps.reflector?.runOnce(route))
         await this.runSubtask('因果抽取', this.deps.causal?.runOnce(route))
         // O1：批次完成时刻记录（成功路径；失败由 catch 告警且不更新——可观测"上次成功维护"）

@@ -89,8 +89,8 @@ export class EmbeddingIndex {
   private readonly deleteStmt
   /** 全量已有 memory_id（ensureAll 差集） */
   private readonly listIdsStmt
-  /** 全量构建串行锁（并发 ensureAll 合并为一次） */
-  private building: Promise<void> | undefined
+  /** 全量构建串行锁（并发 ensureAll/backfill 合并为一次；Promise<unknown> 容纳两条路径的返回值） */
+  private building: Promise<unknown> | undefined
 
   constructor(private readonly deps: EmbeddingIndexDeps) {
     const { db, service } = deps
@@ -180,17 +180,34 @@ export class EmbeddingIndex {
     }
   }
 
-  /** 全量补齐缺失条目（128/批批量嵌入；失败批跳过——缺失保持关键词检索） */
+  /** 全量补齐缺失条目（128/批批量嵌入；失败批跳过——缺失保持关键词检索）。
+   * 语义 = backfill(∞)：一次性补完。与 backfill 共用 building 串行锁。 */
   ensureAll(): Promise<void> {
-    if (this.building !== undefined) return this.building
-    this.building = this.buildMissing()
+    return this.backfill(Number.POSITIVE_INFINITY).then(() => undefined)
+  }
+
+  /**
+   * 增量补齐（C33，2026-08-18 拍板）：一次性处理**至多 budget 条**缺失条目
+   * （128/批；失败批跳过——缺失保持纯关键词检索，显式语义），返回本批处理数。
+   * 维护周期内调用＝持续分片补齐（限速：每周期只补一档，避免启动瞬间打满远程
+   * API 触发限流；覆盖随周期收敛）。与 ensureAll 共用 building 串行锁——并发
+   * 调用合并为一次（并发方 await 后返回 0，由进行中的批次实际处理）。
+   */
+  backfill(budget: number): Promise<number> {
+    if (this.building !== undefined) {
+      // 并发合并：等待进行中的批次完成后返回 0（保守观测；实际由该批次处理）
+      return this.building.then(() => 0)
+    }
+    const run = this.buildMissing(budget)
       .catch((error: unknown) => {
-        this.deps.logWarn('[dsh-memory] 嵌入全量构建失败（缺失条目将保持纯关键词检索）：', error)
+        this.deps.logWarn('[dsh-memory] 嵌入补齐失败（缺失条目将保持纯关键词检索）：', error)
+        return 0
       })
       .finally(() => {
         this.building = undefined
       })
-    return this.building
+    this.building = run
+    return run
   }
 
   /** 旧 JSON 索引文件迁移（首启路径）：表非空（幂等守卫——重启/重复调用不
@@ -233,15 +250,19 @@ export class EmbeddingIndex {
     return migrated
   }
 
-  /** 全量补齐实现（详述见 ensureAll） */
-  private async buildMissing(): Promise<void> {
+  /** 全量补齐实现（limit 预算：≤limit 条后停止；∞=全量。返回实际处理数） */
+  private async buildMissing(limit = Number.POSITIVE_INFINITY): Promise<number> {
     const existing = new Set((this.listIdsStmt.all() as Array<{ [MID_COL]: string }>).map((row) => row[MID_COL]))
     const missing = this.deps.listAll().filter((entry) => !existing.has(entry.id))
-    if (missing.length === 0) return
+    if (missing.length === 0) return 0
+    let processed = 0
     const batch = this.deps.service.embedMany
     if (batch !== undefined) {
       for (let i = 0; i < missing.length; i += EMBED_BATCH_SIZE) {
-        const chunk = missing.slice(i, i + EMBED_BATCH_SIZE)
+        // 预算须在**批内**生效：批大小与剩余预算取 min（预算 < 批大小时不被整批越过）
+        const take = Math.min(EMBED_BATCH_SIZE, limit - processed)
+        if (take <= 0) break
+        const chunk = missing.slice(i, i + take)
         try {
           const vectors = await batch(chunk.map((entry) => entry.content))
           // 4c（Q7 拍板）：单批写包进一个 SQLite 事务——向量落库从"逐行自动提交"
@@ -255,25 +276,29 @@ export class EmbeddingIndex {
             this.deps.db.exec('ROLLBACK')
             throw error
           }
+          processed += chunk.length
         } catch (error) {
           // 批次失败显式记录并继续下一批——缺失条目保持纯关键词检索（显式语义）
           this.deps.logWarn(`[dsh-memory] 嵌入批次失败（${chunk.length} 条保持纯关键词检索）：`, error)
         }
       }
-      return
+      return processed
     }
     // 无批量能力（测试注入假后端）：逐条回退（整体包事务——中途失败整批回滚，
-    // 与批量路径的"批内全有或全无"一致）
+    // 与批量路径的"批内全有或全无"一致；同样受 limit 预算约束）
     this.deps.db.exec('BEGIN')
     try {
       for (const entry of missing) {
+        if (processed >= limit) break
         const vector = await this.deps.service.embed(entry.content)
         this.writeVector(entry.id, vector)
+        processed++
       }
       this.deps.db.exec('COMMIT')
     } catch (error) {
       this.deps.db.exec('ROLLBACK')
       throw error
     }
+    return processed
   }
 }
