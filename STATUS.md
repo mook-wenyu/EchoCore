@@ -1,48 +1,43 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-17（全面风险审查 + 六大优化工作包落地，用户拍板 Q1-Q7 全部推荐项）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-17（二轮复查 + 残余低危打包 + 证据重开决策，C9-C13 五项提交）。
 
 ## 一、架构健康度
 
-- 模块总数：22 源模块 + client 面板（本轮无新增模块；新增工程资产 `.github/workflows/ci.yml`）
-- 依赖方向：`index.ts`（组合根）→ 各模块，无环；`reflect/causal` 仅被 index/tools/maintenance（结构类型）引用；`settings` 仅被 index 引用。新增/变更依赖：无新增包；`@photostructure/sqlite-vec` 由 `^1.2.0` 锁精确 `1.2.0`（防 npm 解析漂移）
-- 单元测试 **472 个全绿**（25 文件，typecheck 干净；较上轮 441 +31）
-- INFRA：新增 CI workflow（push/PR → install --frozen-lockfile → typecheck → test）；迁移单事务化；坏 SQLite 逐行容错；真 SQLite 集成测试补入（node:sqlite :memory:）
-- 本轮实现均为 TDD（先写失败测试→实现→绿），每工作包独立提交（7 个 commit）
+- 模块总数：22 源模块 + client 面板（二轮无新增模块；工程资产：`.github/workflows/ci.yml`）
+- 依赖方向：`index.ts`（组合根）→ 各模块，无环。依赖变更：`@photostructure/sqlite-vec` 锁精确 `1.2.0`；新增 devDep `@vitest/coverage-v8@^3.2.7`（**必须匹配 vitest 3.2.x**——实测装 v4 报 `BaseCoverageProvider` 缺失，版本兼容一票否决）
+- 单元测试 **483 个全绿**（25 文件，typecheck 干净；上轮 472，本轮 +11）
+- **覆盖率基线（首度落地）**：Stmts 93.89% / Branch 90.83% / Funcs 94% / Lines 93.89%；`vitest.config.ts coverage.thresholds` 保守门槛 lines80/functions75/statements80/branches70（按基线留 ~10pt 余量防 CI 红）；`pnpm test:coverage` 已入 CI 步骤
+- 二轮实现均 TDD（先红后绿），每逻辑变更独立提交（C9-C13 五件）
 
-## 二、本次变更影响范围（全面风险审查 → 六大优化工作包）
+## 二、本次变更影响范围（二轮复查 → 拍板落地）
 
-**审查（8 并行子代理 + 2 网络调研 + 主代理交叉校验）**：P0 维度漂移/未处理拒绝、P1 迁移非事务/坏 SQLite 无降级/嵌入迁移无维度校验/字符预算失衡、P2 若干（重入互斥/窗口冗余/superseded 漏查/settings 状态漂移/EACCES 吞错/dead code/README 过时）。注入器键空间 agent.id/session.id 混用**经查 DSH 硬保证恒等（dsh-agent lib: 不匹配即 throw）→ 判为可读性改进非 bug**（诚实纠偏子代理高判）。
+**二轮审查（3 并行子代理取证 + 主代理复核）**：新代码深审（跨维降级/migrateAll/runOnce/settings 回滚等**验证无回归**；发现 memory_status 未透出嵌入新字段、DROP×holder 竞态、死代码 MIN_RELEVANCE_SCORE/EmbeddingFallbackLogger、注释漂移）；测试审计（覆盖率从未配置、onCreate `.catch` 零测试、ENOENT/EACCES 分支零测）；网络第二轮（importance 多因子实证 0.770 vs 0.518 改判、consolidation 度量、因果建边证据、BM25 噪声下限）。grilling 两轮 12 项拍板全部按推荐。
 
-- **WP1（Q1/A + Q2/A + Q6②③⑫，最高危）**：
-  - `embedding.ts`：**禁止跨维运行期降级**——运行期远程故障仅在本地维度==远程维度（384==384）时切本地顶班；跨维则**一次性显式降级** disabled + `runtimeDegraded`（可观测原因"已降级为关键词，需重新保存配置重建索引"），`backendLabel` 显示 `remote(运行期降级)`；消除"降级后索引维度错乱 → KNN 抛裸错 / onCreate 未处理拒绝 exit(1) 杀进程"（DSH installFailLoud 已实查）。
-  - `index.ts`：**onCreate 索引联动 catch**（与 onArchive/onSupersede 同收容形态，附效果失败不 kill 主链路）；经 `embeddingDegradedReason` runtime getter 透出状态；迁移语义修正——**全坏/全跳过不 rename .bak**（保留原文件可修复重试）。
-  - `embed-index.ts`：**loadLegacy 迁移按表维度校验**（错误维度向量跳过 + logWarn）；**dropOtherDimensionTables**（仅 DROP 纯维度表 `vec_memory_<digits>`，跳过 vec0 影子表 `_info/_rowid` 等——实测"may not be dropped"）。
-  - `host-rpc.ts`/`tools.ts`：status 透传 `embeddingDegradedReason`；setConfig **持久化成功/生效失败中间态显式化**（"已保存、重启后自动生效"，非静默"保存失败"）。
-- **WP4（Q4/A + Q6①）**：坏 SQLite 构造加载**逐行容错**（坏 value 行跳过 + `loadFailures` 计数 + warn，与坏 JSON D2 对称）；`migrateMemoryJson` **单事务化**（`migrateAll`：BEGIN→prepared upsert→COMMIT/ROLLBACK；cache 在 COMMIT 后一次性回填——中断保持空态可重试）。
-- **WP6a（Q6④⑤⑥⑦）**：maintenance/reflect/causal 三处 `runOnce` **重入互斥**（并发合并为同一 promise，防重复审计/重复 LLM）；`CANDIDATE_WINDOW` 解耦（1000 vs BATCH_BUDGET 200，预算真实生效）；`archiveStale`/`normalizeTags` 补查 `supersededBy`；`selectReflectionPairs` **peer 仅限同 workspace**（跨域不喂 LLM）。
-- **WP6b（Q6⑧⑩⑪）**：`applyConfigChange` 失败回滚 `active`（修复幂等门拦死自愈）；删除 `renderPack` 生产死代码；根 README 存储/备份描述修正。
-- **WP7 / WP5**：真 SQLite 集成测试补强 + `failNextWrite` 覆盖 create/put + 弱断言修正 + `listByImportance/tokenJaccard/formatMemoryLineCondensed` 覆盖补盲；CI workflow + sqlite-vec 锁精确版本。
-- **Q3/Q6⑨（补全）**：注入/快照预算注释**诚实化**（字符口径：中文 16384 字符≈16K token，不再写"≈4K token"误导）；`defaultHasLocalModel`/`loadLegacy` 区分 ENOENT（无模型/无迁移）与 EACCES 等（真实故障→上抛/告警，不静默掩盖）。
-- **Q7（defer）**：importance 累积投票、反思质量度量**本轮不做**，记录为后续 A/B 候选（缺多方复现证据，YAGNI）。
+- **C9（1a/1b/4c/测试补强）**：`migrateMemoryJson` readFile **ENOENT 与其他 IO 区分**（非 ENOENT 上抛，迁移不被静默跳过丢源）；`mountMemory` 加 `MountOverrides.exposeStore` test seam + **onCreate 集成测试**（create→索引联动失败→不崩、无未处理拒绝——堵住 F2 P0 缺口）；embed-index `ensureAll` **批次写包单事务**（批内全有或全无，中途写败整批回滚）；补测 defaultHasLocalModel/loadLegacy 的 ENOENT vs EACCES、reflect/causal **批次结束后可重开**（防 running 复位死锁）。
+- **C10（Q5 真实 bug + 2b + Q3）**：**Memory 工具输出含 `undefined` 属性值 → 宿主 lossless-JSON 校验整体拒绝**（`tools.ts:392` memory_note 未合并时 `mergedWithId: undefined`；`:565` memory_detail 未命中 `entry: undefined`）。**记忆实际已入库，仅输出回传被拦、工具误报失败**（会诱导重复写入）——改为安全省略键。`ReflectionCumulative`（runs/裁决/合并/归档/跳过跨轮累计，仅成功路径计数）经 memory_status/RPC status 透出（轻量质量钩子）；`memory_status` 补透出 `embeddingBackend/embeddingInitError/embeddingDegradedReason`（约定 `'json' required:true` 承载 null）——模型不再靠猜。
+- **C11（Q4 死代码/下限束）**：`MIN_RELEVANCE_SCORE=0.3` 从死常量**接线为关键词路径噪声下限**（rel<0.3 弱命中不入检索；语义单榜独立召回不受影响——两条独立门槛，修 0.3/0.15 注释漂移）；删除零引用死 type `EmbeddingFallbackLogger`；benchmark「稀有词权重」契约随之下拨（零重合条目在 minScore=0 下也不返回）。
+- **C12（Q6 覆盖率）**：装 `@vitest/coverage-v8@3.2.x` + vitest.config thresholds + `test:coverage` 脚本 + CI 覆盖率步骤（首度可量化防回归门）。
+- **C13（Q1 轻量融合）**：`effectiveImportance(importance, accessCount)`——存储 LLM 1-10 主因子 + 对数式访问频率证据（1 次=+1 / ≥3 次=+2，封顶 +2，不训学习权重）；仅作用于 `listByImportance`（快照/保留决策），**不动检索主路径**（search 评分仍用存储 importance + 半衰期访问调制，避免同一证据双重计入）。依据 arXiv:2606.12945 LexWisdom 0.770 vs 0.518。
+- **F3 证据报告** 落盘 `research-report-round2-enhanced-candidates.md`（Q7 候选预研素材）。
 
-**接口契约变更（本轮）**：`EmbeddingService` +`runtimeDegraded`/`degradedReason`/backendLabel `remote(运行期降级)`；`EmbeddingIndex` +`dropOtherDimensionTables()`、`parseJsonVec` 可选维度校验；`RuntimeHealth` +可选 `embeddingDegradedReason`；host-rpc status 透传该字段、setConfig 中间态错误文案；maintenance/reflect/causal `runOnce` 外层改非 async（并发返回同一 promise 身份）；maintenance `CANDIDATE_WINDOW=1000`（原 200）。
+**接口契约变更（二轮）**：`EmbeddingService` 删除 `EmbeddingFallbackLogger`；`scoring` +`effectiveImportance`；`MemoryReflector` +`cumulativeSummary`/`ReflectionCumulative`；`RuntimeHealth` +`reflectionCumulative`；`memory_status` 输出 +`embeddingBackend/InitError/DegradedReason/reflectionCumulative`；host-rpc status +`reflectionCumulative`；`MountOverrides` +`exposeStore`；store.search 关键词路径噪声下限（行为：零/弱关键词重合不经关键词路径返回）。
 
 ## 三、已知风险点（诚实自曝）
 
-1. **跨维运行期降级由"切本地"改为"显式降级关键词"**（Q1/A）：远程运行期故障且本地维度≠远程维度时，语义能力停用直到重新保存配置/重启——这是设计取舍（保索引维度一致、防检索抛裸错）；同维（384==384）仍可本地顶班。面板经 `embeddingDegradedReason` 可见。
-2. **onCreate 联动的集成级测试缺口**：index.test 用 ready+fail 嵌入覆盖 ensureAll 收容，未直接覆盖"store.create 触发 onCreate 失败"（mountMemory 无 store 句柄 seam）；闭包与 onArchive/onSupersede 同形态、typecheck 通过——已显式记录。
-3. **memory.json 迁移 readFile 仍吞 EACCES**（`migrateMemoryJson` 的 catch 一律视"无旧文件"）：Q6⑨ 只覆盖 embed 侧（hasLocalModel/loadLegacy）；记忆库迁移侧同类区分未做（低，记录）。
-4. **reflect workspace 预过滤后**：applyDecision 的跨域守卫保留为竞态兜底（选择与执行间的 workspace 变化）。
-5. **sqlite-vec 影子表**：DROP 已安全过滤纯维度表名；影子表随 vec0 表生命周期管理（SQLite 托管），非本插件清理范围。
-6. **CI 尚未实际触发**：仓库若不在 GitHub 此 workflow 不运行（文件已备好）；覆盖率门槛未设（保守，避免 CI 红；后续按基线补充）。
-7. **残余历史风险**：400K 自动压缩策略漂移为宿主配置域（用户环境已补位）；extractor 失败重试重复 LLM 调用为已知成本；反思/因果 LLM 成本与 ~68% 精度为 v1 保守取舍。
+1. **关键词噪声下限为检索行为变更**：零重合条目在关键词路径被过滤（即使 minScore=0）；语义单榜仍可独立召回。若未来发现"弱但真实"的关键词召回受损，需重评下限值（benchmark 契约已同步）。
+2. **Q5 修复只覆盖已发现两处**：未来新增/修改工具输出必须保持"不得含 undefined 属性值"纪律（宿主 lossless-JSON 校验；否则记忆已入库但工具误报失败）。新 `memory_detail` 未命中路径已同法省略键。
+3. **2b 累计为进程内态（重启归零）**：跨轮收敛判断需累积多轮才有意义；"被反思归档条目的后续推翻"追踪未做（显式边界，深度归因留给探测集评估）。
+4. **换维热换 DROP 与旧 holder 飞行写竞态**（F1 记录）：低概率（同连接同步 SQL），已被 onCreate catch 收容，向量丢不崩；仍处 out 列表。
+5. **CI/覆盖率门槛未实际触发**：仓库未上线 GitHub 前 workflow 不运行；阈值保守（按基线留余量）。
+6. **因果进检索仍未决策**：CausalRAG2 证据强（假因果降 F1），当前边仅审计不入检索、已有 confidence≥0.6+来源/workspace/superseded 建边校验——"置信≥阈值才入检索"是待决策的 A/B 候选（需产品意图）。
+7. **残余历史风险**：400K 自动压缩策略漂移为宿主配置域（已补位）；extractor 失败重试重复 LLM 调用为已知成本；`memory.json` 迁移 `migrateAll` 期间并发写无（启动路径）——安全。
 
 ## 四、下次最该做的事
 
-1. **重启 3080 实例验证**：面板保存配置后状态行为新契约（远程 ready；无跨维顶班场景；`memory.sqlite` 旧维度表清理日志）。
-2. **CI 真实接线**（若仓库上线 GitHub）：触发 workflow 验证 typecheck+test 门；按需补覆盖率阈值。
-3. **Q7 候选预研**：importance 累积投票（arXiv:2606.12945）需要多轮信号源设计；反思质量度量钩子（consolidation 预算依赖）。
-4. **onCreate 集成测试补强**：若后续给 mountMemory 提供 store 句柄 seam 或经 extractor 驱动写路径，补"create→索引失败→不崩"集成用例。
-5. **memory.json 迁移侧 ENOENT 区分**（风险点 3，微改）。
-6. 既有"下次"项延续：备份脚本配计划任务；缓存命中率基线实测；memory.sqlite 维护效果观察。
+1. **实机重启 3080 验证**：`memory_note` 不再报 "not lossless JSON"（Q5）；`memory_status` 新字段透出（含 reflectionCumulative）；save 配置后状态新契约。
+2. **CI 真实接线**（上线 GitHub）：typecheck+test+覆盖率门跑通；按需收紧阈值。
+3. **Q7 探测集 delta 立项**：consolidation 质量度量（contradiction/staleness/recall@k/precision@k 只读探测集，不进检索）——2b 轻量底座已就位，上真 A/B 评估。
+4. **因果进检索决策**：若产品意图是让因果边增强检索，按 CausalRAG2 证据做"置信≥阈值 + 来源/时序校验"分层；否则维持审计-only。
+5. **importance 融合观察**：effectiveImportance 上线后观察快照/保留面是否收敛（必要时调 evidence 封顶）。
+6. 既有项延续：备份脚本配计划任务；缓存命中率基线；memory.sqlite 维护效果观察。
