@@ -40,16 +40,16 @@
 
 ## 三、关键异常（决定性取证）
 
-### ① 部署的是陈旧构建（缺 WP1 起全部风险修复）
-部署 `lib/*.js` 时间戳 2026-08-17 20:41；对照标记检索（grep 部署 lib）：
+### ① 部署的是陈旧构建（落后 14 个提交，且最严重历史缺陷在产仍存活）
+部署 `lib/*.js` 时间戳 2026-08-17 20:41（实际 8/17 23:33 拷贝入 store）；对照标记检索（子代理 + 主代理 grep 双重确认）：
 - ❌ 无 `runtimeDegraded` / `embeddingDegradedReason`（WP1 跨维降级观测面）
 - ❌ 无 `dropOtherDimensionTables` / 迁移维度校验（Q2）
 - ❌ 无 `migrateAll`（Q4 迁移单事务）
 - ❌ 无 `reflectionCumulative` / `effectiveImportance` / `exposeStore`（C10/C13/C9）
 - ✅ `tools.js:280` 仍是 `mergedWithId: result.outcome.merged ? result.outcome.existingId : undefined` —— **Q5 已修的 lossless-JSON 缺陷在生产仍存在**（memory_note 未合并时输出会被宿主拦截、工具误报失败）
-- `maintenance.js` 含一个 WP6a 标记（待精确匹配，但不改总体结论）
+- ❌ **`embedding.js` 的 `embedWithFallback` 仍是「远程故障 → 无条件 384 顶班」，无维度守卫、无 runtimeDegraded** —— 即最严重历史缺陷（远程 2560 抖动 → 静默切本地 384 → 向量库维度错乱 → 语义检索破坏）**当前生产仍存活**
 
-结论：**485 测试验证的是仓库最新代码；生产运行的是更早构建**——本轮之前的修复（跨维降级显式化、旧表 DROP、迁移事务化、EACCES、settings 回滚、onCreate 收容、lossless 修复等）**均不在生产生效**。
+结论：**生产代码比仓库落后 14 个提交**（`a021648` 及 8/18 全部）；485 测试验证的最新修复在产**均未生效**。当前 DB 仅有 2560 表（未触顶班），但**旧版错误的降级逻辑就位，随时可能在远程抖动时触发**。
 
 ### ② 语义向量索引近乎冻结（覆盖 ~9% 老条目）
 只读审计 `vec_memory_2560_rowids`（704 向量，全 active）：
@@ -63,26 +63,48 @@
 - `memory_causal_edges` = 0 行（因果建边零产出）
 - archived 仅 3（反思/矛盾归档未发生；可能与陈旧构建+未触发 LLM 反思有关，或从未显式运行 memory_reflect）
 
+### ④ 嵌入密钥来源（重启易失）
+- `.credentials.yaml` 仅含 `OPENCODE_GO_API_KEY`/`TEAMOROUTER_API_KEY`；`~/.dsh/.env`、主目录 `.env`、profile `.env` 均不存在。
+- 宿主 `bin.js:134 loadLayeredEnv('dsh')` 从【继承 env → 项目/`~/.dsh` `.env`】注入；插件 `embedding.js:59 process.env[name]` 解析。
+- 运行期实证：DB 已建 `vec_memory_2560` → 远程 2560 已生效 = 密钥**已从宿主 shell 继承环境解析可用**（面板亦显示“已解析可用”）。
+- ⚠️ **重启若不带 `BAILIAN_API_KEY` export，嵌入将静默失效**（无 .env/.credentials 兜底）。
+
 ## 四、输入侧确认
 - `~/.dsh/settings.yaml` memory 段与面板一致；`embeddingDimension: 2560` 符合 schema（`z.number().min(1)` → 合法）。
 - 嵌入密钥 `env:BAILIAN_API_KEY` 在宿主侧**已解析可用**（面板断言）；本地 shell 的 `$env:BAILIAN_API_KEY` 为空属正常（密钥由宿主进程注入，非我的 shell 环境）——已交由宿主子代理进一步核实注入链。
 
-## 五、残余风险与建议（按优先级）
+## 五、残余风险与建议（按优先级；用户已拍板：**不自动热更，仅提供步骤——见附录 A**）
 
-1. **【高】热更生产到最新代码**：重建 `lib`（`pnpm build`）+ 让 profile 指向最新（pnpm 重装 file 依赖 → 新 store 快照）+ 重启 `dsh web`。**这是破坏性/会话中断操作，需用户拍板**（影响当前运行中会话与其它项目会话）。
-2. **【高】补齐语义索引**：最新构建下 `ensureAll` 会一次补齐缺失向量（约 6600 条 × 2560 维远程嵌入，成本/时间需预算：约 52 批 × BATCH 请求，可能数分钟-数十分钟 + API 花费；或考虑默认降本策略，需拍板）。
-3. **【中】因果/反思全链路验证**：最新构建 + 手动触发 `memory_reflect` 后复查 `memory_causal_edges` 与 archived 是否产生。
-4. **【低】部署闭环制度化**：改动→`pnpm build`→重装→重启的 repo 内脚本/文档（生产重启需用户确认）。
-5. **【中】向量覆盖监控**：status 增加“向量覆盖/总数”观测（当前 9%），避免“ready 但语义虚设”再次静默。
+1. **【高】生产运行旧分支**：部署落后仓库 14 个提交，最严重的历史缺陷（远程 2560 抖动→无条件 384 顶班→维度错乱）与 Q5 lossless 缺陷在产仍存活。→ 见附录 A 手动热更步骤。
+2. **【高】语义索引 9% 覆盖**：最新构建重启后 `ensureAll` 会于首启自动补齐全部缺失向量（约 6600 条 × 2560 维远程，预估约 52 批、数分钟~数十分钟 + API 费用；当前版本无“补索引开关”）。
+3. **【中】密钥来源易失**：`BAILIAN_API_KEY` 仅由宿主 shell 继承 env 提供（`.credentials/.env` 均无）；**重启务必带该 export**，否则嵌入静默失效且无兜底。
+4. **【中】因果/反思**：最新构建 + 显式 `memory_reflect` 后复查 `memory_causal_edges` 与 archived 是否开始产出。
+5. **【低】部署闭环制度化**：README/脚本固化「build → pack/link → 重启」步骤（重启仍须用户确认）。
+6. **【中】向量覆盖监控**：status 增加“向量覆盖/总数”观测（当前 9%），避免“ready 但语义虚设”再次静默。
 
 ## 六、证据清单
 - 宿主：`Get-Process`（PID 22644 `@deepseek-ai/dsh/lib/bin.js web`）+ `Get-CimInstance` 命令行
 - 配置：`~/.dsh/settings.yaml` memory 段；面板配置区读数（baseURL/model/2560/“已解析可用”）
-- 部署包：`profiles/web/node_modules/@echocore/dsh-memory/lib/*.js` 时间戳 + 标记 grep 结果
+- 部署包：`profiles/web/node_modules/@echocore/dsh-memory/lib/*.js` 时间戳 + 标记 grep（子代理 + 主代理双重确认 14 提交缺失）
 - 数据层：只读 `node:sqlite` 脚本输出（表结构/7256→7318 行/0 坏 JSON/468 superseded/3 archived/kinds 分布/向量分桶/因果 0）
 - GUI：3080「设置→记忆」面板快照（共 7305 条/7302 活跃；嵌入 ready+remote；检索 50 命中）
+- 宿主侧：PID 存活 + WAL 8/18 12:42 持续写（插件加载活跃证明）；`.credentials.yaml` 字段名（无 BAILIAN）；`bin.js:134 loadLayeredEnv` 注入链
 
-## 七、待补充（背景取证子代理回流后并入）
-- 宿主日志有无插件报错（嵌入批次失败/未处理拒绝）→ 用于界定③根因
-- 密钥 `env:BAILIAN_API_KEY` 注入链确认
-- 网络权威实践对照（SQLite/向量一致性审计、热更部署、嵌入就绪探测）
+## 七、权威实践对照（网络第二轮子代理，仅列已核实项）
+- **生产 SQLite 只读健康检查**（sqlite.org/pragma.html 已核实）：`PRAGMA integrity_check` / `quick_check`（生产高频用）/ `foreign_key_check`、`cell_size_check=ON` 均只读；`PRAGMA wal_checkpoint(PASSIVE)` 非阻塞、适合运行中库。→ 建议定期跑 quick_check 纳入运维。
+- **向量索引一致性**（sqlite-vec 官方 + issues #54/#269/#243）：维度在 CREATE 时固定、写入维度不符即报错；DELETE 仅把 validity 位置零、shadow 表残留“孤儿”行；无内置 optimize → 主表行数 vs vec0 行数需运维对账、缺失向量重建。→ 印证本报告语义索引补齐/对账为运维必需。
+- **嵌入维度一致性**（QwenLM/qwen3-embedding）：输出维度随模型/配置固定（0.6B=1024、4B=2560，支持 MRL）；声明维度与 endpoint 实际返回不一致则写入必失败。→ 生产 2560 与 4B 模型匹配，且已实证写入 704 条成功。sqlite-rembed 模式（OpenAI 兼容 `/v1/embeddings` + env key）与本插件架构一致。
+- **本地热更闭环**（pnpm.io/cli/link、pack）：dev 用 `pnpm link`（即时生效）、稳定分发用 `pnpm pack` → 目标 node_modules 安装 tarball。→ 附录 A 采用 pack/重装路径。
+
+## 八、附录 A：热更生产到最新代码的精确步骤（用户拍板：不自动热更，仅提供步骤）
+> 前提与警示：① 重启会中断所有运行中会话（含其它项目会话）；② 重启 shell **必须已 export `BAILIAN_API_KEY`**（否则嵌入静默失效，无 .env/credentials 兜底）；③ 重启后新构建会于首启自动补齐缺失向量（一次性成本见 §五-2）。
+
+1. **备份**（可选，稳妥）：复制 `~/.dsh/storages/memory.sqlite`、`memory.sqlite-wal`、`memory.sqlite-shm` 到备份目录。
+2. **重建**（仓库根 `D:\TSProjects\EchoCore`）：`pnpm --filter @echocore/dsh-memory build`（产出最新 lib + client）。
+3. **刷新 profile 部署**（`~/.dsh/profiles/web`）：若为 pnpm 管理则在该目录 `pnpm update @echocore/dsh-memory`（或 `pnpm install --force`）；否则用 `pnpm --filter @echocore/dsh-memory pack` 打 tarball 并在 profile `pnpm add <tarball>` 安装。
+4. **重启宿主**：停止 PID 22644（按你启动 `dsh web` 的方式），在已 export key 的 shell 重新启动。
+5. **重启后校验**：
+   - 面板「记忆」→ 嵌入状态应为 `ready`（若见 `remote(运行期降级)`/`disabled` 且原因含“维度”→ 检查 env key 是否漏带）；
+   - 抽查一次 `memory_note` 非合并写入：**不再报 “not lossless JSON”**（Q5 修复生效标志）；
+   - （可选）`PRAGMA quick_check`；手动 `memory_reflect` 后复查 `memory_causal_edges` 是否有行。
+
