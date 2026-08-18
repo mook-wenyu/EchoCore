@@ -276,6 +276,22 @@ export function importanceFactor(importance: number): number {
 }
 
 /**
+ * 有效重要度（Q1/2c 轻量融合，2026-08-17 用户拍板）：保留 LLM 单次 1-10 作为
+ * 主因子，叠加「访问频率证据」——对被频繁召回/引用的记忆按对数式增益抬重要度。
+ *   evidenceBoost = accessCount>0 ? min(2, floor(log2(1+accessCount))) : 0
+ *   → 1 次 = +1；3 次 = +2；≥7 次 = +2（封顶 +2，防高频访问无界放大/霸榜；
+ *      与 B2 半衰期访问调制的对数压缩同源）。
+ * 仅用于「保留/提升」决策面（listByImportance / 快照取数）——**不动检索主路径**
+ * （search 评分仍用存储 importance + 半衰期访问调制，避免同一访问证据双重计入）。
+ * 依据：LexWisdom 盲区实证 多因子 0.770 vs 单因子 0.518（arXiv:2606.12945）——
+ * 频率证据补单次打分漂移；**不训学习权重**（仅单篇无工程复现，YAGNI）。
+ */
+export function effectiveImportance(importance: number, accessCount: number): number {
+  const evidence = accessCount > 0 ? Math.min(2, Math.floor(Math.log2(1 + accessCount))) : 0
+  return Math.min(10, Math.max(0, importance + evidence))
+}
+
+/**
  * 时间 × 重要性调制因子（0.5..1.0）：memoryScore 与语义融合路径共用。
  * P3：半衰期随 importance 自适应 + 重要度 ≥ 8 的 salience floor（保活）。
  * B2：半衰期再乘访问频率调制（高频访问衰减更慢，召回抬回）。

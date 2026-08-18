@@ -6,6 +6,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MemoryStore, type SearchOptions } from '../src/store.js'
+import { effectiveImportance } from '../src/scoring.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { createRealSqliteStore, FakeTable, settle } from './helpers.js'
 
@@ -751,8 +752,7 @@ describe('MemoryStore.tokenJaccard', () => {
   })
 })
 
-describe('MemoryStore.search 关键词噪声下限（Q4 接线 MIN_RELEVANCE_SCORE）', () => {
-  it('弱部分命中（rel<0.3，常见词巧合重合）不入检索结果；强命中保留', async () => {
+describe('MemoryStore.search 关键词噪声下限（Q4 接线 MIN_RELEVANCE_SCORE）', () => {  it('弱部分命中（rel<0.3，常见词巧合重合）不入检索结果；强命中保留', async () => {
     const table = new FakeTable()
     const store = new MemoryStore(table, nowFn)
     const strong = (await store.create(input({ content: 'pnpm workspace 管理多包' }))).entry
@@ -786,5 +786,24 @@ describe('MemoryStore.search 关键词噪声下限（Q4 接线 MIN_RELEVANCE_SCO
     })
     // 关键词 rel≈0（不入榜），但语义 cosine 高 → 单榜 rrf ≈ 0.5 ≥ minScore → 召回
     expect(results.some((e) => e.id === sem.id)).toBe(true)
+  })
+})
+
+describe('MemoryStore.listByImportance 有效重要度（Q1 轻量融合：存储重要性 + 访问频率证据）', () => {
+  it('访问频率证据在重要度排序中生效（补单次打分漂移），对数封顶', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    const stored6 = (await store.create(input({ content: '仅存储重要度 6', importance: 6 }))).entry
+    const evidenced5 = (await store.create(input({ content: '存储 5 但高频访问', importance: 5 }))).entry
+    // 模拟检索命中回写累积：evidenced5 被访问 7 次 → evidence +2 → eff 7 > stored 6
+    await table.update(evidenced5.id, (cur) => ({ ...cur, accessCount: 7 }))
+    const top = store.listByImportance('D:/workspace', 10)
+    expect(top[0]!.id).toBe(evidenced5.id)
+    // 封顶：imp 9 + 极端高频仍 ≤ 10（防无界放大）
+    const cap = (await store.create(input({ content: '封顶测试', importance: 9 }))).entry
+    await table.update(cap.id, (cur) => ({ ...cur, accessCount: 1000 }))
+    expect(effectiveImportance(cap.importance, store.getById(cap.id)!.accessCount)).toBe(10)
+    // 无访问证据时与存储重要度一致（既有排序语义不变）
+    expect(effectiveImportance(stored6.importance, stored6.accessCount)).toBe(6)
   })
 })

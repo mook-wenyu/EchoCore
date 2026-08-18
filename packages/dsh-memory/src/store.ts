@@ -16,7 +16,7 @@
 import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 import { cosine } from './embedding.js'
-import { idfWeightedRelevance, MIN_RELEVANCE_SCORE, relevanceScore, rrfScore, timeImportanceFactor, tokenize } from './scoring.js'
+import { effectiveImportance, idfWeightedRelevance, MIN_RELEVANCE_SCORE, relevanceScore, rrfScore, timeImportanceFactor, tokenize } from './scoring.js'
 import {
   dedupKeyOf,
   newMemoryId,
@@ -661,7 +661,13 @@ export class MemoryStore {
       result.push(entry)
     }
     result.sort(
-      (a, b) => b.importance - a.importance || b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id),
+      // Q1/2c 轻量融合：按**有效重要度**（存储重要性 + 访问频率证据，见
+      // scoring.effectiveImportance）排序——被频繁召回的记忆证据补足单次打分漂移
+      (a, b) =>
+        effectiveImportance(b.importance, b.accessCount) -
+          effectiveImportance(a.importance, a.accessCount) ||
+        b.createdAt.localeCompare(a.createdAt) ||
+        a.id.localeCompare(b.id),
     )
     return result.slice(0, limit)
   }
