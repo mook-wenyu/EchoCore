@@ -750,3 +750,41 @@ describe('MemoryStore.tokenJaccard', () => {
     expect(store.tokenJaccard(e1, partial)).toBe(j)
   })
 })
+
+describe('MemoryStore.search 关键词噪声下限（Q4 接线 MIN_RELEVANCE_SCORE）', () => {
+  it('弱部分命中（rel<0.3，常见词巧合重合）不入检索结果；强命中保留', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    const strong = (await store.create(input({ content: 'pnpm workspace 管理多包' }))).entry
+    const weak = (await store.create(input({ content: '部署工具流程说明' }))).entry
+    const results = store.search({ query: 'pnpm workspace 管理 部署', workspace: 'D:/workspace', limit: 10, minScore: 0.15 })
+    // 强命中（pnpm/workspace/管理 3/4 token → rel≈0.75）保留；弱命中（仅"部署" 1/4
+    // token → rel≈0.25 < 0.3）被 MIN_RELEVANCE_SCORE 噪声下限过滤（F3 BM25 噪声下限）
+    expect(results.some((e) => e.id === strong.id)).toBe(true)
+    expect(results.some((e) => e.id === weak.id)).toBe(false)
+  })
+
+  it('语义融合路径：关键词弱命中不占榜，但高语义条目仍可经语义单榜召回（下限不伤语义）', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, nowFn)
+    const sem = (await store.create(input({ content: '量子物理纠缠态测量' }))).entry // 关键词零重合、语义高
+    const results = store.search({
+      query: 'pnpm workspace 管理 部署',
+      workspace: 'D:/workspace',
+      limit: 5,
+      minScore: 0.15,
+      queryEmbedding: (() => {
+        const v = new Float32Array(384)
+        v[0] = 1
+        return v
+      })(),
+      lookupEmbedding: () => Array.from((() => {
+        const v = new Float32Array(384)
+        v[0] = 1
+        return v
+      })()),
+    })
+    // 关键词 rel≈0（不入榜），但语义 cosine 高 → 单榜 rrf ≈ 0.5 ≥ minScore → 召回
+    expect(results.some((e) => e.id === sem.id)).toBe(true)
+  })
+})

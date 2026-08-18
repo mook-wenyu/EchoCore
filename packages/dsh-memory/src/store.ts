@@ -16,7 +16,7 @@
 import { DomainError, type KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 import { cosine } from './embedding.js'
-import { idfWeightedRelevance, relevanceScore, rrfScore, timeImportanceFactor, tokenize } from './scoring.js'
+import { idfWeightedRelevance, MIN_RELEVANCE_SCORE, relevanceScore, rrfScore, timeImportanceFactor, tokenize } from './scoring.js'
 import {
   dedupKeyOf,
   newMemoryId,
@@ -517,11 +517,12 @@ export class MemoryStore {
         (options.queryEmbedding !== undefined && options.lookupEmbedding !== undefined)
       const queryTokenList = tokenize(query)
       if (semantic) {
-        // 关键词榜：relevance > 0 的条目降序（同分按 id 稳定；relevance=0 不上榜）
+        // 关键词榜：relevance ≥ 下限的条目降序（Q4 噪声下限——弱命中不入榜，
+        // 语义单榜不受影响；同分按 id 稳定；低于下限不上榜）
         // R1：缓存 token 集合（entryTokenCache）替代每轮重建
         const withRel = matches.map((entry) => ({ entry, rel: relevanceScore(queryTokenList, this.cachedTokens(entry)) }))
         const kwRanked = withRel
-          .filter((item) => item.rel > 0)
+          .filter((item) => item.rel >= MIN_RELEVANCE_SCORE)
           .sort((a, b) => b.rel - a.rel || a.entry.id.localeCompare(b.entry.id))
         const kwRank = new Map<string, number>()
         kwRanked.forEach((item, index) => kwRank.set(item.entry.id, index + 1))
@@ -569,9 +570,12 @@ export class MemoryStore {
         for (const entry of matches) {
           // R1：缓存 token 集合替代 memoryScore 内部重复 tokenize（计算等价：
           // memoryScore = relevance × timeImportanceFactor，relevance=0 → 0 < minScore 不过）
-          const score =
-            idfWeightedRelevance(queryTokenList, this.cachedTokens(entry), (t) => df.get(t) ?? 0, matches.length) *
-            timeImportanceFactor(entry, now)
+          const rel = idfWeightedRelevance(queryTokenList, this.cachedTokens(entry), (t) => df.get(t) ?? 0, matches.length)
+          // Q4（2026-08-17 拍板）：关键词噪声下限——原始 relevance 低于
+          // MIN_RELEVANCE_SCORE 的弱命中（常见词巧合重合）不入检索结果
+          // （接线 F1 死代码常量 + F3 的 BM25 噪声下限建议；语义路径由语义榜独立承担）
+          if (rel < MIN_RELEVANCE_SCORE) continue
+          const score = rel * timeImportanceFactor(entry, now)
           if (score >= minScore) scored.push({ entry, score })
         }
       }

@@ -255,9 +255,6 @@ export async function remoteEmbedFetch(
   }
 }
 
-/** 语义检索降级回调（装配层注入 logger；embed 运行期故障时记录并回退关键词） */
-export type EmbeddingFallbackLogger = (message: string, error: unknown) => void
-
 export class EmbeddingService {
   private stateValue: EmbeddingState = 'disabled'
   /** 当前后端（remote 优先；运行期失败切换 local） */

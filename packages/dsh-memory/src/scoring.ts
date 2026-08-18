@@ -65,9 +65,12 @@ export const SALIENCE_FLOOR_ACTIVE_WINDOW_MS = 90 * 86_400_000
  *   0.3 ≈ 10-token 查询命中 3 个 token——低于此通常只是同片段巧合重合，
  *   不构成真正的语义相关。
  *
- * 语义融合路径（P4/B1 RRF）共用同一过滤：store.search 的 minScore 统一以
- * 本常量为兜底，语义单榜靠前条目（单榜分 = 1/(k+1)/归一化 ≈ 0.5）不受影响，
- * 零重合的高语义相关条目仍可单榜召回——门槛只筛"双榜皆弱的杂音"，不伤语义召回。
+ * 语义融合路径（P4/B1 RRF）为**两条独立门槛**（Q4 接线，修 2026-08-17 注释漂移）：
+ * - 关键词路径噪声下限 = 本常量：store.search 对每条 keyword relevance 单独门控
+ *   （rel < MIN_RELEVANCE_SCORE 直接跳过，不入检索）；
+ * - 融合分门槛 = store.search 的 minScore（缺省 0.15）作用于 rrf×timeImportance；
+ * 语义单榜靠前条目（单榜分 = 1/(k+1)/归一化 ≈ 0.5）不受下限影响，零重合的高
+ * 语义相关条目仍可单榜召回——下限只筛"弱关键词命中 + 未上榜语义"的杂音。
  */
 export const MIN_RELEVANCE_SCORE = 0.3
 

@@ -283,15 +283,12 @@ describe('recall@k 检索质量评估（合成库）', () => {
     const rowA = scored.find(({ entry }) => entry.content.includes(marker))
     const rowB = scored.find(({ entry }) => !entry.content.includes(marker))
 
-    // A 命中标识词 → relevance=1.0；B 不命中 → relevance=0（score=0）
+    // Q4 接线后的新契约（2026-08-17 用户拍板）：关键词路径噪声下限
+    // MIN_RELEVANCE_SCORE=0.3——A 命中标识词 rel=1.0 ≥ 下限 → 返回且 ≥0.5 高置信带；
+    // B 零重合（rel=0 < 下限）→ 被噪声下限过滤（此前 minScore=0 时也会返回 score=0，
+    // 现由下限直接排除——精度优先，宁缺毋滥；语义路径仍可独立召回）。
     expect(rowA).toBeDefined()
-    expect(rowB).toBeDefined()
-    expect(rowA!.score).toBeGreaterThan(rowB!.score)
-    // 稀有词把 A 抬进高置信带（relevance 1.0 × 时间因子 ≈0.75，恒 ≥0.5）——"稀有词权
-    // 重更高"的边界。此断言在两种评分模型下都成立，作为轻量 IDF 加权的生效验证：
-    // - 纯重合率（relevanceScore）：A 命中 → 1.0、B → 0，A 严格高于 B；
-    // - IDF/BM25 加权（idfWeightedRelevance，主代理已并入 store 关键词分支）：稀有词
-    //   标识 token df=1 取得大 idf，A 仍为 1.0、B 为 0，权重只增不减，断言依旧成立。
+    expect(rowB).toBeUndefined()
     expect(rowA!.score).toBeGreaterThanOrEqual(0.5)
   })
 })
