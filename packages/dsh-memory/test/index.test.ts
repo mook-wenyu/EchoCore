@@ -20,6 +20,13 @@ import { EmbeddingService } from '../src/embedding.js'
 import type { MemoryStore } from '../src/store.js'
 import { FakeCtx } from './helpers.js'
 
+// 全模块拦截（pass-through：默认真实实现）——用于确定性注入迁移读取的 EACCES 失败
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return { ...actual, readFile: vi.fn(actual.readFile) }
+})
+import { readFile } from 'node:fs/promises'
+
 /** 访问 mock EmbeddingService 的构造记录（静态计数——断言实时生效器重建后端） */
 function embeddingConstructed(): Array<{ remote?: { model?: string } }> {
   return (EmbeddingService as unknown as { constructed: Array<{ remote?: { model?: string } }> }).constructed
@@ -343,6 +350,45 @@ describe('插件组合根（index.ts）', () => {
     expect(count).toBe(0)
     db.close()
     await cleanup(ctx, store.dir)
+  })
+
+  it('迁移读取失败（非 ENOENT）→ 装配拒绝不半死；下次装配（修复后）重试成功——"中断可重试"端到端验收（F1 中优先级）', async () => {
+    const store = tmpStore()
+    writeFileSync(
+      store.jsonFile,
+      JSON.stringify({ tables: { entries: { a: makeEntry('a', '记忆甲') } } }),
+      'utf8',
+    )
+    // 第一次装配：readFile 抛 EACCES（旧库不可读的 IO 故障）→ migrateMemoryJson 上抛
+    // → mountMemory 整体拒绝（不半死激活、不静默空库丢迁移源）
+    vi.mocked(readFile).mockImplementationOnce(() =>
+      Promise.reject(Object.assign(new Error('permission denied'), { code: 'EACCES' })),
+    )
+    const ctx1 = setup().ctx
+    await expect(
+      mountMemory(ctx1 as never, { ...DEFAULTS } as never, { warn: () => {}, info: () => {} } as never, {
+        dbFile: store.dbFile,
+        legacyJsonFile: store.jsonFile,
+      }),
+    ).rejects.toThrow('permission denied')
+    vi.mocked(readFile).mockClear()
+    // 关闭第一次装配留下的数据库连接，再重试装配（模拟"修复权限后重启"）
+    for (const dispose of ctx1.disposers) dispose()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const ctx2 = setup().ctx
+    await mountMemory(ctx2 as never, { ...DEFAULTS } as never, { warn: () => {}, info: () => {} } as never, {
+      dbFile: store.dbFile,
+      legacyJsonFile: store.jsonFile,
+    })
+    // 重试成功：条目已迁移落库
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(store.dbFile)
+    const rows = db.prepare('SELECT id FROM entries ORDER BY id').all() as Array<{ id: string }>
+    expect(rows.map((r) => r.id)).toEqual(['a'])
+    db.close()
+    for (const dispose of [...ctx1.disposers, ...ctx2.disposers]) dispose()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    rmSync(store.dir, { recursive: true, force: true })
   })
 
   it('语义嵌入 ready 但运行期嵌入故障（ensureAll/indexEntry 失败）被收容——装配完成不崩 apply（Q6② 拍板：索引联动为附属效果，失败仅告警）', async () => {
