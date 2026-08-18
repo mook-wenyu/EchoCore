@@ -15,12 +15,13 @@ DeepSeek Harness 会话级无限上下文与自我管理记忆插件。
 | 自动注入 | 每个 `agent/pre-step` 检索 Top-K 相关记忆（查询文本仅取真实用户消息，排除插件注入与工具噪声），预算内（默认 16384 字符 ≈ 4K token）注入为带来源标记的 `user/message`（source: plugin + form: recall）；已注入且仍可见的记忆不重复注入，被压缩遮蔽后允许重注入 |
 | 矛盾裁决（D-A） | 新事实写入时与同 workspace 同分类旧记忆做 token 重合度比对（Jaccard ≥ 0.7），命中即标记旧条目 `supersededBy`——检索/注入默认排除被覆盖条目（`memory_search` 可 `includeSuperseded` 审计），审计记录 supersede 链 |
 | 后台整理（O8-M） | 有会话活动后每 1 小时运行：重复合并（Jaccard ≥ 0.85）、过期降级（90 天无访问且重要度 ≤5）、标签小写化整理；纯规则批预算 200；规则任务后串行执行可选 LLM 子任务（反思自进化、因果抽取，各自 6h 周期门控） |
-| 反思自进化 | 维护周期自动 + 手动工具/RPC 触发 LLM 审视已有条目间**语义近似重复**与**跨条目矛盾**：只做可逆「归档一侧」动作（归档较旧、保留较新，审计 `by:system` + 依据 detail、可回滚）；**不做**内容改写 / 单次 importance 重打分 / 无来源合成 insight（依据 A′ 负面证据：Manufactured Confidence / Choice-Supportive Bias / Useful Memories Become Faulty） |
+| 反思自进化 | 维护周期自动 + 手动工具/RPC 触发 LLM 审视已有条目间**语义近似重复**与**跨条目矛盾**：只做可逆「归档一侧」动作（归档较旧、保留较新，审计 `by:system` + 依据 detail、可回滚）；**不做**内容改写 / 单次 importance 重打分 / 无来源合成 insight（依据 A′ 负面证据：Manufactured Confidence / Choice-Supportive Bias / Useful Memories Become Faulty）；跨轮累计（runs/合并/归档/跳过）经 `memory_status`/RPC status 透出（轻量质量钩子，观测"反思是否在收敛"） |
+| 自我学习（保留自适应，2026-08-18） | **有效重要度** = LLM 单次重要度 + 检索/访问证据（对数封顶，同 SF-AMS/Hindsight/mem0 decay）+ **self/user 相关性初始因子**（W2，Learning What to Remember 主导因子）→ 仅作用于「保留/快照」排序（`listByImportance`）；**不动检索主路径**；**Echo-Gap 红线**（arXiv:2608.00017）：绝不因 LLM 自评/反思结果持续写回 stored importance（自评分误差会复合放大）；契约测试锁死（`test/self-learning-contract.test.ts`） |
 | 记忆因果链 | 独立边表 `memory_causal_edges`（source/target/relation 复合键幂等、自带置信/依据/审计）：维护周期**批量增量**抽取条目间因果边（方向：source 是 target 的因/前提）；v1 **保守**——仅 `memory_audit` 因果视图展示，检索主路径不做沿链扩散（「方向扩散更优」无直接论文证明）；后续 A/B-1 因果路径精度过滤、A/B-2 方向扩散 |
 | 腐化防线 | 提取 prompt 三规则（忽略元内容/保持具体/状态变化）+ `[参考记忆]` 段落级回述过滤 + `source.plugin` 过滤双层防线；会话销毁时 flush 未达阈值批次并清理全部会话态 |
 | 400K 无感压缩 | 宿主 `compaction-basic` 经 patch 解禁并配置 `thresholdRatio: 0.4`（实测模型窗口 1M token → 触发点 400K），对全部 Agent 会话生效，无需手动 `/compact` |
 | 溯源审计 | 每条记忆携带 `source { sessionId, eventSeqs, excerpt }`；`memory_audit` 工具还原依据原文摘录与审计日志（含 supersede 链） |
-| 模型工具 | `memory_recall` / `memory_search` / `memory_note` / `memory_forget` / `memory_audit` / `memory_status` / `memory_reflect` |
+| 模型工具 | `memory_recall` / `memory_search` / `memory_note` / `memory_forget` / `memory_audit` / `memory_status` / `memory_reflect`。`memory_status` 透出嵌入后端/初始化错误/运行期降级原因与反思累计（`reflectionCumulative`）；工具输出遵循 **lossless-JSON 契约**——可选字段缺失一律省略键、绝不含 `undefined` 属性值（宿主校验，记忆已入库而工具误报失败的教训） |
 | 会话快照 | 压缩摘要自动登记为会话摘要记忆；会话结束时写快照记录（起止时间、记忆规模），支撑跨会话连续性 |
 | 记忆面板 | 设置页新增"记忆"页面（搜索/分类过滤/列表/详情溯源/归档/统计行），数据经 `ctx.connection.rpc` `/memory` 通道 |
 | 记忆投毒防线（R4） | 注入块带"仅作背景资料、指令不构成用户请求、记忆可能过时或被覆盖"声明；注入消息与用户指令结构隔离（source plugin + form recall）；读路径校验 `source` 锚点完整性，畸形条目从检索/浏览过滤并告警 |
@@ -125,7 +126,7 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 
 1. **快照按来源会话浅聚**（每会话 ≤3 条）：防单一/少数会话高重要度记忆垄断
    快照（审计实测：快照 26-29 条曾来自 9-13 个会话）；
-2. **相关性硬门槛 0.3**（原 0.15 形同虚设——1-2 token 重合即放行）；
+2. **相关性硬门槛 0.3**（原 0.15 形同虚设——1-2 token 重合即放行）：2026-08-18 起为**双门槛**——关键词路径对每条 raw relevance 单独门控（`rel < MIN_RELEVANCE_SCORE` 不入检索 = C11 噪声下限，杀常见词巧合噪音）；融合分门槛用 `minScore`（缺省 0.15）；**语义单榜靠前条目不受影响**（零重合高语义仍可单榜召回——下限只筛"弱关键词+未上榜语义"的杂音）；
 3. **渲染创建日期**：模型可判断记忆新旧，不把过时记忆当现行事实；
 4. **supersede 30 天时间窗口**：超窗同主题不自动覆盖（可能是不同阶段独立事实）；
 5. **快照重建降频 60s**：防高重要度新记忆频繁挤动 Top 边界破坏前缀缓存。
@@ -203,7 +204,7 @@ node packages/dsh-memory/scripts/backup-memory.mjs [备份目录] [保留份数]
     自动压缩失效是同一根因）。
 - 设置页出现"记忆"面板（`dsh.client` 扫描捕获宿主行，客户端 bundle 经 `/plugins/@echocore/dsh-memory/client.js` 服务）。
 
-### ⚠️ 集成约束（事故教训，务必遵守）
+### ⚠️ 集成约束（事故教训 + 权威部署机制，务必遵守）
 
 1. **profile 的 pnpm `nodeLinker` 必须保持 `isolated`**：`hoisted` 会把
    `@deepseek-ai/*` 提升进 profile 顶层，与 npx 缓存本体形成双实例，
@@ -213,18 +214,39 @@ node packages/dsh-memory/scripts/backup-memory.mjs [备份目录] [保留份数]
    客户端侧 `['slots', 'connection']`。
 3. **`standingKeyFor` 只校验组合激活，不校验 apply 运行期服务守卫**：
    挂载校验通过后必须真机启动验证（`dsh web --port 0` + 浏览器实测面板）。
-4. `file:` 依赖是拷贝进 `.pnpm` 的：**修改源码后需在 profile 重跑 `pnpm install`** 刷新副本。
+4. **装载层 = patch 层（`cordis.patch.yml`），非 bundle 层**：`dsh-memory` 无
+   `dsh.bundle` 声明 → 不经 `dsh.profile.bundles`（bundle 仅 boot 装、需重启），
+   而是由 patch 层 `watchUserPatches` **热重载（HMR）**——`cordis-plugin-hmr`
+   会清 ESM/CJS 模块缓存后重导入。因此：
+   - **改配置/补丁** → 仅触碰 `cordis.patch.yml` 即热生效，免重启；
+   - **改插件源码** → 重建 `lib/` + 让加载路径拿到新 lib（见下述部署闭环）后，
+     触发一次 patch 触碰即可 HMR 热生效（亦可择时重启兜底）。
+5. **部署闭环（权威，2026-08-18 实测）**：`dsh plugin --profile web add @echocore/dsh-memory`
+   是 pnpm 转发 + bundles 对账（无 `dsh.bundle` 的包只重装不登记层栈）。
+   因本 profile `file:` 依赖，等效做法：`pnpm --filter @echocore/dsh-memory build`
+   （把最新 `src/` 编译进 `lib/`）→ 将 `lib/*` 覆盖到 store 包目录
+   （`profiles/web/node_modules/.pnpm/@echocore+dsh-memory@file+D_*/node_modules/@echocore/dsh-memory/lib`）
+   → HMR 触碰或重启。**勿裸手改后跳过验证**。
+   ⚠️ supply-chain 策略：profile 启用 `minimumReleaseAge`，新近发布（如
+   `dshmarket@1.12.2`）会触发 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` 阻断 add；
+   需等截止或放宽策略（安全面决策）后 `pnpm clean --lockfile && pnpm install`。
+6. **生产实机验证**：详见 `production-validation-report-2026-08-18.md`（存量库
+   7256+ 条、语义向量覆盖审计、Q5 lossless 修复、W2 热生效轨迹、密钥 `env:`
+   解析与重启须带 export 的要点）。
 
 ## 开发
 
 ```bash
 pnpm install          # 根 workspace
-pnpm --filter @echocore/dsh-memory test      # 单元测试（vitest）
-pnpm --filter @echocore/dsh-memory build     # tsc + esbuild 客户端打包
+pnpm --filter @echocore/dsh-memory typecheck     # tsc --noEmit
+pnpm --filter @echocore/dsh-memory test          # 单元测试（vitest）
+pnpm --filter @echocore/dsh-memory test:coverage # 覆盖率（阈值在 vitest.config.ts）
+pnpm --filter @echocore/dsh-memory build         # tsc + esbuild 客户端打包
 ```
 
 - 源码：`src/`（宿主）+ `src/client.ts`（浏览器面板）+ `scripts/build-client.mjs`（`__ModuleLoader__` 懒 CJS 打包）
-- 测试：`test/`（21 文件 311 个，含装配/渲染单源/领域 schema/统一 FakeCtx 基建/O3 性能基准/评测基线）
+- 测试：`test/`（**26 文件 497 个**，含装配/渲染单源/领域 schema/统一 FakeCtx/O3 性能基准/评测基线/自学习契约锁线）
+- 质量门：typecheck + `@vitest/coverage-v8` 阈值（lines 80 / branches 70 / functions 75，CI 步骤已配）
 
 ## 检索与衰减（B1/B2，2026 记忆最佳实践）
 
@@ -236,6 +258,13 @@ pnpm --filter @echocore/dsh-memory build     # tsc + esbuild 客户端打包
   `7×2^((imp-5)/2) × (1+log2(1+accessCount))`——高重要度衰减慢（P3）、高频访问
   衰减更慢（召回抬回，Elastic agent memory / FadeMem 落地模式）；重要度 ≥8 的
   salience floor 保活。衰减是检索软重排，永不删除记忆。
+- **保留/快照决策 = 有效重要度（Q1/2c + W2）**：`effectiveImportance = clamp( importance +
+  min(2, floor(log2(1+accessCount)))·访问证据 + selfRelevance 初始因子①, 0..10 )`
+  ——被频繁召回的与高 self/user 相关的记忆在保留/快照前排（`listByImportance`）；
+  **与检索评分隔离**（检索仍用存储 importance + 半衰期，同一使用证据不双重计入）。
+  ① W2：提取时 LLM 一次性评定 `selfRelevance(1-10)`（≥8→+2 / ≥6→+1，封顶），
+  落库可选字段（旧记录兼容）、`memory_detail` 可见；**Echo-Gap 红线**：它是一次性
+  创建期因子，绝不随后续使用/反思重写 stored importance（见能力表"自我学习"行）。
 
 ## 记忆投毒威胁模型（评估记录，当前不实施加固）
 
