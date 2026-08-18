@@ -387,7 +387,16 @@ export async function mountMemory(
 
   // 模型工具：recall / search / note / forget / audit / status / reflect
   // （G3：snapshot 传入供工具回路去重——快照已注入的记忆不再由工具重复输出）
-  registerMemoryTools(ctx, { store, snapshot: snapshotService, embedding: holder, logger, runtime, causal: causalStore, reflector })
+  registerMemoryTools(ctx, {
+    store,
+    snapshot: snapshotService,
+    embedding: holder,
+    logger,
+    runtime,
+    causal: causalStore,
+    reflector,
+    causalExtractor,
+  })
 
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）
   registerSnapshot(ctx, { store, logger })

@@ -46,6 +46,7 @@ function setup(opts?: {
   runtime?: RuntimeHealth
   causal?: MemoryCausalStore
   reflector?: { runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<import('../src/reflect.js').ReflectionSummary | undefined> }
+  causalExtractor?: { runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<import('../src/causal.js').CausalSummary | undefined> }
 }) {
   const ctx = new FakeCtx()
   const table = opts?.store !== undefined ? undefined : new FakeTable()
@@ -56,6 +57,7 @@ function setup(opts?: {
     runtime: opts?.runtime,
     causal: opts?.causal,
     reflector: opts?.reflector,
+    causalExtractor: opts?.causalExtractor,
   })
   return { tools: ctx.toolDefs, store, table }
 }
@@ -84,9 +86,9 @@ async function seed(store: MemoryStore, input: Partial<NewMemoryInput> = {}): Pr
 }
 
 describe('工具注册', () => {
-  it('七个工具全部注册（含 memory_reflect）', () => {
+  it('八个工具全部注册（含 memory_reflect / memory_causal）', () => {
     const { tools } = setup()
-    for (const name of ['memory_recall', 'memory_search', 'memory_note', 'memory_forget', 'memory_audit', 'memory_status', 'memory_reflect']) {
+    for (const name of ['memory_recall', 'memory_search', 'memory_note', 'memory_forget', 'memory_audit', 'memory_status', 'memory_reflect', 'memory_causal']) {
       expect(tools.has(name), name).toBe(true)
     }
   })
@@ -520,6 +522,52 @@ describe('memory_reflect', () => {
     const exec = fakeExec() as { agent: { id: string; session: { id: string; header: { cwd: string }; events: unknown[] } } }
     exec.agent.session.events = []
     const result = (await toolOf(tools, 'memory_reflect').execute({}, exec as never)) as { ran: boolean }
+    expect(result.ran).toBe(false)
+  })
+})
+
+// ── memory_causal：手动因果抽取触发（C35，2026-08-18 拍板：维护批自动 + 手动工具共享同一 runOnce） ──
+describe('memory_causal', () => {
+  it('未接线抽取器时诚实返回 ran:false（不抛错）', async () => {
+    const { tools } = setup()
+    const result = (await toolOf(tools, 'memory_causal').execute({}, fakeExec() as never)) as { ran: boolean }
+    expect(result.ran).toBe(false)
+  })
+
+  it('接线后 force 触发：把当前会话路由传给抽取器，返回执行观察量', async () => {
+    const calls: Array<{ route: { provider: string; model: string } | undefined; opts?: { force?: boolean } }> = []
+    const causalExtractor = {
+      async runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }) {
+        calls.push({ route, opts })
+        return { reviewed: 4, edges: 2, created: 2, skipped: 1 }
+      },
+    }
+    const { tools } = setup({ causalExtractor })
+    const exec = fakeExec('s1', 'D:/workspace') as {
+      agent: { id: string; session: { id: string; header: { cwd: string }; events: unknown[] } }
+    }
+    exec.agent.session.events = [
+      { type: 'request/header', seq: 1, data: { header: { config: { provider: 'deepseek', model: 'm' } } } },
+    ] as never
+    const result = (await toolOf(tools, 'memory_causal').execute({}, exec as never)) as {
+      ran: boolean
+      edges: number
+      created: number
+    }
+    expect(result.ran).toBe(true)
+    expect(result.edges).toBe(2)
+    expect(result.created).toBe(2)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.route).toEqual({ provider: 'deepseek', model: 'm' })
+    expect(calls[0]?.opts?.force).toBe(true)
+  })
+
+  it('抽取器返回 undefined（无路由缓存）时诚实返回 ran:false', async () => {
+    const causalExtractor = { async runOnce() { return undefined } }
+    const { tools } = setup({ causalExtractor })
+    const exec = fakeExec() as { agent: { id: string; session: { id: string; header: { cwd: string }; events: unknown[] } } }
+    exec.agent.session.events = []
+    const result = (await toolOf(tools, 'memory_causal').execute({}, exec as never)) as { ran: boolean }
     expect(result.ran).toBe(false)
   })
 })

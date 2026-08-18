@@ -45,6 +45,10 @@ export interface MemoryToolsDeps {
   reflector?: {
     runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<ReflectionSummary | undefined>
   }
+  /** C35：因果抽取器（可选：memory_causal 手动触发用；未接线时工具仍注册并诚实返回未执行） */
+  causalExtractor?: {
+    runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<CausalSummary | undefined>
+  }
 }
 
 /** O1：运行健康指标（写链失败/嵌入状态/维护时间——"写失败一眼可见"闭环） */
@@ -153,6 +157,7 @@ export function registerMemoryTools(ctx: Context, deps: MemoryToolsDeps): void {
   registerAudit(ctx, deps)
   registerStatus(ctx, deps)
   registerReflect(ctx, deps)
+  registerCausal(ctx, deps)
 }
 
 /** memory_recall：按查询检索 Top-K 相关记忆（显式召回路径） */
@@ -641,6 +646,63 @@ function registerReflect(ctx: Context, deps: MemoryToolsDeps): void {
           decisions: summary.decisions,
           merged: summary.merged,
           archived: summary.archived,
+          skipped: summary.skipped,
+        }
+      },
+    }),
+  )
+}
+
+/**
+ * memory_causal：手动触发一轮 LLM 因果抽取（C35，2026-08-18 拍板）。
+ * 与维护周期共用同一 MemoryCausalExtractor（force 跳过 6h 周期门控即时执行）；
+ * 建边为 add-only + confidence≥0.6 + 复合键幂等，审计可溯源。未接线/无路由 → 诚实返回 ran:false。
+ */
+function registerCausal(ctx: Context, deps: MemoryToolsDeps): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'memory_causal',
+      description:
+        '立即执行一轮记忆因果抽取（LLM）：审视最近记忆条目间的因果/衍生关系，' +
+        '只新增 source→target 因果边（confidence≥0.6，add-only 幂等，审计可溯源）。' +
+        '适用于手动触发/验证因果链；平时由维护周期自动运行。',
+      parameters: {},
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ran: { type: 'boolean', required: true },
+            reviewed: { type: 'integer', required: true },
+            edges: { type: 'integer', required: true },
+            created: { type: 'integer', required: true },
+            skipped: { type: 'integer', required: true },
+          },
+          additionalProperties: false,
+        },
+        render: (_args, value) => [
+          {
+            type: 'text',
+            text: value.ran
+              ? `因果抽取完成：审 ${value.reviewed} 条 · 提议 ${value.edges} 条边 · 新建 ${value.created} · 跳过/拒绝 ${value.skipped}（add-only，审计可溯源）`
+              : '因果抽取未执行：当前无可用模型路由，或抽取器未接线。',
+          },
+        ],
+      },
+      async execute(_args, exec) {
+        if (deps.causalExtractor === undefined) {
+          return { ran: false, reviewed: 0, edges: 0, created: 0, skipped: 0 }
+        }
+        // 路由：优先从当前执行会话解析；无 agent 则传给抽取器回退其缓存路由（仅 RPC 面板场景）
+        const route = exec.agent === undefined ? undefined : resolveRoute(exec.agent.session, exec.agent)
+        const summary = await deps.causalExtractor.runOnce(route, { force: true })
+        if (summary === undefined) {
+          return { ran: false, reviewed: 0, edges: 0, created: 0, skipped: 0 }
+        }
+        return {
+          ran: true,
+          reviewed: summary.reviewed,
+          edges: summary.edges,
+          created: summary.created,
           skipped: summary.skipped,
         }
       },
