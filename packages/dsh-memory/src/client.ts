@@ -59,6 +59,11 @@ export interface MemoryStatsView {
   /** 最近一次远程验证失败原因（远程未生效时展示，杜绝静默回退） */
   embeddingInitError?: string
   lastMaintenanceAt?: string | null
+  /** E：反思/因果观测（宿主 status 已下发；缺则不渲染——跨版本兼容） */
+  reflection?: { reviewed: number; decisions: number; merged: number; archived: number; skipped: number }
+  reflectionCumulative?: { runs: number; decisions: number; merged: number; archived: number; skipped: number }
+  lastReflectionAt?: string | null
+  causal?: { reviewed: number; edges: number; created: number; skipped: number }
 }
 
 /**
@@ -75,6 +80,16 @@ export interface MemoryPanelConfigView {
   embeddingApiKeyResolved: boolean
 }
 
+/** 反思执行结果视图（与宿主 handleReflect 对齐） */
+export interface ReflectResultView {
+  ran: boolean
+  reviewed: number
+  decisions: number
+  merged: number
+  archived: number
+  skipped: number
+}
+
 /** 面板数据 API（apply 期从 ctx 装配，随组件 props 传递） */
 export interface MemoryPanelApi {
   list(status?: string, limit?: number): Promise<MemorySummaryView[]>
@@ -83,6 +98,8 @@ export interface MemoryPanelApi {
   get(id: string): Promise<MemoryDetailView | undefined>
   archive(id: string): Promise<boolean>
   status(): Promise<MemoryStatsView>
+  /** E：手动触发一轮 LLM 反思（RPC reflect 端点；force 即时执行，审计可回滚） */
+  reflect(): Promise<ReflectResultView>
   /** 读取当前生效配置（含 apiKey 解析状态） */
   getConfig(): Promise<MemoryPanelConfigView>
   /** 更新配置（仅变更项；宿主校验并持久化到 settings.yaml，插件内存重启生效） */
@@ -122,6 +139,10 @@ export function createMemoryApi(ctx: Context): MemoryPanelApi {
       const result = await call('archive', { id })
       const value = unwrap(result) as { archived: boolean }
       return value.archived
+    },
+    async reflect() {
+      const result = await call('reflect', {})
+      return unwrap(result) as ReflectResultView
     },
     async status() {
       const result = await call('status', {})
@@ -275,6 +296,17 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
     }
   }
 
+  const doReflect = async (): Promise<void> => {
+    try {
+      await props.api.reflect()
+      // 反思会归档/合并 → 列表与统计都需要刷新（统计含反思累计）
+      await refresh(query, kind, workspace)
+      refreshStats()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   const onSearch = (): void => {
     void refresh(query, kind, workspace)
   }
@@ -326,6 +358,22 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
           stats.lastMaintenanceAt !== undefined && stats.lastMaintenanceAt !== null
             ? React.createElement('div', { style: metaStyle }, `上次维护：${stats.lastMaintenanceAt}`)
             : null,
+          // E：反思/因果观测行（数据已由 status 下发；缺则不渲染——跨版本兼容）
+          stats.reflectionCumulative !== undefined
+            ? React.createElement(
+                'div',
+                { style: metaStyle },
+                `反思累计：${stats.reflectionCumulative.runs} 轮 · 裁决 ${stats.reflectionCumulative.decisions} · 合并 ${stats.reflectionCumulative.merged} · 归档 ${stats.reflectionCumulative.archived} · 跳过 ${stats.reflectionCumulative.skipped}`,
+              )
+            : null,
+          stats.lastReflectionAt !== undefined && stats.lastReflectionAt !== null
+            ? React.createElement('div', { style: metaStyle }, `上次反思：${stats.lastReflectionAt.slice(0, 10)}`)
+            : null,
+          stats.causal !== undefined
+            ? React.createElement('div', { style: metaStyle }, `因果：审 ${stats.causal.reviewed} · 建边 ${stats.causal.created}`)
+            : null,
+          // E：手动触发反思按钮（RPC reflect 端点已存在；force 即时执行）
+          React.createElement('button', { onClick: () => void doReflect(), style: { ...buttonStyle, marginTop: 4 } }, '运行反思'),
         )
       : null,
     React.createElement(
@@ -356,9 +404,14 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
       React.createElement('button', { onClick: onSearch, style: buttonStyle }, '搜索'),
     ),
     error !== '' ? React.createElement('div', { style: errorStyle }, error) : null,
-    React.createElement('div', { style: listStyle }, rows.length > 0 ? rows : React.createElement('div', null, '（暂无记忆）')),
-    selected !== undefined ? React.createElement(DetailPane, { entry: selected, onArchive: () => void doArchive(selected.id) }) : null,
-    // 配置区块（面板底部）：当前生效配置表单 + 保存（持久化到 settings.yaml 并实时热换生效）
+    // A：master-detail 并排分栏（列表左 + 详情右；窄屏自动换行叠层）
+    React.createElement(
+      'div',
+      { style: mainRowStyle },
+      React.createElement('div', { style: listStyle }, rows.length > 0 ? rows : React.createElement('div', null, '（暂无记忆）')),
+      selected !== undefined ? React.createElement(DetailPane, { entry: selected, onArchive: () => void doArchive(selected.id) }) : null,
+    ),
+    // 配置区块（F：默认折叠——低频配置渐进披露；面板底部）
     React.createElement(ConfigPane, { api: props.api, onSaved: refreshStats }),
   )
 }
@@ -388,12 +441,15 @@ const CONFIG_FIELDS: ConfigFieldDef[] = [
   { key: 'embeddingDimension', label: '远程维度', type: 'number' },
 ]
 
-/** 配置区块：草稿表单 + 保存（仅提交变更项） + 生效提示 */
+/** 配置区块：草稿表单 + 保存（仅提交变更项） + 生效提示。
+ * F（2026-08-18 拍板）：默认折叠——低频配置渐进披露；标题可点击展开/收起。 */
 function ConfigPane(props: { api: MemoryPanelApi; onSaved?: () => void }): React.ReactElement {
   // 草稿：字段 → 字符串（输入框统一字符串态，保存时按字段类型转换）
   const [draft, setDraft] = React.useState<Record<string, string>>({})
   const [resolved, setResolved] = React.useState(false)
   const [notice, setNotice] = React.useState('')
+  // F：折叠态（默认收起）
+  const [open, setOpen] = React.useState(false)
 
   React.useEffect(() => {
     void props.api
@@ -472,19 +528,32 @@ function ConfigPane(props: { api: MemoryPanelApi; onSaved?: () => void }): React
   return React.createElement(
     'div',
     { style: { ...detailStyle, marginTop: 12 } },
-    React.createElement('h4', null, '配置'),
+    // F：标题即折叠开关（渐进披露——低频配置默认收起，避免与数据视图混排）
     React.createElement(
-      'div',
-      { style: metaStyle },
-      `远程 API Key 状态：${resolved ? '已解析可用' : '未配置或环境变量未设置（支持字面 key 或 env:NAME）'}`,
+      'h4',
+      { style: { cursor: 'pointer', margin: 0 }, onClick: () => setOpen((prev) => !prev) },
+      `配置${open ? '（点击收起）' : '（点击展开）'}`,
     ),
-    rows,
-    React.createElement(
-      'div',
-      { style: { marginTop: 8 } },
-      React.createElement('button', { onClick: () => void save(), style: buttonStyle }, '保存'),
-      notice !== '' ? React.createElement('span', { style: { ...metaStyle, marginLeft: 8 } }, notice) : null,
-    ),
+    // 默认折叠：仅展开时渲染表单（getConfig 仍在挂载时拉取一次——草稿在展开前就绪，
+    // 避免展开后闪空；RPC 单次成本可忽略）
+    open
+      ? React.createElement(
+          'div',
+          null,
+          React.createElement(
+            'div',
+            { style: metaStyle },
+            `远程 API Key 状态：${resolved ? '已解析可用' : '未配置或环境变量未设置（支持字面 key 或 env:NAME）'}`,
+          ),
+          rows,
+          React.createElement(
+            'div',
+            { style: { marginTop: 8 } },
+            React.createElement('button', { onClick: () => void save(), style: buttonStyle }, '保存'),
+            notice !== '' ? React.createElement('span', { style: { ...metaStyle, marginLeft: 8 } }, notice) : null,
+          ),
+        )
+      : null,
   )
 }
 
@@ -517,8 +586,25 @@ function DetailPane(props: { entry: MemoryDetailView; onArchive: () => void }): 
 
 const panelStyle: React.CSSProperties = { padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }
 const statsStyle: React.CSSProperties = { font: 'var(--dsw-font-xs-13)', fontWeight: 600, color: 'var(--dsw-alias-label-secondary)' }
-const listStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 360, overflowY: 'auto' }
-const detailStyle: React.CSSProperties = { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: 8 }
+/** A：master-detail 并排分栏——列表左 + 详情右；窄屏（flex 换行）自动叠层 */
+const mainRowStyle: React.CSSProperties = { display: 'flex', flexDirection: 'row', flexWrap: 'wrap', gap: 8, alignItems: 'flex-start' }
+const listStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+  maxHeight: 360,
+  overflowY: 'auto',
+  flex: '1 1 320px',
+  minWidth: 280,
+}
+const detailStyle: React.CSSProperties = {
+  border: '1px solid var(--dsw-alias-border-l1)',
+  borderRadius: 6,
+  padding: 8,
+  // A：详情作为右栏（固定 ~420px；窄屏换行后占满）
+  flex: '0 1 420px',
+  minWidth: 260,
+}
 const metaStyle: React.CSSProperties = { font: 'var(--dsw-font-xxs-12)', color: 'var(--dsw-alias-label-tertiary)', margin: '2px 0' }
 /** 控件统一外观：官方输入/按钮形态（border-l2 边框 + layer-1 底 + primary 文字） */
 const inputStyle: React.CSSProperties = {

@@ -51,6 +51,7 @@ function fakeApi(overrides?: Partial<MemoryPanelApi>): MemoryPanelApi {
       embeddingModel: '',
       embeddingDimension: 1024,
     }),
+    reflect: async () => ({ ran: false, reviewed: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 }),
   }
   return { ...base, ...overrides }
 }
@@ -186,6 +187,10 @@ describe('MemoryPanel 组件行为（jsdom）', () => {
     try {
       await waitFor(() => expect(status.mock.calls.length).toBeGreaterThan(0))
       const before = status.mock.calls.length
+      // F：配置区默认折叠 → 先点击标题展开
+      await waitFor(() => expect(screen.getByText('配置（点击展开）')).toBeTruthy())
+      fireEvent.click(screen.getByText('配置（点击展开）'))
+      await waitFor(() => expect(screen.getByDisplayValue('https://a.example/v1')).toBeTruthy())
       // 修改 Base URL 输入框 → 与初始草稿不同（有变更项）
       fireEvent.change(screen.getByDisplayValue('https://a.example/v1'), { target: { value: 'https://b.example/v1' } })
       fireEvent.click(screen.getByText('保存'))
@@ -223,6 +228,86 @@ describe('MemoryPanel 组件行为（jsdom）', () => {
       fireEvent.click(screen.getByText(/\[fact\] 记忆内容甲/))
       await waitFor(() => expect(get).toHaveBeenCalledWith('mem-1'))
       await waitFor(() => expect(screen.getByText(/原文摘录：原文摘录/)).toBeTruthy())
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('E：统计区渲染反思/因果累计（status 已下发字段）', async () => {
+    const status = vi.fn(async () => ({
+      total: 2,
+      active: 2,
+      archived: 0,
+      byKind: { fact: 1, preference: 0, decision: 1, todo: 0, insight: 0 },
+      writeFailures: 0,
+      embeddingState: 'ready',
+      lastMaintenanceAt: null,
+      rejectedCount: 0,
+      reflection: { reviewed: 14, decisions: 0, merged: 0, archived: 0, skipped: 0 },
+      reflectionCumulative: { runs: 3, decisions: 1, merged: 1, archived: 0, skipped: 1 },
+      lastReflectionAt: '2026-08-18T00:00:00.000Z',
+      causal: { reviewed: 30, edges: 0, created: 0, skipped: 0 },
+    }))
+    const view = render(React.createElement(MemoryPanel, { api: fakeApi({ status }), close: () => {} }))
+    try {
+      await waitFor(() => expect(screen.getByText(/反思累计：3 轮/)).toBeTruthy())
+      expect(screen.getByText(/合并 1/)).toBeTruthy()
+      expect(screen.getByText(/上次反思：2026-08-18/)).toBeTruthy()
+      expect(screen.getByText(/因果：审 30 · 建边 0/)).toBeTruthy()
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('E：点击“运行反思”按钮 → reflect 被调并刷新统计', async () => {
+    const status = vi.fn(async () => ({
+      total: 0,
+      active: 0,
+      archived: 0,
+      byKind: { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 },
+      writeFailures: 0,
+      embeddingState: 'ready',
+      lastMaintenanceAt: null,
+      rejectedCount: 0,
+    }))
+    const reflect = vi.fn(async () => ({ ran: true, reviewed: 5, decisions: 1, merged: 1, archived: 0, skipped: 0 }))
+    const view = render(React.createElement(MemoryPanel, { api: fakeApi({ status, reflect }), close: () => {} }))
+    try {
+      await waitFor(() => expect(screen.getByText('运行反思')).toBeTruthy())
+      fireEvent.click(screen.getByText('运行反思'))
+      await waitFor(() => expect(reflect).toHaveBeenCalled(), { timeout: 2000 })
+      await waitFor(() => expect(status.mock.calls.length).toBeGreaterThan(1), { timeout: 2000 })
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('F：配置区默认折叠（标题可见，表单输入框默认不渲染），点击展开后渲染字段', async () => {
+    const status = vi.fn(async () => ({
+      total: 0,
+      active: 0,
+      archived: 0,
+      byKind: { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 },
+      writeFailures: 0,
+      embeddingState: 'ready',
+      lastMaintenanceAt: null,
+      rejectedCount: 0,
+    }))
+    const getConfig = vi.fn(async () => ({
+      embeddingApiBaseUrl: 'https://a.example/v1',
+      embeddingApiKey: 'sk-test',
+      embeddingApiKeyResolved: true,
+      embeddingModel: 'm',
+      embeddingDimension: 1024,
+    }))
+    const view = render(React.createElement(MemoryPanel, { api: fakeApi({ status, getConfig }), close: () => {} }))
+    try {
+      // 默认折叠：配置标题（带折叠提示）可见，但表单输入框（Base URL）不可见
+      await waitFor(() => expect(screen.getByText('配置（点击展开）')).toBeTruthy())
+      expect(screen.queryByDisplayValue('https://a.example/v1')).toBeNull()
+      // 点击标题展开 → 表单字段渲染
+      fireEvent.click(screen.getByText('配置（点击展开）'))
+      await waitFor(() => expect(screen.getByDisplayValue('https://a.example/v1')).toBeTruthy())
     } finally {
       view.unmount()
     }
