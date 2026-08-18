@@ -30,6 +30,10 @@
 - **C28（docs-as-code 校验，2026-08-18）**：`scripts/check-docs.mjs`（断链+中英结构一致性，零依赖）+ markdownlint-cli2（根 devDep + `.markdownlint-cli2.jsonc`）接线 CI；存量 29 处空白错误 `--fix` 清理。
 - **C29（反思实证修复，2026-08-18）**：生产 `memory_reflect` 端到端验证暴露两盲区——①焦点按重要度 top-20 漏检 imp6-7 真重复（生产 267 带内候选、逐字同文对全被 imp≥8 挤出被审集，实证）；②LLM 畸形输出静默当 0。修复：焦点改为**带内重合度优先**（maxBandJ 降序→重要度次级；无 peer 孤条目不占焦点，同对两端双向进集）+ `callLlm` 对无 `decisions` 字段输出显式 warn。TDD（先红 3 例→绿）。**在产生效确认**：21:02 宿主重启（PID 15896）已载入 C29（被审焦点 14→20=预算用满）；推翻了"可选 HMR 触碰即热载"假设——实证可靠生效路径＝**lib 先拷 + 宿主重启**（HMR 触碰不会重建插件实例，累计未归零）。`BAILIAN_API_KEY` 已字面化进 `~/.dsh/settings.yaml` memory.embeddingApiKey（备份 `.bak-20260818-211902`；此前仅存于启动 shell env，重启即失）。两次 memory_reflect 均 0 动作：窗口内确有 16 对非快照强重复（j≥0.6），但最强对均带内容差异（如 #8104/#8086=0.829 且后者多"3 处明显…"）→ **LLM 保守判 none 站得住**；畸形→warn 已加但宿主日志不可见→该分支未验证。
 
+- **C33（语义向量持续分片补齐，2026-08-18）**：`backfill(budget)`（预算批内生效）+ 维护周期每轮补一档（`BACKFILL_BUDGET=256`，限速防限流）；与 ensureAll 共用串行锁。背景：生产语义覆盖仅 18.7%（1534/8191），检索质量受限于关键词路径。
+- **C34（反思合并改语义门，2026-08-18）**：对齐权威（ai-memory `CONSOLIDATE_COSINE_THRESHOLD=0.75`）——`selectReflectionPairs` 双侧有向量时以 **cosine≥0.75** 为主门（抓语义近等价改写、不并仅主题相邻），任一侧无向量回退 token-Jaccard 带；`EmbeddingIndex.getVector` + `cosineSimilarity` 支撑。根因复盘：Jaccard 0.7-0.83"重复"多带内容差异，LLM 保守判 none 正确；语义门给"真同义改写"以可靠判定面。
+- **C35（memory_causal 手动触发，2026-08-18）**：新工具镜像 memory_reflect（force 共享维护批 runOnce；add-only/置信≥0.6 语义不变）；维护批早已接线（maintenance.ts:225），0 边根因=6h 门控未过+无手动入口。**在产验证**：21:49 重启（PID 6872）后 `memory_causal` 执行成功（审 30 条/0 边=候选多为近重复非真因果，诚实结果）。
+
 **接口契约变更（自学习）**：`MemoryEntry/NewMemoryInput/ExtractedMemory` + `selfRelevance?`；`effectiveImportance(importance, accessCount, selfRelevance=0)`（第三参缺省=0，两参调用不变）；`MemoryDetail` + `selfRelevance?`（无则省略键）；`memoryEntrySchema` + `optional`；提取 system prompt 规则 11。
 
 ## 三、已知风险点（诚实自曝）
@@ -42,14 +46,14 @@
 5. **CI/覆盖率门槛未实际触发**：仓库未上线 GitHub 前 workflow 不运行；阈值保守（按基线留余量）。
 6. **因果进检索仍未决策**：CausalRAG2 证据强（假因果降 F1），当前边仅审计不入检索、已有 confidence≥0.6+来源/workspace/superseded 建边校验——"置信≥阈值才入检索"是待决策的 A/B 候选（需产品意图）。
 7. **W2 selfRelevance 依赖 LLM 一次性打分质量**：档位（≥8→+2 / ≥6→+1）与封顶 +2 为保守参数（无离线评估，仅证据背书为"初始因子"）；LLM 若系统性高评/低评该维度会偏移保留面——需实机观察（可经 memory_detail 审计）。创建期一次性、不重写，Echo-Gap 安全。
-8. **生产仍为旧构建运行中**（C19 已停盘至最新）：新码含 W2 需**下一次重启**才在产生效；重启须带 `BAILIAN_API_KEY` export（密钥仅宿主 shell 继承 env，见生产报告附录）。
+8. **生产已为最新代码**（C33-35 已随 21:49 重启载入，PID 6872）：`BAILIAN_API_KEY` 已字面化进 settings.yaml——重启不再依赖 shell env。残余：**语义向量覆盖 18.7%**（1534/8191，C33 分片补齐收敛中）；C34 语义门在双侧有向量时生效（随覆盖扩大）。
 9. **残余历史风险**：400K 自动压缩策略漂移为宿主配置域（已补位）；extractor 失败重试重复 LLM 调用为已知成本；`memory.json` 迁移 `migrateAll` 期间并发写无（启动路径）——安全。
 
 ## 四、下次最该做的事
 
-1. **热更重启 → 在产复验**（含 W2）：按 `production-validation-report` 附录 A 择时重启（带 key），复验语义覆盖补齐、Q5 不再报错、`memory_detail` 可见 `selfRelevance`、因果表有产出。
+1. **观察语义补齐收敛与语义门效果**：1h 维护周期 backfill（C33）覆盖 18.7%→100% 的进程；覆盖过半后复跑 memory_reflect 观察 C34 语义门（cosine≥0.75）是否开始产出合并/归档。
 2. **selfRelevance 实机观察**：抽样 `memory_detail` 检查 LLM 对该维度的评分分布与档位边际；必要时调档位参数。
 3. **CI 真实接线**（上线 GitHub）：typecheck+test+覆盖率门跑通；按需收紧阈值。
 4. **Q7 探测集 delta 立项**：consolidation 质量度量（contradiction/staleness/recall@k/precision@k 只读探测集）——2b 轻量底座已就位。
-5. **因果进检索决策**：若产品意图是让因果边增强检索，按 CausalRAG2 证据做"置信≥阈值 + 来源/时序校验"分层；否则维持审计-only。
+5. **因果进检索决策**：`memory_causal` 手动入口已上线（C35，审 30 条/0 边——当前候选多为近重复非真因果）；若产品意图是让因果边增强检索，按 CausalRAG2 证据做"置信≥阈值 + 来源/时序校验"分层；否则维持审计-only。
 6. 既有项延续：备份脚本配计划任务；缓存命中率基线；memory.sqlite 维护效果观察。
