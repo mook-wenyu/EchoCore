@@ -108,3 +108,10 @@
    - 抽查一次 `memory_note` 非合并写入：**不再报 “not lossless JSON”**（Q5 修复生效标志）；
    - （可选）`PRAGMA quick_check`；手动 `memory_reflect` 后复查 `memory_causal_edges` 是否有行。
 
+### 附录 A.1 部署执行记录（2026-08-18 13:05，用户授权「不停 dsh，帮我部署」）
+- 已完成：仓库重建 `pnpm --filter @echocore/dsh-memory build`（lib 13:04:42）→ 将 23 个 lib 文件**直接覆盖**到 profile 链接指向的 pnpm store 包目录 `~/.dsh/profiles/web/node_modules/.pnpm/@echocore+dsh-memory@file+D_74875032194c9337fdfaa35b753fddb3/node_modules/@echocore/dsh-memory/lib`。
+- 验证：部署 lib 已含全部修复标记（`runtimeDegraded`/`dropOtherDimensionTables`/`migrateAll`/`reflectionCumulative`/`effectiveImportance`/lossless 安全省略键）；**Q5 旧缺陷（`mergedWithId: … : undefined`）已消失**。
+- 诚实边界：**运行中进程（PID 22644）不受影响、仍用旧码**（Node 模块内存缓存、宿主无插件热载机制——已查证）；**新码下一次重启生效**。
+- 备选路径说明：`pnpm update @echocore/dsh-memory` 因 registry 网络抖动（解析其它 `@deepseek-ai/*` 依赖失败）未成，改用离线直拷；因 profile 依赖为 `file:D:/TSProjects/EchoCore/packages/dsh-memory` 且源包 `lib` 已重建，**将来任何成功的 `pnpm install` 会从新源重新打包，保持一致**。
+- 重启须知（下次方便时）：在已 export `BAILIAN_API_KEY` 的 shell 重启 `dsh web`；重启后首启 `ensureAll` 会自动补齐缺失语义向量（约 6600 条 × 2560 维，一次性成本，见 §五-2）。
+
