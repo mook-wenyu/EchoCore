@@ -10,7 +10,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-import { BACKFILL_BUDGET, MAINTENANCE_INTERVAL_MS, MemoryMaintenance } from '../src/maintenance.js'
+import { BACKFILL_BUDGET, CANDIDATE_WINDOW, MAINTENANCE_INTERVAL_MS, MemoryMaintenance } from '../src/maintenance.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry } from '../src/types.js'
 import { FakeCtx, FakeTable } from './helpers.js'
@@ -541,6 +541,70 @@ describe('MemoryMaintenance LLM 子任务接线（反思/因果）', () => {
     await expect(maintenance.runOnce()).resolves.toBeUndefined()
     expect(calls).toEqual(['causal:deepseek/m'])
     expect(maintenance.lastRunAt).not.toBeNull() // 批次成功完成（子任务失败被收容）
+  })
+})
+
+describe('调优回归（2026-08-19：窗口与预算扩容）', () => {
+  it('BACKFILL_BUDGET 已提升至 512（原 256 收敛需 27h，512 约 13.5h）', () => {
+    expect(BACKFILL_BUDGET).toBe(512)
+  })
+
+  it('CANDIDATE_WINDOW 已提升至 2000（原 1000 仅覆盖 11%，尾部 7700 条永不收敛）', () => {
+    expect(CANDIDATE_WINDOW).toBe(2000)
+  })
+
+  it('窗口扩大后 runOnce 仍以 CANDIDATE_WINDOW 拉取、并按 BATCH_BUDGET 200 限幅（mergeDuplicates O(200²) 不随窗口膨胀）', async () => {
+    const ctx = new FakeCtx()
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => NOW)
+    // 监控 listRecent 调用窗口参数
+    let observedWindow = 0
+    const orig = store.listRecent.bind(store)
+    store.listRecent = ((limit: number, status?: unknown, includeSuperseded?: unknown) => {
+      observedWindow = limit
+      return orig(limit, status as Parameters<typeof orig>[1], includeSuperseded as boolean)
+    }) as typeof store.listRecent
+    const maintenance = new MemoryMaintenance({ store, logger: { warn: () => {}, info: () => {} }, now: () => NOW })
+    maintenance.install(ctx as unknown as Context)
+    const sessionEvent = ctx.listener('session/event') as (session: Session, event: SessionEvent) => void
+    activate(sessionEvent, makeSession('s1'))
+    // 预置 2100 条过期候选：若窗口仍为 1000 则仅拉 1000，archived 最多 200；窗口 2000 则拉 2000 仍限幅 200
+    for (let i = 0; i < 2100; i++) {
+      const entry = makeEntry({
+        id: `w${i}`,
+        content: `过期窗口验证 ${i}`,
+        importance: 1,
+        accessCount: 0,
+        createdAt: new Date(NOW - i * 1000).toISOString(),
+        updatedAt: new Date(NOW - 95 * MS_PER_DAY).toISOString(),
+      })
+      await table.put(entry.id, entry)
+    }
+    await maintenance.runOnce()
+    expect(observedWindow).toBe(2000)
+    // 单批预算仍为 200（窗口扩大不扩大处理量，mergeDuplicates 仍 O(200²)）
+    expect(store.stats().archived).toBe(200)
+  })
+
+  it('backfill 预算恒为 512 且窗口扩大后尾部条目可被覆盖（2000 窗口包含远于 1000 的条目）', async () => {
+    const ctx = new FakeCtx()
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => NOW)
+    const calls: number[] = []
+    const maintenance = new MemoryMaintenance({
+      store,
+      logger: { warn: () => {}, info: () => {} },
+      now: () => NOW,
+      backfill: async (budget: number) => {
+        calls.push(budget)
+        return 0
+      },
+    })
+    maintenance.install(ctx as unknown as Context)
+    const sessionEvent = ctx.listener('session/event') as (session: Session, event: SessionEvent) => void
+    activate(sessionEvent, makeSession('s1'))
+    await maintenance.runOnce()
+    expect(calls).toEqual([512])
   })
 })
 

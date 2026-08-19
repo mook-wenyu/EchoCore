@@ -27,7 +27,11 @@ import { getLoadablePath } from '@photostructure/sqlite-vec'
 
 import type { MemoryEntry } from './types.js'
 
-/** 嵌入批次大小（用户拍板 128/批，2026-08-17；与 EmbeddingService.embedMany 一致） */
+/**
+ * 嵌入批次大小（用户拍板 128/批，2026-08-17；与 EmbeddingService.embedMany 一致）。
+ * 维护侧 BACKFILL_BUDGET 已调优至 512（夜间可 1024），单周期需 4 批（512/128）；
+ * 嵌入侧批次大小保持 128 不变，批次内事务"全有或全无"，与维护预算协同收敛。
+ */
 export const EMBED_BATCH_SIZE = 128
 
 /** 嵌入索引依赖 */

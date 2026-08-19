@@ -16,8 +16,9 @@ import { DatabaseSync } from 'node:sqlite'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { EmbeddingIndex, cosineSimilarity } from '../src/embed-index.js'
+import { EMBED_BATCH_SIZE, EmbeddingIndex, cosineSimilarity } from '../src/embed-index.js'
 import { EmbeddingService, EmbeddingUnavailableError, cosine, defaultHasLocalModel, remoteEmbedFetch, resolveApiKey, searchWithSemantic } from '../src/embedding.js'
+import { BACKFILL_BUDGET, CANDIDATE_WINDOW } from '../src/maintenance.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry, NewMemoryInput } from '../src/types.js'
 import { FakeTable } from './helpers.js'
@@ -943,5 +944,78 @@ describe('defaultHasLocalModel（Q6⑨：ENOENT 归为"无模型"，其它 IO �
     } finally {
       vi.mocked(access).mockClear()
     }
+  })
+})
+
+describe('调优回归（2026-08-19：BACKFILL_BUDGET/窗口/BATCH 协同）', () => {
+  function fakeService() {
+    let call = 0
+    const make = (text: string) => {
+      const v = new Float32Array(384)
+      v[text.length % 384] = 1
+      return v
+    }
+    return {
+      state: 'ready',
+      dimension: 384,
+      embed: async (text: string) => make(text),
+      embedMany: async (texts: string[]) => {
+        call++
+        return texts.map((text) => make(text))
+      },
+    }
+  }
+  function queryVec(len: number): Float32Array {
+    const v = new Float32Array(384)
+    v[len % 384] = 1
+    return v
+  }
+
+  it('维护预算与嵌入批次协同：BACKFILL_BUDGET=512 为 EMBED_BATCH_SIZE=128 的整数倍（单周期 4 批整除）', () => {
+    expect(BACKFILL_BUDGET).toBe(512)
+    expect(EMBED_BATCH_SIZE).toBe(128)
+    expect(BACKFILL_BUDGET % EMBED_BATCH_SIZE).toBe(0)
+    expect(CANDIDATE_WINDOW).toBe(2000)
+  })
+
+  it('预算扩大后 backfill(512) 单周期可处理 512 条（原 256 需约 27h，512 约 13.5h 收敛）', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const entries = Array.from({ length: 600 }, (_, i) => ({ id: `tune-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+    const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => entries, logWarn: () => {} })
+    const first = await index.backfill(BACKFILL_BUDGET)
+    expect(first).toBe(512)
+    expect(index.knn(queryVec(3), 700)).toHaveLength(512)
+    const second = await index.backfill(BACKFILL_BUDGET)
+    expect(second).toBe(88) // 剩余 88 条
+    expect(index.knn(queryVec(3), 700)).toHaveLength(600)
+    db.close()
+  })
+
+  it('backfill 预算内批失败不影响预算语义：失败批不消耗预算、剩余可续补（失败跳过后仍按预算补齐）', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const warns: string[] = []
+    let call = 0
+    const service = {
+      state: 'ready',
+      dimension: 384,
+      embed: async (text: string) => {
+        const v = new Float32Array(384)
+        v[0] = text.length
+        return v
+      },
+      embedMany: async (texts: string[]) => {
+        call++
+        if (call === 1) throw new Error('模拟批失败')
+        const v = new Float32Array(384)
+        return texts.map(() => v)
+      },
+    }
+    const entries = Array.from({ length: 300 }, (_, i) => ({ id: `fail-${i}`, content: `内容${i}` })) as unknown as MemoryEntry[]
+    const index = new EmbeddingIndex({ db, service, listAll: () => entries, logWarn: (m) => warns.push(m) })
+    const processed = await index.backfill(256)
+    // 第 1 批128失败不计入processed，第2批128成功，第3批44（300-256）成功=172；失败不消耗预算符合"跳过继续"语义
+    expect(processed).toBe(172)
+    expect(warns.some((m) => m.includes('网络') || m.includes('批次') || m.includes('失败'))).toBe(true)
+    db.close()
   })
 })

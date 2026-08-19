@@ -205,6 +205,14 @@ export class MemoryStore {
     }
   }
 
+  /**
+   * 维护游标预留（2026-08-19 调优 YAGNI 说明）：
+   * 未来若 CANDIDATE_WINDOW 改为滚动游标分片（按 createdAt 游标分页轮询，N 周期
+   * 覆盖全库），可在此持久化 lastMaintenanceCursor（string | null，按 createdAt+id
+   * 游标）。当前仅扩大窗口至 2000 先解尾部收敛，不过度设计。
+   */
+  private lastMaintenanceCursor: string | null = null
+
   /** 当前时刻 ISO 字符串 */
   private iso(): string {
     return new Date(this.now()).toISOString()
