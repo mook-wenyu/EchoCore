@@ -13,7 +13,15 @@ import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 
 import {
   MemoryReflector,
+  PEER_MIN_JACCARD,
+  PEER_MIN_TOKEN_OVERLAP,
   REFLECT_INTERVAL_MS,
+  REFLECT_SEMANTIC_THRESHOLD,
+  REFLECT_SEMANTIC_THRESHOLD_LOCAL,
+  REFLECT_SEMANTIC_THRESHOLD_REMOTE,
+  REFLECT_WINDOW,
+  REFLECTION_SYSTEM_PROMPT,
+  getSemanticThresholdForDim,
   parseReflectionDecisions,
   selectReflectionPairs,
 } from '../src/reflect.js'
@@ -253,12 +261,125 @@ describe('selectReflectionPairs', () => {
   })
 
   it('焦点预算受 REFLECT_FOCUS_BUDGET 上限约束（20）', () => {
+    // 调优后需 overlap≥2 才算候选，故用至少 2 个公共 token 的内容（word common）而非单 token "word"
     const entries: MemoryEntry[] = []
     for (let i = 0; i < 25; i++) {
-      entries.push(makeEntry({ id: `e${i}`, content: `word ${i}`, importance: i % 10 + 1 }))
+      entries.push(makeEntry({ id: `e${i}`, content: `word common token ${i} extra`, importance: i % 10 + 1 }))
     }
     const pairs = selectReflectionPairs(entries)
     expect(pairs).toHaveLength(20)
+  })
+})
+
+describe('阈值调优：语义阈值按维度区分（384→0.72, 1024→0.75）', () => {
+  /** 构造指定维度与余弦的向量对：a=[1,0...], b=[cos,sin,0...] → cosine=cos */
+  function makeVecPair(dim: number, cos: number): { a: Float32Array; b: Float32Array } {
+    const a = new Float32Array(dim)
+    const b = new Float32Array(dim)
+    a[0] = 1
+    const sin = Math.sqrt(Math.max(0, 1 - cos * cos))
+    b[0] = cos
+    b[1] = sin
+    // 归一化已保证（√(cos²+sin²)=1）
+    return { a, b }
+  }
+
+  it('getSemanticThresholdForDim：384→0.72，其它→0.75', () => {
+    expect(getSemanticThresholdForDim(384)).toBe(REFLECT_SEMANTIC_THRESHOLD_LOCAL)
+    expect(REFLECT_SEMANTIC_THRESHOLD_LOCAL).toBe(0.72)
+    expect(getSemanticThresholdForDim(1024)).toBe(REFLECT_SEMANTIC_THRESHOLD_REMOTE)
+    expect(REFLECT_SEMANTIC_THRESHOLD_REMOTE).toBe(0.75)
+    expect(getSemanticThresholdForDim(2)).toBe(0.75)
+    expect(REFLECT_SEMANTIC_THRESHOLD).toBe(0.75)
+  })
+
+  it('384 维：cos=0.73≥0.72 入选（技术文档类 paraphrase 区间救援）', () => {
+    const a = makeEntry({ id: 'a384', content: 'x y z', importance: 5 })
+    const b = makeEntry({ id: 'b384', content: 'u v w', importance: 5 })
+    const { a: va, b: vb } = makeVecPair(384, 0.73)
+    const embedding = { getVector: (id: string) => (id === 'a384' ? va : id === 'b384' ? vb : undefined) }
+    const pairs = selectReflectionPairs([a, b], embedding)
+    expect(pairs.find((p) => p.focus.id === 'a384')?.peers.map((p) => p.id)).toContain('b384')
+  })
+
+  it('1024 维：cos=0.73<0.75 排除（远程阈值更严）', () => {
+    const a = makeEntry({ id: 'a1024', content: 'x y z', importance: 5 })
+    const b = makeEntry({ id: 'b1024', content: 'u v w', importance: 5 })
+    const { a: va, b: vb } = makeVecPair(1024, 0.73)
+    const embedding = { getVector: (id: string) => (id === 'a1024' ? va : id === 'b1024' ? vb : undefined) }
+    const pairs = selectReflectionPairs([a, b], embedding)
+    // 双侧向量但余弦未达 0.75 → 无合格对，双方均不作焦点
+    expect(pairs.some((p) => p.focus.id === 'a1024')).toBe(false)
+    expect(pairs.some((p) => p.focus.id === 'b1024')).toBe(false)
+  })
+
+  it('边界：384 维 cos=0.72 恰好入选，0.71 排除；1024 维 cos=0.75 入选，0.74 排除', () => {
+    // 384: 0.72 边界
+    const a1 = makeEntry({ id: 'a384_72', content: 'p q', importance: 5 })
+    const b1 = makeEntry({ id: 'b384_72', content: 'r s', importance: 5 })
+    const { a: va1, b: vb1 } = makeVecPair(384, 0.72)
+    const emb1 = { getVector: (id: string) => (id === 'a384_72' ? va1 : id === 'b384_72' ? vb1 : undefined) }
+    expect(selectReflectionPairs([a1, b1], emb1).find((p) => p.focus.id === 'a384_72')?.peers.map((p) => p.id)).toContain('b384_72')
+    const { a: va2, b: vb2 } = makeVecPair(384, 0.71)
+    const emb2 = { getVector: (id: string) => (id === 'a384_72' ? va2 : id === 'b384_72' ? vb2 : undefined) }
+    expect(selectReflectionPairs([a1, b1], emb2).some((p) => p.focus.id === 'a384_72')).toBe(false)
+
+    // 1024: 0.75 边界
+    const a2 = makeEntry({ id: 'a1024_75', content: 'p q', importance: 5 })
+    const b2 = makeEntry({ id: 'b1024_75', content: 'r s', importance: 5 })
+    const { a: va3, b: vb3 } = makeVecPair(1024, 0.75)
+    const emb3 = { getVector: (id: string) => (id === 'a1024_75' ? va3 : id === 'b1024_75' ? vb3 : undefined) }
+    expect(selectReflectionPairs([a2, b2], emb3).find((p) => p.focus.id === 'a1024_75')?.peers.map((p) => p.id)).toContain('b1024_75')
+    const { a: va4, b: vb4 } = makeVecPair(1024, 0.74)
+    const emb4 = { getVector: (id: string) => (id === 'a1024_75' ? va4 : id === 'b1024_75' ? vb4 : undefined) }
+    expect(selectReflectionPairs([a2, b2], emb4).some((p) => p.focus.id === 'a1024_75')).toBe(false)
+  })
+})
+
+describe('阈值调优：Jaccard 下界 0.08 + overlap≥2', () => {
+  it('PEER_MIN_JACCARD 已降至 0.08（PEER_MIN_TOKEN_OVERLAP=2）', () => {
+    expect(PEER_MIN_JACCARD).toBe(0.08)
+    expect(PEER_MIN_TOKEN_OVERLAP).toBe(2)
+  })
+
+  it('Jaccard=0.11(≈2/18) 在 [0.08,0.15) 区间：旧阈值漏掉，现阈值入选（overlap≥2）', () => {
+    // 2/18≈0.111：旧 0.15 下被漏，新 0.08 下应入选
+    const focus = makeEntry({ id: 'focus', content: 'a b c d e f g h i j', importance: 10 }) // 10 tokens
+    const peer = makeEntry({ id: 'peer', content: 'a b z y x w v u q r', importance: 1 }) // 10 tokens, overlap a,b
+    const pairs = selectReflectionPairs([focus, peer])
+    expect(pairs.find((p) => p.focus.id === 'focus')?.peers.map((p) => p.id)).toContain('peer')
+  })
+
+  it('Jaccard≈0.07(2/28≈0.071) 仍低于下界：排除', () => {
+    // 2/28≈0.071 <0.08 → 排除（即使 overlap=2）
+    const focus = makeEntry({
+      id: 'focus',
+      content: 'a b c d e f g h i j k l m n',
+      importance: 10,
+    }) // 14 tokens
+    const peer = makeEntry({
+      id: 'peer',
+      content: 'a b z y x w v u q r s t o p',
+      importance: 1,
+    }) // 14 tokens? overlap 2 => union 26 => 2/26≈0.076 <0.08 排除
+    const pairs = selectReflectionPairs([focus, peer])
+    expect(pairs.some((p) => p.focus.id === 'focus' && p.peers.some((x) => x.id === 'peer'))).toBe(false)
+  })
+
+  it('Jaccard=0.2 但 overlap=1：因辅助门被排除（短文本噪声防护）', () => {
+    const focus = makeEntry({ id: 'focus', content: 'a b c', importance: 10 }) // tokens a,b,c
+    const peer = makeEntry({ id: 'peer', content: 'a x y', importance: 1 }) // tokens a,x,y => overlap 1, union 5 => 0.2
+    const pairs = selectReflectionPairs([focus, peer])
+    // overlap 1 <2 → 不合格，尽管 Jaccard 0.2 在带内
+    expect(pairs.some((p) => p.focus.id === 'focus' && p.peers.some((x) => x.id === 'peer'))).toBe(false)
+    expect(pairs.find((p) => p.focus.id === 'focus')).toBeUndefined()
+  })
+
+  it('Jaccard=0.5 且 overlap=2：正常入选', () => {
+    const focus = makeEntry({ id: 'focus', content: 'a b c d', importance: 10 }) // 4 tokens
+    const peer = makeEntry({ id: 'peer', content: 'a b x y', importance: 1 }) // overlap 2 => 2/6≈0.333 带内且 overlap≥2
+    const pairs = selectReflectionPairs([focus, peer])
+    expect(pairs.find((p) => p.focus.id === 'focus')?.peers.map((p) => p.id)).toContain('peer')
   })
 })
 
@@ -501,6 +622,133 @@ describe('反思审计详情与观测（A′ 建议：动作需带依据引用�
     await reflector.runOnce({ provider: 'deepseek', model: 'm' })
     // 互为带内 peer 的一对：两个焦点都以各自 peer 进入提示词 → reviewed=2
     expect(reflector.lastSummary).toEqual({ reviewed: 2, decisions: 0, merged: 0, archived: 0, skipped: 0 })
+  })
+})
+
+describe('窗口扩大至 400：旧重复能进窗', () => {
+  it('REFLECT_WINDOW 已扩大至 400', () => {
+    expect(REFLECT_WINDOW).toBe(400)
+  })
+
+  it('400 窗口下 250 位的旧重复仍能被审（200 窗下会漏）', async () => {
+    // 构造 350 条：348 条孤条目（最新）+ 1 对旧重复（排在 250+ 位）
+    const entries: MemoryEntry[] = []
+    for (let i = 0; i < 348; i++) {
+      entries.push(
+        makeEntry({
+          id: `iso${i}`,
+          content: `isolated ${i}`,
+          importance: 1,
+          createdAt: new Date(NOW).toISOString(),
+        }),
+      )
+    }
+    const older = makeEntry({
+      id: 'oldDupA',
+      content: 'CourtGrantTypes 迁至 Project persistence',
+      importance: 6,
+      createdAt: new Date(NOW - 5_000).toISOString(),
+    })
+    const newer = makeEntry({
+      id: 'oldDupB',
+      content: 'CourtGrantTypes 已迁移到 Project 持久化机制',
+      importance: 6,
+      createdAt: new Date(NOW - 4_000).toISOString(),
+    })
+    entries.push(older, newer)
+    // 混合打乱后仍按 createdAt 倒序入窗，旧重复在 350 条内 → 400 窗应包含
+    const { reflector } = makeReflector(entries, '{"decisions":[]}')
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    // 旧重复对至少应产生 reviewed>0（焦点存在）
+    expect(summary?.reviewed).toBeGreaterThan(0)
+  })
+
+  it('超过 400 窗的最旧条目不进窗（边界）', async () => {
+    const entries: MemoryEntry[] = []
+    // 500 条：498 条最新孤条目 + 1 对极旧重复（排在 499-500 位，超出 400 窗）
+    for (let i = 0; i < 498; i++) {
+      entries.push(
+        makeEntry({
+          id: `iso${i}`,
+          content: `isolated ${i}`,
+          importance: 1,
+          createdAt: new Date(NOW).toISOString(),
+        }),
+      )
+    }
+    const older = makeEntry({
+      id: 'veryOldA',
+      content: 'CourtGrantTypes 迁至 Project persistence',
+      importance: 6,
+      createdAt: new Date(NOW - 100_000).toISOString(),
+    })
+    const newer = makeEntry({
+      id: 'veryOldB',
+      content: 'CourtGrantTypes 已迁移到 Project 持久化机制',
+      importance: 6,
+      createdAt: new Date(NOW - 90_000).toISOString(),
+    })
+    entries.push(older, newer)
+    const { reflector } = makeReflector(entries, '{"decisions":[]}')
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    // 极旧对超出 400 窗 → 不应被审（reviewed 仅来自窗口内孤条目可能为 0）
+    // 由于孤条目之间几乎无相似，reviewed 应为 0
+    expect(summary?.reviewed).toBe(0)
+  })
+})
+
+describe('可观测 & 提示词调优', () => {
+  it('REFLECTION_SYSTEM_PROMPT 包含 few-shot 示例与预筛说明（已预筛高相似对，多数应判 merge/archive）', () => {
+    expect(REFLECTION_SYSTEM_PROMPT).toContain('已由相似度预筛')
+    expect(REFLECTION_SYSTEM_PROMPT).toContain('多数对确实存在')
+    expect(REFLECTION_SYSTEM_PROMPT).toContain('示例1')
+    expect(REFLECTION_SYSTEM_PROMPT).toContain('示例2')
+    expect(REFLECTION_SYSTEM_PROMPT).toContain('CourtGrantTypes')
+    expect(REFLECTION_SYSTEM_PROMPT).toContain('"action":"merge"')
+    expect(REFLECTION_SYSTEM_PROMPT).toContain('"action":"none"')
+  })
+
+  it('semanticHitRate 可观测：有 embedding 时 summary 暴露 0..1 的覆盖率', async () => {
+    const { older, newer } = duplicatePair()
+    const table = new FakeTable()
+    for (const e of [older, newer]) void table.put(e.id, e)
+    const va = new Float32Array([1, 0, 0])
+    const vb = new Float32Array([1, 0, 0])
+    const embedding = { getVector: (id: string) => (id === 'older01' ? va : id === 'newer01' ? vb : undefined) }
+    const llm = new (class {
+      calls: unknown[] = []
+      async *stream(opts: unknown) {
+        this.calls.push(opts)
+        yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+        yield { type: 'text-delta', index: 0, text: '{"decisions":[]}' } as StreamChunk
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: '{"decisions":[]}' } } as StreamChunk
+        yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+      }
+    })()
+    const infos: unknown[] = []
+    const warns: unknown[] = []
+    const reflector = new MemoryReflector({
+      store: new MemoryStore(table, () => NOW),
+      llm: llm as never,
+      logger: { warn: (...a: unknown[]) => warns.push(a), info: (...a: unknown[]) => infos.push(a) },
+      now: () => NOW,
+      embedding,
+    })
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(summary?.semanticHitRate).toBeDefined()
+    expect(summary?.semanticHitRate).toBeGreaterThanOrEqual(0)
+    expect(summary?.semanticHitRate).toBeLessThanOrEqual(1)
+    // 2/2 有向量 → 覆盖率 1.0
+    expect(summary?.semanticHitRate).toBe(1)
+    // 直方图日志已输出
+    expect(infos.some((x) => String(x).includes('向量覆盖'))).toBe(true)
+  })
+
+  it('无 embedding 时 semanticHitRate 为 undefined（不误报）', async () => {
+    const { older, newer } = duplicatePair()
+    const { reflector } = makeReflector([older, newer], '{"decisions":[]}')
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(summary?.semanticHitRate).toBeUndefined()
   })
 })
 

@@ -16,7 +16,8 @@
  *   保证每次动作可溯源、可回滚（依据引用是"只操作有来源条目"护栏的可审计面）。
  *
  * 覆盖范围补盲：既有规则合并已覆盖 tokenJaccard ≥ 0.85 的近似重复（maintenance
- * 任务 a）与 create 的 supersede（≥0.7）——本模块只补 [0.15, 0.85) 的语义盲区。
+ * 任务 a）与 create 的 supersede（≥0.7）——本模块只补 [0.08, 0.85) 的语义盲区
+ * （2026-08-18 调优后下界由 0.15 降至 0.08，并加 minTokenOverlap≥2 辅助门）。
  */
 
 import { BlockAssembler, createUserMessage, type LlmRuntime, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -31,8 +32,12 @@ import type { MemoryEntry } from './types.js'
 /** 自动周期门控：距上次成功执行未满该间隔则跳过（不打 LLM） */
 export const REFLECT_INTERVAL_MS = 6 * 3_600_000
 
-/** 候选窗口：listRecent 拉取量（只审最新前 N 条，控制单次负载） */
-export const REFLECT_WINDOW = 200
+/**
+ * 候选窗口：listRecent 拉取量（只审最新前 N 条，控制单次负载）
+ * 2026-08-18 调优：8705 规模下 200 窗仅覆盖 2.3%，旧重复永不进窗；
+ * 扩大至 400 并保持 maxSim 优先，使旧重复有机会被审（分层采样思想的轻量实现）。
+ */
+export const REFLECT_WINDOW = 400
 
 /** 每批「焦点」条目数上限 */
 export const REFLECT_FOCUS_BUDGET = 20
@@ -44,17 +49,41 @@ export const REFLECT_PEERS_PER_FOCUS = 3
  * C34（2026-08-18 拍板）：语义合并门——双侧有向量时 cosine ≥ 该值才算候选对
  * （对齐 ai-memory `CONSOLIDATE_COSINE_THRESHOLD=0.75`：抓语义近等价表述，
  * 不并仅主题相邻；任一侧无向量 → 回退 token-Jaccard 带）。随 C33 覆盖补齐扩大生效。
+ * 2026-08-18 调优：按维度区分阈值（384 维本地 bge-m3/MiniLM 实测技术文档 paraphrase
+ * 在 0.70-0.78 区间被截掉，0.72 更宽松；1024 维远程保持 0.75 严谨）。
  */
 export const REFLECT_SEMANTIC_THRESHOLD = 0.75
+/** 本地 384 维语义阈值（更宽松，避免技术文档类改写被截） */
+export const REFLECT_SEMANTIC_THRESHOLD_LOCAL = 0.72
+/** 远程 1024 维语义阈值（保持权威值） */
+export const REFLECT_SEMANTIC_THRESHOLD_REMOTE = 0.75
+
+/**
+ * 根据向量维度返回语义阈值（显式降级语义+中文注释：非防御性兜底）
+ * - 维度 384 → 0.72（本地 MiniLM/bge-m3 小模型区间宽松）
+ * - 其他（如 1024 远程）→ 0.75（维持权威阈值）
+ * 若无法得知维度（如向量缺失）调用方应走 Jaccard 回退，不调用此函数。
+ */
+export function getSemanticThresholdForDim(dim: number): number {
+  // 显式判断：仅 384 走宽松阈值，其余一律 0.75（不过严也不过松）
+  return dim === 384 ? REFLECT_SEMANTIC_THRESHOLD_LOCAL : REFLECT_SEMANTIC_THRESHOLD_REMOTE
+}
 
 /** LLM 输出上限 */
 export const REFLECT_MAX_TOKENS = 1024
 
-/** peer 相似带下界：低于此值语义关联太弱，交由纯函数时剔除 */
-const PEER_MIN_JACCARD = 0.15
+/**
+ * peer 相似带下界：低于此值语义关联太弱，交由纯函数时剔除
+ * 2026-08-18 调优：由 0.15 降至 0.08（短文本如 "pnpm workspace" vs "pnpm 管理多包"
+ * 实测 Jaccard≈0.08 曾被漏，降阈召回；配合 minTokenOverlap≥2 防短文本噪声放大）。
+ */
+export const PEER_MIN_JACCARD = 0.08
 
 /** peer 相似带上界：≥ 此值属既有规则合并域（maintenance 任务 a），本模块不重复 */
-const PEER_MAX_JACCARD = 0.85
+export const PEER_MAX_JACCARD = 0.85
+
+/** 短文本噪声辅助门：Jaccard 带内仍需至少 2 个 token 重合才算候选 */
+export const PEER_MIN_TOKEN_OVERLAP = 2
 
 /** 反思依赖（store/llm/logger/now 注入，便于单测） */
 export interface ReflectionDeps {
@@ -62,7 +91,7 @@ export interface ReflectionDeps {
   llm: Pick<LlmRuntime, 'stream'>
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
   now: () => number
-  /** C34：语义门取向量（有向量时 cosine≥0.75 为主门；缺省无向量 → Jaccard 带回退） */
+  /** C34：语义门取向量（有向量时 cosine≥阈值 为主门；缺省无向量 → Jaccard 带回退） */
   embedding?: { getVector(id: string): Float32Array | undefined }
 }
 
@@ -78,6 +107,12 @@ export interface ReflectionSummary {
   archived: number
   /** none 或拒绝执行（已归档/被覆盖/跨域等）数量 */
   skipped: number
+  /**
+   * 可观测：语义向量覆盖率（0..1），用于度量"向量覆盖仅 21.8% 双侧命中 p²≈3.5% 导致救援失效"
+   * 计算 = 候选窗口内有向量条目数 / 窗口总条目数；无 embedding 时 undefined。
+   * 低成本可观测，不引入直方图日志的额外复杂度亦可（此处同时在 runReflection 中 info 日志）。
+   */
+  semanticHitRate?: number
 }
 
 /** 一轮反思裁决 */
@@ -105,8 +140,14 @@ export interface ReflectionCumulative {
   skipped: number
 }
 
-/** 反思系统提示词（只判定近似重复/矛盾，禁止其它动作） */
-const REFLECTION_SYSTEM_PROMPT = `你是一个记忆反思器，审视已有记忆条目之间的语义近似重复与跨条目矛盾。
+/**
+ * 反思系统提示词（只判定近似重复/矛盾，禁止其它动作）
+ * 2026-08-18 调优：补充 2 个 few-shot 示例（1 个该合并的重复对、1 个该判 none 的无关对），
+ * 并显式说明"已预筛高相似对，多数应判 merge/archive"，纠正模型倾向 none 的保守偏置。
+ */
+export const REFLECTION_SYSTEM_PROMPT = `你是一个记忆反思器，审视已有记忆条目之间的语义近似重复与跨条目矛盾。
+
+输入说明：下列记忆对已由相似度预筛（语义余弦≥阈值或 Jaccard∈[0.08,0.85)且重合token≥2），多数对确实存在近似重复或矛盾，请倾向于判 merge/archive；仅当两条确实无关或证据不足时判 none，避免过度保守。
 
 判断规则：
 1. 语义近似重复（action: merge）：两条记忆表述同一事实，仅措辞/详略不同（token 重合度低于既有规则的 0.85 合并域）。
@@ -117,6 +158,16 @@ const REFLECTION_SYSTEM_PROMPT = `你是一个记忆反思器，审视已有记�
 - 不得建议改写任何记忆内容、调整重要性、或新建/合成新记忆。
 - 只允许在两个都来自记忆库（都有来源引用）的条目之间判定。
 - 每条裁决必须引用 focus 与 peer 的完整 id（#<id>）。
+
+示例1（应判 merge——同一事实的措辞改写）：
+焦点 #dupOld kind=fact content=CourtGrantTypes 迁至 Project persistence
+对比 #dupNew kind=fact content=CourtGrantTypes 已迁移到 Project 持久化机制
+→ {"focusId":"dupOld","peerId":"dupNew","action":"merge","reason":"同一事实的措辞改写"}
+
+示例2（应判 none——主题无关）：
+焦点 #aaa kind=fact content=优先使用 pnpm 管理依赖
+对比 #bbb kind=fact content=项目部署在 Vercel 平台
+→ {"focusId":"aaa","peerId":"bbb","action":"none","reason":"主题无关，无重复或矛盾"}
 
 输出严格 JSON（不要输出任何其他文字）：
 {"decisions":[{"focusId":"<focus 完整 id>","peerId":"<peer 完整 id>","action":"merge|archive|none","reason":"简短中文理由"}]}
@@ -198,6 +249,7 @@ export function parseReflectionDecisions(text: string): ReflectionDecision[] {
  * 纯函数：条目对 token 集合 Jaccard（0..1），与 store.tokenJaccard 分词语义一致
  * （tokenize(content + tags)）。selectReflectionPairs 为纯函数（签名不含 store），
  * 故本地复用 tokenize 保证确定性可测，语义对齐 store 的 token 缓存。
+ * 2026-08-18 调优：新增 minTokenOverlap≥2 辅助门，缓解短文本 Jaccard 过敏感问题。
  */
 function jaccardOf(a: MemoryEntry, b: MemoryEntry): number {
   const setA = new Set(tokenize(`${a.content} ${a.tags.join(' ')}`))
@@ -212,16 +264,34 @@ function jaccardOf(a: MemoryEntry, b: MemoryEntry): number {
 }
 
 /**
+ * 带重合数的 Jaccard 计算（用于 PEER_MIN_TOKEN_OVERLAP 门控）
+ * 返回 { jaccard, overlap }，与 jaccardOf 同分词语义
+ */
+function jaccardWithOverlap(a: MemoryEntry, b: MemoryEntry): { jaccard: number; overlap: number } {
+  const setA = new Set(tokenize(`${a.content} ${a.tags.join(' ')}`))
+  const setB = new Set(tokenize(`${b.content} ${b.tags.join(' ')}`))
+  if (setA.size === 0 || setB.size === 0) return { jaccard: 0, overlap: 0 }
+  let intersection = 0
+  for (const token of setA) {
+    if (setB.has(token)) intersection++
+  }
+  const union = setA.size + setB.size - intersection
+  const jaccard = union === 0 ? 0 : intersection / union
+  return { jaccard, overlap: intersection }
+}
+
+/**
  * 选取反思焦点 + 各自的候选对比条目（纯函数，供测试）。
- * - 焦点策略（2026-08-18 实证修复 + C34 语义门）：
+ * - 焦点策略（2026-08-18 实证修复 + C34 语义门 + 2026-08-18 调优）：
  *   ① 焦点 = window 内"存在 ≥1 个合格对比对"的条目，按【最强对相似度降序 → 重要度
  *      降序 → 创建时间倒序 → id 稳定】取前 REFLECT_FOCUS_BUDGET；无 peer 的孤条目
  *      不占焦点（无对可审，喂 LLM 纯浪费 token）。
  *   ② 对级合格判定（相似度来源二选一）：
- *      - 双侧有向量（embedding.getVector）→ **语义余弦 ≥ REFLECT_SEMANTIC_THRESHOLD
- *        (0.75)**（C34，对齐 ai-memory CONSOLIDATE_COSINE_THRESHOLD：抓语义近等价
- *        表述，不并仅主题相邻；token 重合低但语义同义的改写也能入审）；
- *      - 任一侧无向量 → 回退 token-Jaccard ∈ [0.15, 0.85)（既有带）。
+ *      - 双侧有向量（embedding.getVector）→ **语义余弦 ≥ 按维度区分的阈值
+ *        (384→0.72, 其他→0.75)**（2026-08-18 调优：技术文档类 paraphrase 实测
+ *        0.70-0.78 区间，本地小模型需更宽松）；
+ *      - 任一侧无向量 → 回退 token-Jaccard ∈ [0.08, 0.85) 且 overlap≥2（2026-08-18
+ *        调优：下界由 0.15 降至 0.08 召回短文本如 "pnpm workspace"；重合≥2 防噪声）。
  * - 每焦点的 peers = 同 workspace 合格对，按相似度降序取前 REFLECT_PEERS_PER_FOCUS。
  * 注意：≥0.85（Jaccard）由既有规则合并/覆盖域处理，本函数只补盲区。
  */
@@ -229,16 +299,24 @@ export function selectReflectionPairs(
   entries: MemoryEntry[],
   embedding?: { getVector(id: string): Float32Array | undefined },
 ): Array<{ focus: MemoryEntry; peers: MemoryEntry[] }> {
-  // 对级相似度：{ sim 排序值, ok 是否合格 }。双侧向量 → 余弦；否则 Jaccard。
+  // 对级相似度：{ sim 排序值, ok 是否合格 }。双侧向量 → 余弦（阈值按维度区分）；否则 Jaccard+overlap。
   const pairSim = (a: MemoryEntry, b: MemoryEntry): { sim: number; ok: boolean } => {
     const va = embedding?.getVector(a.id)
     const vb = embedding?.getVector(b.id)
     if (va !== undefined && vb !== undefined) {
       const sim = cosineSimilarity(va, vb)
-      return { sim, ok: sim >= REFLECT_SEMANTIC_THRESHOLD }
+      // 2026-08-18 调优：阈值按模型维度区分（向量长度判断：384→0.72, 其他→0.75）
+      // 显式降级语义+中文注释：非防御性兜底，维度即模型身份
+      const threshold = getSemanticThresholdForDim(va.length)
+      // 若两向量维度不一致（极端异常），取更严格者（防御不一致但显式处理）
+      // 注释：正常同库维度一致，此分支仅为显式说明不一致时的取严策略
+      const thresholdB = getSemanticThresholdForDim(vb.length)
+      const finalThreshold = Math.max(threshold, thresholdB)
+      return { sim, ok: sim >= finalThreshold }
     }
-    const j = jaccardOf(a, b)
-    return { sim: j, ok: j >= PEER_MIN_JACCARD && j < PEER_MAX_JACCARD }
+    const { jaccard: j, overlap } = jaccardWithOverlap(a, b)
+    // 2026-08-18 调优：下界 0.08 + overlap≥2 双门控
+    return { sim: j, ok: j >= PEER_MIN_JACCARD && j < PEER_MAX_JACCARD && overlap >= PEER_MIN_TOKEN_OVERLAP }
   }
   // 每条目 → 其同 workspace 最强合格对相似度（maxSim；无合格对为 0，不参与焦点）
   const maxSim = new Map<string, number>()
@@ -403,7 +481,29 @@ export class MemoryReflector {
     const candidates = this.deps.store.listRecent(REFLECT_WINDOW, 'active')
     const pairs = selectReflectionPairs(candidates, this.deps.embedding)
     const reviewed = pairs.filter((pair) => pair.peers.length > 0).length
-    const summary: ReflectionSummary = { reviewed, decisions: 0, merged: 0, archived: 0, skipped: 0 }
+    // 可观测：向量覆盖率（语义救援能力的直观度量）
+    // 2026-08-18 调优：向量覆盖仅 21.8% 时双侧命中 p²≈3.5%，救援失效；暴露覆盖率便于
+    // 诊断“为何语义未命中”（semanticHitRate 低 → 需补齐嵌入而非调阈值）。
+    let semanticHitRate: number | undefined
+    if (this.deps.embedding !== undefined) {
+      let withVec = 0
+      for (const entry of candidates) {
+        if (this.deps.embedding.getVector(entry.id) !== undefined) withVec++
+      }
+      semanticHitRate = candidates.length === 0 ? 0 : withVec / candidates.length
+      // 直方图日志（低成本可观测）：覆盖率 + 窗口利用率
+      this.deps.logger.info(
+        `[dsh-memory] 反思候选直方图：窗口=${candidates.length}/${REFLECT_WINDOW} 向量覆盖=${(semanticHitRate * 100).toFixed(1)}% 焦点=${reviewed}/${pairs.length}`,
+      )
+    }
+    const summary: ReflectionSummary = {
+      reviewed,
+      decisions: 0,
+      merged: 0,
+      archived: 0,
+      skipped: 0,
+      ...(semanticHitRate !== undefined ? { semanticHitRate } : {}),
+    }
     if (reviewed === 0) return summary
 
     const text = renderReflectionText(pairs)
