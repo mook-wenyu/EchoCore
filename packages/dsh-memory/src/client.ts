@@ -190,11 +190,11 @@ class PanelErrorBoundary extends React.Component<{ children: React.ReactNode }, 
   static getDerivedStateFromError(error: Error): { error: Error } {
     return { error }
   }
-  componentDidCatch(error: Error, info: React.ErrorInfo): void {
+  override componentDidCatch(error: Error, info: React.ErrorInfo): void {
     // 仅日志，不抛；面板可通过"重试"重置
     console.error('[dsh-memory] 面板渲染异常：', error, info)
   }
-  render(): React.ReactNode {
+  override render(): React.ReactNode {
     if (this.state.error !== null) {
       return React.createElement(
         'div',

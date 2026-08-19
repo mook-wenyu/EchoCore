@@ -12,7 +12,11 @@ import { createMemoryApi, type MemoryPanelApi } from '../src/client.js'
 
 // client.ts 模块顶层 import * as React（仅供组件渲染用）；测试环境 node 无 react 依赖。
 // 用例只测 createMemoryApi（纯逻辑，不触 React），故用工厂桩替代，满足模块解析即可。
-vi.mock('react', () => ({ createElement: () => null }))
+// 需透传 Component 以支持 PanelErrorBoundary（extends React.Component）的类定义
+vi.mock('react', async () => {
+  const actual = (await vi.importActual('react')) as Record<string, unknown>
+  return { ...actual, createElement: () => null }
+})
 
 /** 假 connection：记录每次 rpc.call 的参数，并回放预设结果序列 */
 interface FakeConnection {
