@@ -59,11 +59,14 @@ export interface MemoryStatsView {
   /** 最近一次远程验证失败原因（远程未生效时展示，杜绝静默回退） */
   embeddingInitError?: string
   lastMaintenanceAt?: string | null
-  /** E：反思/因果观测（宿主 status 已下发；缺则不渲染——跨版本兼容） */
-  reflection?: { reviewed: number; decisions: number; merged: number; archived: number; skipped: number }
-  reflectionCumulative?: { runs: number; decisions: number; merged: number; archived: number; skipped: number }
+  /** 降级原因（Q1/A：远程维度≠本地时显式 disabled 原因） */
+  embeddingDegradedReason?: string
+  /** E：反思/因果观测（宿主 status 已下发；缺则不渲染——跨版本兼容；宿主对未运行发 null） */
+  reflection?: { reviewed: number; decisions: number; merged: number; archived: number; skipped: number } | null
+  reflectionCumulative?: { runs: number; decisions: number; merged: number; archived: number; skipped: number } | null
   lastReflectionAt?: string | null
-  causal?: { reviewed: number; edges: number; created: number; skipped: number }
+  causal?: { reviewed: number; edges: number; created: number; skipped: number } | null
+  lastCausalAt?: string | null
 }
 
 /**
@@ -173,9 +176,39 @@ export function apply(ctx: Context): void {
   const api = createMemoryApi(ctx)
   slots.inject('settings.section', () =>
     slots.register({ name: 'settings.section', id: 'memory', order: 30, label: '记忆' }, (props) =>
-      React.createElement(MemoryPanel, { api, close: props.close }),
+      React.createElement(PanelErrorBoundary, null, React.createElement(MemoryPanel, { api, close: props.close })),
     ),
   )
+}
+
+// ── 错误边界（面板白屏兜底）：捕获同步渲染异常，展示可重试的错误视图而非空白 ──
+class PanelErrorBoundary extends React.Component<{ children: React.ReactNode }, { error: Error | null }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props)
+    this.state = { error: null }
+  }
+  static getDerivedStateFromError(error: Error): { error: Error } {
+    return { error }
+  }
+  componentDidCatch(error: Error, info: React.ErrorInfo): void {
+    // 仅日志，不抛；面板可通过"重试"重置
+    console.error('[dsh-memory] 面板渲染异常：', error, info)
+  }
+  render(): React.ReactNode {
+    if (this.state.error !== null) {
+      return React.createElement(
+        'div',
+        { style: { padding: 12, color: 'var(--dsw-alias-state-error-primary)' } },
+        React.createElement('div', null, `面板加载失败：${this.state.error.message}`),
+        React.createElement(
+          'button',
+          { style: { marginTop: 8, padding: '4px 10px' }, onClick: () => this.setState({ error: null }) },
+          '重试',
+        ),
+      )
+    }
+    return this.props.children
+  }
 }
 
 // ── 面板组件（纯 React，无 JSX） ────────────────────────────────────────
@@ -355,11 +388,15 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
               // 远程失败时存在，与 state 无关：ready=本地顶班、disabled=远程失败且无本地）
               React.createElement('div', { style: { ...metaStyle, ...warnStyle } }, `远程嵌入未生效：${stats.embeddingInitError}`)
             : null,
+          stats.embeddingDegradedReason != null
+            ? React.createElement('div', { style: { ...metaStyle, ...warnStyle } }, `嵌入降级：${stats.embeddingDegradedReason}`)
+            : null,
           stats.lastMaintenanceAt !== undefined && stats.lastMaintenanceAt !== null
             ? React.createElement('div', { style: metaStyle }, `上次维护：${stats.lastMaintenanceAt}`)
             : null,
           // E：反思/因果观测行（数据已由 status 下发；缺则不渲染——跨版本兼容）
-          stats.reflectionCumulative !== undefined
+          // 修复：宿主对"未运行"显式发 null（host-rpc.ts:99-104），需同时防御 null 与 undefined，否则 null.runs 抛错致白屏
+          stats.reflectionCumulative != null
             ? React.createElement(
                 'div',
                 { style: metaStyle },
@@ -369,7 +406,7 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
           stats.lastReflectionAt !== undefined && stats.lastReflectionAt !== null
             ? React.createElement('div', { style: metaStyle }, `上次反思：${stats.lastReflectionAt.slice(0, 10)}`)
             : null,
-          stats.causal !== undefined
+          stats.causal != null
             ? React.createElement('div', { style: metaStyle }, `因果：审 ${stats.causal.reviewed} · 建边 ${stats.causal.created}`)
             : null,
           // E：手动触发反思按钮（RPC reflect 端点已存在；force 即时执行）
@@ -557,19 +594,21 @@ function ConfigPane(props: { api: MemoryPanelApi; onSaved?: () => void }): React
   )
 }
 
-/** 详情面板：内容、来源、摘录、审计日志 */
+/** 详情面板：内容、来源、摘录、审计日志（防御畸形条目：缺失字段时降级展示而非抛错白屏） */
 function DetailPane(props: { entry: MemoryDetailView; onArchive: () => void }): React.ReactElement {
   const entry = props.entry
-  const auditRows = entry.audit.map((record, index) =>
-    React.createElement('div', { key: index, style: metaStyle }, `${record.at} [${record.by}] ${record.action}${record.detail ? `：${record.detail}` : ''}`),
-  )
+  const auditRows = Array.isArray(entry.audit)
+    ? entry.audit.map((record, index) =>
+        React.createElement('div', { key: index, style: metaStyle }, `${record.at} [${record.by}] ${record.action}${record.detail ? `：${record.detail}` : ''}`),
+      )
+    : []
   return React.createElement(
     'div',
     { style: detailStyle },
-    React.createElement('h4', null, `记忆 #${entry.id.slice(0, 8)}（${entry.kind}，重要度 ${entry.importance}，状态 ${entry.status}）`),
-    React.createElement('p', null, entry.content),
-    React.createElement('p', { style: metaStyle }, `来源会话：${entry.source.sessionId}`),
-    React.createElement('p', { style: metaStyle }, `来源事件序号：${entry.source.eventSeqs.join(', ') || '（手动记录）'}`),
+    React.createElement('h4', null, `记忆 #${(entry.id ?? '').slice(0, 8)}（${entry.kind ?? 'unknown'}，重要度 ${entry.importance ?? '-'}，状态 ${entry.status ?? '-'}）`),
+    React.createElement('p', null, entry.content ?? '（无内容）'),
+    React.createElement('p', { style: metaStyle }, `来源会话：${entry.source?.sessionId ?? '未知'}`),
+    React.createElement('p', { style: metaStyle }, `来源事件序号：${entry.source?.eventSeqs?.join(', ') || '（手动记录）'}`),
     React.createElement('p', { style: metaStyle }, `原文摘录：${entry.source.excerpt.slice(0, 200)}`),
     React.createElement('p', { style: metaStyle }, `访问次数：${entry.accessCount}`),
     React.createElement('div', { style: metaStyle }, '审计日志：'),

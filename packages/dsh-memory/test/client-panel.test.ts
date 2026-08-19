@@ -282,6 +282,35 @@ describe('MemoryPanel 组件行为（jsdom）', () => {
     }
   })
 
+  it('容错：status 返回 null 字段（未运行）时不白屏', async () => {
+    const status = vi.fn(async () => ({
+      total: 1,
+      active: 1,
+      archived: 0,
+      byKind: { fact: 1, preference: 0, decision: 0, todo: 0, insight: 0 },
+      writeFailures: 0,
+      embeddingState: 'ready',
+      lastMaintenanceAt: null,
+      rejectedCount: 0,
+      reflection: null,
+      reflectionCumulative: null,
+      lastReflectionAt: null,
+      causal: null,
+      lastCausalAt: null,
+    }))
+    const list = vi.fn(async () => [summary('mem-1', 'fact', '记忆内容')])
+    const view = render(React.createElement(MemoryPanel, { api: fakeApi({ status, list }), close: () => {} }))
+    try {
+      await waitFor(() => expect(screen.getByText(/共 1 条记忆/)).toBeTruthy())
+      // 不应渲染反思/因果行，也不白屏
+      expect(screen.queryByText(/反思累计/)).toBeNull()
+      expect(screen.queryByText(/因果：/)).toBeNull()
+      expect(screen.getByText(/记忆内容/)).toBeTruthy()
+    } finally {
+      view.unmount()
+    }
+  })
+
   it('F：配置区默认折叠（标题可见，表单输入框默认不渲染），点击展开后渲染字段', async () => {
     const status = vi.fn(async () => ({
       total: 0,
