@@ -34,16 +34,21 @@ import type { AuditRecord, CausalRelation, MemoryCausalEdge, MemoryEntry, Memory
 
 /** 自动周期门控间隔（ms；建议 6 小时） */
 export const CAUSAL_INTERVAL_MS = 6 * 3_600_000
-/** 候选窗口（listRecent 拉取量；建议 200） */
-export const CAUSAL_WINDOW = 200
-/** 进入提示词的条目数上限（建议 30） */
-export const CAUSAL_BUDGET = 30
-/** 建边置信下限（LLM 自评 confidence < 0.6 不建边） */
-export const CAUSAL_MIN_CONFIDENCE = 0.6
+/** 候选窗口（listRecent 拉取量；与反思对齐扩大至 400，提升旧因果召回） */
+export const CAUSAL_WINDOW = 400
+/** 进入提示词的条目数上限（与反思对齐扩大至 50，提升召回覆盖） */
+export const CAUSAL_BUDGET = 50
+/**
+ * 建边置信下限（LLM 自评 confidence < 0.55 不建边）
+ * 权衡：原 0.6 过严导致零样本下召回过低；降至 0.55 为最小改动扩大召回，
+ * 0.55-0.74 属低权区间（未来检索可加权而非硬截断），≥0.55 即建边保留信号，
+ * 高于 0.55 的边仍具区分度，不引入过多噪声。
+ */
+export const CAUSAL_MIN_CONFIDENCE = 0.55
 /** LLM 输出 token 上限 */
 export const CAUSAL_MAX_TOKENS = 1024
 
-/** 因果抽取系统提示词：只找因果/衍生关系，约束方向与输出格式 */
+/** 因果抽取系统提示词：只找因果/衍生关系，约束方向与输出格式，含 2 个 few-shot */
 const CAUSAL_SYSTEM_PROMPT = `你是一个记忆因果分析器。给定一批记忆条目（每条以 #id 开头），找出条目之间存在的因果/衍生/前提-结果关系对。
 
 规则：
@@ -52,7 +57,21 @@ const CAUSAL_SYSTEM_PROMPT = `你是一个记忆因果分析器。给定一批�
 3. 为每个关系给出 confidence（0-1，自评把握度）与一句 justification（依据摘要）
 4. 只输出 JSON，不要输出任何其他文字：
 {"edges":[{"sourceId":"...","targetId":"...","confidence":0.9,"justification":"..."}]}
-没有关系时输出：{"edges":[]}`
+没有关系时输出：{"edges":[]}
+
+示例1（有因果）：
+输入：
+#m1 [fact] 用户决定采用 pnpm 作为包管理器，以提升安装速度
+#m2 [fact] 仓库已配置 pnpm-workspace.yaml 并将 packageManager 设为 pnpm
+输出：
+{"edges":[{"sourceId":"m1","targetId":"m2","confidence":0.88,"justification":"m1 的 pnpm 决策导致 m2 的工作区配置"}]}
+
+示例2（无因果）：
+输入：
+#m3 [fact] 用户喜欢喝咖啡
+#m4 [fact] 本周气温下降，适合户外活动
+输出：
+{"edges":[]}`
 
 /** 一次因果抽取批次的结果统计 */
 export interface CausalSummary {
@@ -62,8 +81,12 @@ export interface CausalSummary {
   edges: number
   /** 实际新建成边数 */
   created: number
-  /** 拒绝建边数（自环/未知 id/非 active/跨 workspace/置信<0.6/已存在） */
+  /** 拒绝建边数（自环/未知 id/非 active/跨 workspace/置信<0.55/已存在） */
   skipped: number
+  /** 置信度均值（基于 LLM 提议的全部 edges；无边时 undefined，可观测） */
+  confidenceMean?: number
+  /** 置信度分布直方图（按区间计数，可观测） */
+  confidenceHist?: { lt055: number; btw055_074: number; btw075_089: number; gte09: number }
 }
 
 /** 因果抽取依赖（store/边表/llm/logger/now 注入，便于单测） */
@@ -258,10 +281,30 @@ export function parseCausalEdges(text: string): ParsedCausalEdge[] {
   return result
 }
 
-/** 候选条目渲染为紧凑列表：`#id [kind] content…`（一次性给 LLM） */
+/** 按句边界截断：优先在限长内找最后句末标点，找不到则硬截（避免截断因果信号句） */
+export function truncateContent(content: string, limit = 200): string {
+  if (content.length <= limit) return content
+  const slice = content.slice(0, limit)
+  // 句末标点：中英文句号/感叹/问号/换行，视为句边界
+  const punctSet = new Set(['。', '！', '？', '!', '?', '.', '\n'])
+  let cut = -1
+  for (let i = slice.length - 1; i >= 0; i--) {
+    if (punctSet.has(slice[i]!)) {
+      cut = i + 1
+      break
+    }
+  }
+  // 仅当句边界不至于过短（≥限长一半）时才按句截断，否则硬截保留更多信息
+  if (cut > 0 && cut >= Math.floor(limit * 0.5)) {
+    return slice.slice(0, cut)
+  }
+  return slice
+}
+
+/** 候选条目渲染为紧凑列表：`#id [kind] content…`（一次性给 LLM，按句边界截断至 200） */
 function renderCandidates(candidates: MemoryEntry[]): string {
   return candidates
-    .map((entry) => `#${entry.id} [${entry.kind}] ${entry.content.slice(0, 120)}`)
+    .map((entry) => `#${entry.id} [${entry.kind}] ${truncateContent(entry.content, 200)}`)
     .join('\n')
 }
 
@@ -329,7 +372,7 @@ export class MemoryCausalExtractor {
         const candidates = this.deps.store.listRecent(CAUSAL_WINDOW, 'active').slice(0, CAUSAL_BUDGET)
         const reviewed = candidates.length
         if (reviewed === 0) {
-          const empty: CausalSummary = { reviewed: 0, edges: 0, created: 0, skipped: 0 }
+          const empty: CausalSummary = { reviewed: 0, edges: 0, created: 0, skipped: 0, confidenceHist: { lt055: 0, btw055_074: 0, btw075_089: 0, gte09: 0 } }
           this.lastRunAtValue = new Date(this.deps.now()).toISOString()
           this.routeCache = resolved
           this.lastSummaryValue = empty
@@ -363,7 +406,22 @@ export class MemoryCausalExtractor {
           .join('')
 
         const parsed = parseCausalEdges(text)
-        const summary: CausalSummary = { reviewed, edges: parsed.length, created: 0, skipped: 0 }
+        // 可观测：置信度分布与均值
+        const hist = { lt055: 0, btw055_074: 0, btw075_089: 0, gte09: 0 }
+        let confSum = 0
+        for (const e of parsed) {
+          confSum += e.confidence
+          if (e.confidence < 0.55) hist.lt055++
+          else if (e.confidence < 0.75) hist.btw055_074++
+          else if (e.confidence < 0.9) hist.btw075_089++
+          else hist.gte09++
+        }
+        const confidenceMean = parsed.length > 0 ? confSum / parsed.length : undefined
+        const summary: CausalSummary = { reviewed, edges: parsed.length, created: 0, skipped: 0, confidenceMean, confidenceHist: hist }
+        // 日志输出均值（可观测）
+        if (confidenceMean !== undefined) {
+          this.deps.logger.info(`[dsh-memory] 因果抽取置信度均值 ${confidenceMean.toFixed(3)} 分布 ${JSON.stringify(hist)}`)
+        }
 
         // 逐条校验建边（重读 store 当前状态）
         for (const edge of parsed) {
@@ -392,7 +450,7 @@ export class MemoryCausalExtractor {
 
   /**
    * 校验并落库一条候选边；不满足条件的计入 skipped（自环/未知 id/非 active/
-   * 已被覆盖/跨 workspace/置信<0.6/已存在）。
+   * 已被覆盖/跨 workspace/置信<0.55/已存在）。
    */
   private async acceptCandidate(edge: ParsedCausalEdge, summary: CausalSummary): Promise<void> {
     if (edge.sourceId === edge.targetId) {

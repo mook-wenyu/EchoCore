@@ -14,10 +14,14 @@ import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 import {
+  CAUSAL_BUDGET,
+  CAUSAL_MIN_CONFIDENCE,
+  CAUSAL_WINDOW,
   MemoryCausalExtractor,
   MemoryCausalStore,
   causalEdgeKey,
   parseCausalEdges,
+  truncateContent,
   type CausalSummary,
 } from '../src/causal.js'
 import { MemoryStore } from '../src/store.js'
@@ -436,5 +440,119 @@ describe('MemoryCausalExtractor', () => {
     // ——防 running 复位失败导致"永久锁死"（F2 审计点）
     await extractor.runOnce(route, { force: true })
     expect(llm.calls).toHaveLength(2)
+  })
+})
+
+// ——— 调优新增：阈值/窗口/截断/可观测（TDD） ———
+describe('causal 调优：阈值与窗口', () => {
+  it('常量已提升：WINDOW=400 BUDGET=50 MIN_CONFIDENCE=0.55', () => {
+    expect(CAUSAL_WINDOW).toBe(400)
+    expect(CAUSAL_BUDGET).toBe(50)
+    expect(CAUSAL_MIN_CONFIDENCE).toBe(0.55)
+  })
+
+  it('边界：0.55 可建边，0.54 拒绝（原 0.6 已降至 0.55）', async () => {
+    // 0.55 应通过
+    const pass = setupExtractor('{"edges":[{"sourceId":"a","targetId":"b","confidence":0.55}]}')
+    await seedPair(pass.entryTable)
+    const s1 = (await pass.extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })) as CausalSummary
+    expect(s1.created).toBe(1)
+    expect(s1.skipped).toBe(0)
+    // 0.54 拒绝
+    const fail = setupExtractor('{"edges":[{"sourceId":"a","targetId":"b","confidence":0.54}]}')
+    await seedPair(fail.entryTable)
+    const s2 = (await fail.extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })) as CausalSummary
+    expect(s2.created).toBe(0)
+    expect(s2.skipped).toBe(1)
+  })
+
+  it('原 0.6 仍可建边（兼容高置信）', async () => {
+    const { entryTable, causal, extractor } = setupExtractor('{"edges":[{"sourceId":"a","targetId":"b","confidence":0.6}]}')
+    await seedPair(entryTable)
+    const s = (await extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })) as CausalSummary
+    expect(s.created).toBe(1)
+    expect(causal.listEdges()).toHaveLength(1)
+  })
+
+  it('窗口扩大：50 条候选均进入 reviewed（原 30 上限已提升）', async () => {
+    const { entryTable, extractor } = setupExtractor('{"edges":[]}')
+    for (let i = 0; i < 60; i++) {
+      await entryTable.put(`id${i}`, makeEntry({ id: `id${i}`, content: `内容${i}` }))
+    }
+    const s = (await extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })) as CausalSummary
+    expect(s.reviewed).toBe(50)
+  })
+
+  it('提示词含 few-shot 示例（因果对与非因果对）', async () => {
+    const { entryTable, llm, extractor } = setupExtractor('{"edges":[]}')
+    await seedPair(entryTable)
+    await extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })
+    const system = llm.calls[0]!.system as string
+    expect(system).toContain('示例1')
+    expect(system).toContain('示例2')
+    expect(system).toContain('无因果')
+  })
+
+  it('截断按句边界：200 限长内按句号截断，避免截断因果信号句', () => {
+    // 含句号：应在句号处截断
+    const text = '前句。'.repeat(40) + '后句无句号内容填充'.repeat(20) // 远超 200
+    const truncated = truncateContent(text, 200)
+    expect(truncated.length).toBeLessThanOrEqual(200)
+    // 应以句号结尾（按句边界）
+    expect(truncated.endsWith('。')).toBe(true)
+    // 不含句号：硬截
+    const noPunct = 'a'.repeat(300)
+    expect(truncateContent(noPunct, 200).length).toBe(200)
+    // 短文本不截断
+    expect(truncateContent('短文本', 200)).toBe('短文本')
+  })
+
+  it('渲染截断已扩至 200（非 120），长内容在提示词中保留更多）', async () => {
+    const long = '句1。'.repeat(100) // 300 字符含句号
+    const { entryTable, llm, extractor } = setupExtractor('{"edges":[]}')
+    await entryTable.put('a', makeEntry({ id: 'a', content: long }))
+    await entryTable.put('b', makeEntry({ id: 'b', content: '短内容' }))
+    await extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })
+    const userText = (llm.calls[0]!.messages[0] as { content: Array<{ text: string }> }).content[0]!.text
+    // 长内容的 120 字符 vs 200 字符：提示词中应包含超过 120 的片段
+    const renderedLine = userText.split('\n').find((l) => l.startsWith('#a'))!
+    // 渲染后的内容部分长度应 > 120（旧逻辑 120，现 200 按句边界）
+    const contentPart = renderedLine.replace(/^#a \[fact\] /, '')
+    expect(contentPart.length).toBeGreaterThan(120)
+    expect(contentPart.length).toBeLessThanOrEqual(200)
+  })
+
+  it('可观测：summary 含 confidenceMean 与直方图，日志输出均值', async () => {
+    const { entryTable, extractor } = setupExtractor(
+      '{"edges":[{"sourceId":"a","targetId":"b","confidence":0.9},{"sourceId":"b","targetId":"a","confidence":0.6}]}',
+    )
+    await seedPair(entryTable)
+    let logged = ''
+    // 复用 extractor 的 logger 无法直接取 info，改用捕获：重建带捕获 logger 的 extractor
+    const { store, edgeTable } = (() => {
+      const t = new FakeTable()
+      const s = new MemoryStore(t, () => NOW)
+      const et = new FakeKvTable<MemoryCausalEdge>()
+      return { store: s, edgeTable: et, table: t }
+    })()
+    // 重新种入以复用同一逻辑：直接用原 setupExtractor 的变体捕获日志
+    const captures: unknown[][] = []
+    const llm2 = new FakeLlm('{"edges":[{"sourceId":"a","targetId":"b","confidence":0.9},{"sourceId":"b","targetId":"a","confidence":0.6}]}')
+    const table2 = new FakeTable()
+    const store2 = new MemoryStore(table2, () => NOW)
+    const et2 = new FakeKvTable<MemoryCausalEdge>()
+    const causal2 = new MemoryCausalStore(et2, () => NOW)
+    await seedPair(table2)
+    const extractor2 = new MemoryCausalExtractor({
+      store: store2,
+      causal: causal2,
+      llm: llm2,
+      logger: { warn: () => {}, info: (...a: unknown[]) => captures.push(a) },
+      now: () => NOW,
+    })
+    const s = (await extractor2.runOnce({ provider: 'p', model: 'm' }, { force: true })) as CausalSummary
+    expect(s.confidenceMean).toBeCloseTo(0.75)
+    expect(s.confidenceHist).toEqual({ lt055: 0, btw055_074: 1, btw075_089: 0, gte09: 1 })
+    expect(captures.some((a) => String(a[0]).includes('置信度均值'))).toBe(true)
   })
 })
