@@ -19,6 +19,7 @@
 - **P0-3 抽 balanced-json**：新建 `utils/balanced-json.ts` 单源 `extractBalancedJson`，`scoring.ts` 新增 `jaccard(a,b)` 纯函数，`store.tokenJaccard` 与 `store/create.jaccardTokenSimilarity` 收敛单源
 - **P1 单例收敛**：新建 `runtime.ts: MemoryRuntime` 收敛 `embeddingEpoch/holder/storeRef/settings` 四全局，`settings.ts`/`index.ts` 全部经实例，`resetSeamForTest` 改实例方法；补 `embedding/tools/reflect` 覆盖率至 >90%（`All 97.71%/92.28%`）
 - **P2 安全与压缩**：`host-rpc:handleSetConfig` 检测明文 `sk-` 提示迁 `env:`，`scripts/migrate-apikey-to-env.mjs` 一键迁移脱敏备份；新建 `docs/COMPACTION.md` 400K 触发/200K 目标/16K 预留双阈值滞回，`docs/DEPLOYMENT.md` 联动
+- **P3 游标与自适应（本轮）**：`store` 新增 `listRecentByCursor` 游标分页 + `lastMaintenanceCursor` 轮询全库（2000 窗→100% 覆盖），`reflect` 新增 `adjustThresholdByHitRate`（<0.1→0.68, >0.3→0.75）与 `maintenance` 联动，`causal` 新增 `confidence.hist` 可观测
 
 **接口契约变更**：`MemoryStatsView` 已在 C38 补 `| null`；`MemoryPanelApi.reflect()` 已加；`store` 拆分后 `import from '../store.js'` 兼容层保留；`runtime` 新增 `MemoryRuntime` 单例（内部）。
 
