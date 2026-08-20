@@ -380,7 +380,10 @@ export async function mountMemory(
     logger,
     now: () => Date.now(),
     // C34：语义门取向量（holder.index 调用时求值——热换后新索引即生效）
+    // 使用 getter 延迟读取：构造时 holder.index 可能为 undefined（异步初始化未完成），
+    // 热换后 getter 每次读取最新值（与 store hooks/injector 同模式）
     embedding: holder.index,
+    getEmbeddingIndex: () => holder.index,
   })
   const causalExtractor = new MemoryCausalExtractor({ store, causal: causalStore, llm: ctx.llm, logger, now: () => Date.now() })
   // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）；

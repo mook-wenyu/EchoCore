@@ -118,8 +118,14 @@ export interface ReflectionDeps {
   llm: Pick<LlmRuntime, 'stream'>
   logger: Pick<ReturnType<Context['logger']>, 'warn' | 'info'>
   now: () => number
-  /** C34：语义门取向量（有向量时 cosine≥阈值 为主门；缺省无向量 → Jaccard 带回退） */
+  /**
+   * C34：语义门取向量（有向量时 cosine≥阈值 为主门；缺省无向量 → Jaccard 带回退）。
+   * 使用 getter 函数延迟读取 holder.index——构造时可能为 undefined（异步初始化未完成），
+   * 热换后新索引即生效（与 store hooks/injector 同模式）。
+   */
   embedding?: { getVector(id: string): Float32Array | undefined }
+  /** 延迟取向量索引（hot-swap 守卫；非测试场景由装配层注入） */
+  getEmbeddingIndex?: () => { getVector(id: string): Float32Array | undefined } | undefined
 }
 
 /** 本轮反思观察量 */
@@ -462,16 +468,18 @@ export class MemoryReflector {
   /** 执行反思主体：拉候选 → 选焦点对 → 渲染 → 单次 LLM → 逐条执行 */
   private async runReflection(route: { provider: string; model: string }): Promise<ReflectionSummary> {
     const candidates = this.deps.store.listRecent(REFLECT_WINDOW, 'active')
-    const pairs = selectReflectionPairs(candidates, this.deps.embedding)
+    // hot-swap 守卫：优先用 getter（延迟读 holder.index），回退静态 embedding
+    const embeddingIndex = this.deps.getEmbeddingIndex?.() ?? this.deps.embedding
+    const pairs = selectReflectionPairs(candidates, embeddingIndex)
     const reviewed = pairs.filter((pair) => pair.peers.length > 0).length
     // 可观测：向量覆盖率（语义救援能力的直观度量）
     // 2026-08-18 调优：向量覆盖仅 21.8% 时双侧命中 p²≈3.5%，救援失效；暴露覆盖率便于
     // 诊断“为何语义未命中”（semanticHitRate 低 → 需补齐嵌入而非调阈值）。
     let semanticHitRate: number | undefined
-    if (this.deps.embedding !== undefined) {
+    if (embeddingIndex !== undefined) {
       let withVec = 0
       for (const entry of candidates) {
-        if (this.deps.embedding.getVector(entry.id) !== undefined) withVec++
+        if (embeddingIndex.getVector(entry.id) !== undefined) withVec++
       }
       semanticHitRate = candidates.length === 0 ? 0 : withVec / candidates.length
       // 直方图日志（低成本可观测）：覆盖率 + 窗口利用率
