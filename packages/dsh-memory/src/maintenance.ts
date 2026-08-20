@@ -292,17 +292,14 @@ export class MemoryMaintenance {
    * 优先使用 store.listRecentByCursor（新增游标分页 API），回退到旧 listRecent 兼容旧存量。
    */
   private fetchNextWindow(): MemoryEntry[] {
-    const storeAny = this.deps.store as unknown as { listRecentByCursor?: typeof this.deps.store.listRecent }
+    // 游标分页为新增 API，旧测试桩（FakeStore）仅含 listRecent；any 化以兼容
+    const storeAny = this.deps.store as unknown as { listRecentByCursor?: (c: unknown, l: number, s: string) => MemoryEntry[] }
     if (typeof storeAny.listRecentByCursor === 'function') {
       // 游标分页：从 lastMaintenanceCursor 取 BATCH_BUDGET 条 active 条目
-      return (this.deps.store as unknown as { listRecentByCursor: (c: { createdAt: string; id: string } | undefined, l: number, s?: string) => MemoryEntry[] }).listRecentByCursor(
-        this.lastMaintenanceCursor ?? undefined,
-        BATCH_BUDGET,
-        'active' as unknown as string,
-      )
+      return storeAny.listRecentByCursor(this.lastMaintenanceCursor ?? undefined, BATCH_BUDGET, 'active')
     }
     // 兼容回退（旧 store 未实现游标分页时）：保持 CANDIDATE_WINDOW 窗口语义
-    const candidates = this.deps.store.listRecent(CANDIDATE_WINDOW, 'active' as unknown as string)
+    const candidates = this.deps.store.listRecent(CANDIDATE_WINDOW, 'active' as const)
     return candidates.slice(0, BATCH_BUDGET)
   }
 
