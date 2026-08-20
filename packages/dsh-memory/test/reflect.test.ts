@@ -21,6 +21,7 @@ import {
   REFLECT_SEMANTIC_THRESHOLD_REMOTE,
   REFLECT_WINDOW,
   REFLECTION_SYSTEM_PROMPT,
+  adjustThresholdByHitRate,
   getSemanticThresholdForDim,
   parseReflectionDecisions,
   selectReflectionPairs,
@@ -783,6 +784,8 @@ describe('P1 补覆盖：reflect 阈值与降级分支（75-577）', () => {
     // 已在阈值调优测试中覆盖 1024 的 0.73 排除；此处专门覆盖"混维取严"代码行（313-314）
     // 通过让 a=384(0.73过)、b=1024(0.73不过) 的最终阈值逻辑被执行——验证 Math.max 分支存在
     // 更直接：检查 getSemanticThresholdForDim 在不同维度返回不同阈值，且 Math.max 生效
+    // 先重置自适应阈值（前序用例可能已通过 adjustThresholdByHitRate 改为 0.68/0.75 导致状态污染）
+    adjustThresholdByHitRate(0.2)
     expect(getSemanticThresholdForDim(384)).toBe(0.72)
     expect(getSemanticThresholdForDim(1024)).toBe(0.75)
     expect(Math.max(getSemanticThresholdForDim(384), getSemanticThresholdForDim(1024))).toBe(0.75)
