@@ -71,10 +71,45 @@ function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig
   // ctx.agentDefaultModel 为 Cordis 服务注入（dsh-agent-default-model 插件提供），
   // 宿主未挂载时 ctx.get 返回 undefined——回退函数统一返回 undefined（诚实返回）。
   const getDefaultModel = (): { provider: string; model: string } | undefined => {
+    // 方案1：尝试从 DSH settings 服务读取 agent-default-model 命名空间
     try {
-      const svc = ctx.get('agentDefaultModel') as { currentSelection?: () => { provider: string; model: string } } | undefined
-      if (svc !== undefined && typeof svc.currentSelection === 'function') {
-        return svc.currentSelection()
+      const svc = ctx.get('settings') as { get?: (ns: string) => { provider?: string; model?: string } | undefined } | undefined
+      if (svc !== undefined && typeof svc.get === 'function') {
+        const agentDefault = svc.get('agent-default-model')
+        if (agentDefault?.provider && agentDefault?.model) {
+          return { provider: agentDefault.provider, model: agentDefault.model }
+        }
+      }
+    } catch {}
+    // 方案2：直接读取 settings.yaml 文件（降级兜底）
+    try {
+      const fs = require('node:fs') as typeof import('node:fs')
+      const path = require('node:path') as typeof import('node:path')
+      const os = require('node:os') as typeof import('node:os')
+      const settingsPath = path.join(os.homedir(), '.dsh', 'settings.yaml')
+      if (fs.existsSync(settingsPath)) {
+        const content = fs.readFileSync(settingsPath, 'utf-8')
+        // 简单解析 YAML：找 agent-default-model 段的 provider/model
+        const lines = content.split('\n')
+        let inAgentDefault = false
+        let provider = ''
+        let model = ''
+        for (const line of lines) {
+          if (line.trim().startsWith('agent-default-model:')) {
+            inAgentDefault = true
+            continue
+          }
+          if (inAgentDefault) {
+            if (line.startsWith('  ') || line.startsWith('\t')) {
+              const trimmed = line.trim()
+              if (trimmed.startsWith('provider:')) provider = trimmed.split(':')[1]?.trim().replace(/['"]/g, '') ?? ''
+              if (trimmed.startsWith('model:')) model = trimmed.split(':')[1]?.trim().replace(/['"]/g, '') ?? ''
+            } else {
+              break
+            }
+          }
+        }
+        if (provider && model) return { provider, model }
       }
     } catch {}
     return undefined
