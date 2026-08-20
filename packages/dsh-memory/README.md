@@ -118,7 +118,8 @@ node packages/dsh-memory/scripts/download-embedding-model.mjs
 （2026-08-16 修复：原写回 cordis.patch.yml 的链路实为写进 cordis.yml——该文件
 每次启动被 DSH 重置为组合基底，保存的配置重启即丢失；settings.yaml 是 DSH
 官方用户设置 seam，内建插件配置页同款通道）。apiKey 行展示解析状态（字面 key
-或 `env:NAME` 引用是否可用）。**状态可见化**（2026-08-17）：面板统计行显示
+或 `env:NAME` 引用是否可用；若检测到明文 `sk-` 前缀则宿主 `logger.warn` 提示迁移为 `env:BAILIAN_API_KEY`
+（执行 `node scripts/migrate-apikey-to-env.mjs` 一键迁移，明文→env 引用并生成脱敏备份 `settings.yaml.bak.*`）。**状态可见化**（2026-08-17）：面板统计行显示
 `嵌入状态：ready（后端：remote|local）`——远程验证失败时显式展示失败原因
 （如"返回维度 1024 ≠ 配置维度 2048"），杜绝"ready 但远程未生效"的静默降级；
 保存后自动刷新该状态行。
@@ -192,7 +193,8 @@ SQLite WAL 备份脚本、`memory.json` 迁移语义、`BAILIAN_API_KEY` 重启�
 
 ⚠️ **400K 无感自动压缩**：由 profile `cordis.patch.yml` 的 `compaction-basic` 解禁 + `modelPolicies.thresholdRatio: 0.4`
 提供（实测窗口 1M token）；**modelPolicies 是 provider+model 精确匹配**——默认模型换 provider 后必须同步补策略，
-否则回落默认 0.8（触发点 800K）。见 [docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)。
+否则回落默认 0.8（触发点 800K）。双阈值滞回 `TRIGGER 400K / TARGET 200K / RESERVE 16K` 详见 [COMPACTION.md](../../docs/COMPACTION.md)
+与 [docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md) §9，验证：`grep -r compaction ~/.dsh`。
 
 ## 开发（How-to）
 

@@ -33,6 +33,7 @@ import { MemoryStore } from './store.js'
 import { installSettingsSeam, type SettingsSeam } from './settings.js'
 import { registerMemoryTools } from './tools.js'
 import { jiebaWords } from './scoring.js'
+import { memoryRuntime } from './runtime.js'
 import type { MemoryCausalEdge, MemoryEntry } from './types.js'
 
 export const name = 'memory'
@@ -94,9 +95,9 @@ function defaultEmbeddingModelDir(): string {
 // memory_recall 触发 NamedEntries 严格重复检测（fatal load failure）。终版方案
 // （用户拍板）：settings 变更 → 重建 EmbeddingService/EmbeddingIndex 写入
 // holder；store 钩子/注入器/工具/状态展示在**调用时**读 holder，热换零竞态。
+// 模块级可变全局（embeddingEpoch/holder/storeRef）已收敛至 MemoryRuntime 单例
+// （memoryRuntime.holder/epoch/storeRef），消除模块级可变状态。
 
-/** 嵌入初始化并发纪元（epoch 守卫：并发初始化只保留最后一次发起的会话） */
-let embeddingEpoch = 0
 const EMBEDDING_MODEL_DIR = defaultEmbeddingModelDir()
 
 /**
@@ -117,7 +118,7 @@ async function initEmbedding(
   store: MemoryStore,
   logger: ReturnType<Context['logger']>,
 ): Promise<void> {
-  const epoch = ++embeddingEpoch
+  const epoch = ++memoryRuntime.epoch
   // 远程配置齐判定：baseUrl/model/apiKey 非空（apiKey 经 resolveApiKey 解析——
   // 字面 key 或 env:NAME 环境变量引用；解析为空视为未配置）
   const remoteConfigured =
@@ -144,7 +145,7 @@ async function initEmbedding(
     }
     throw error
   }
-  if (epoch !== embeddingEpoch) return
+  if (epoch !== memoryRuntime.epoch) return
   if (service.state === 'ready') {
     // 向量索引 = vec0 虚拟表（与 memory.sqlite 同文件；构造即载入 sqlite-vec
     // 扩展并建表）。旧 JSON 索引（memory-embeddings-<dim>.json）一次性迁移入
@@ -166,14 +167,14 @@ async function initEmbedding(
         logger.warn('[dsh-memory] 旧嵌入索引改名 .bak 失败（保留原位置）')
       })
     }
-    if (epoch !== embeddingEpoch) return
+    if (epoch !== memoryRuntime.epoch) return
     holder.service = service
     holder.index = index
     // 全量补齐缺失嵌入（后台；仅缺失条目——既有向量已迁移/复用于表内）
     void index.ensureAll()
     logger.info(`[dsh-memory] 语义嵌入已就绪（后端：${service.backendLabel}，维度：${service.dimension}，索引 ${index.table}）`)
   } else {
-    if (epoch !== embeddingEpoch) return
+    if (epoch !== memoryRuntime.epoch) return
     holder.service = service
     holder.index = undefined
     logger.info('[dsh-memory] 语义嵌入未启用：无远程配置且无本地模型（关键词检索）')
@@ -233,10 +234,10 @@ export async function mountMemory(
   // initEmbedding 注释）。store 经 storeRef 延迟引用：applier 在迁移前挂接，
   // 若 settings 变更恰在迁移窗口内触发，则跳过（后续初始 init 读 seam.effective()
   // 已含合并配置——同一生效门，不丢变更）。
-  const holder: EmbeddingHolder = { service: undefined, index: undefined }
-  let storeRef: MemoryStore | undefined
+  // 显式化单例：holder/epoch/storeRef 已收敛至 memoryRuntime（消除模块级可变全局）
+  const holder: EmbeddingHolder = memoryRuntime.holder
   overrides.seam?.setApplier((next) => {
-    const s = storeRef
+    const s = memoryRuntime.storeRef
     if (s === undefined) return Promise.resolve()
     return initEmbedding(next, db, holder, s, logger)
   })
@@ -273,7 +274,7 @@ export async function mountMemory(
 
   // R4-1：畸形 source（手工篡改 memory.json）被检索过滤时告警一次，可观测性由装配层提供
   // P4 hooks：闭包读 holder.index（调用时求值——热换后新索引即生效，无需重启）
-  const store = (storeRef = new MemoryStore(
+  const store = (memoryRuntime.storeRef = new MemoryStore(
     table,
     undefined,
     (id) => {
@@ -405,7 +406,8 @@ export async function mountMemory(
   // 配置端点由 settings seam 供数（getConfig 读生效配置 / setConfig 持久化到
   // settings.yaml 并经实时生效器热换嵌入后端——根因修复见 settings.ts 文件头）；
   // reflect 端点 = 面板手动触发反思（route 缺省回退反思器缓存——面板无会话）
-  registerMemoryRpc(ctx, store, rpcContextFrom(overrides.seam, config), runtime, reflector)
+  // P2：明文密钥检测（sk- 开头）经 logger.warn 提示迁移 env:BAILIAN_API_KEY
+  registerMemoryRpc(ctx, store, rpcContextFrom(overrides.seam, config), runtime, reflector, logger)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }

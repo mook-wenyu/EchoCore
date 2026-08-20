@@ -152,3 +152,31 @@ describe('createMemoryApi unwrap 错误路径', () => {
     await expect(api.status()).rejects.toThrow(TypeError)
   })
 })
+
+/**
+ * TDD 新增：解耦验证（api 可在 node 单测，不依赖 React）
+ * - 直接从 src/client/api.js 导入（绕过 client.ts 的 React 依赖链），验证纯 RPC 层可独立测试
+ * - 验证 reflect 端点载荷与错误透传（与面板"运行反思"按钮联动的底层契约）
+ */
+describe('createMemoryApi 解耦与 reflect 契约（TDD 新增）', () => {
+  it('api 可从 client/api 直接导入（无 React 依赖，node 单测）且 reflect 正常透传', async () => {
+    // 直接导入 api 层（不经过 client.ts 的 React/Panel 链）
+    const { createMemoryApi: createApiDirect } = await import('../src/client/api.js')
+    const recorded: Array<{ channel: string; endpoint: string; payload: unknown }> = []
+    const call = vi.fn(async (channel: string, endpoint: string, payload: unknown) => {
+      recorded.push({ channel, endpoint, payload })
+      return { ok: true, value: { ran: true, reviewed: 5, decisions: 1, merged: 1, archived: 0, skipped: 0 } } as RpcResult<unknown>
+    })
+    const ctx = { get: (n: string) => (n === 'connection' ? { rpc: { call } } : undefined) } as unknown as Context
+    const api = createApiDirect(ctx)
+    const result = await api.reflect()
+    expect(recorded).toEqual([{ channel: '/memory', endpoint: 'reflect', payload: {} }])
+    expect(result.ran).toBe(true)
+    expect(result.reviewed).toBe(5)
+  })
+
+  it('reflect 在 ok:false 时抛错（错误透传与 unwrap 一致）', async () => {
+    const { api } = fakeCtx([err('反思器未就绪')])
+    await expect(api.reflect()).rejects.toThrow('反思器未就绪')
+  })
+})

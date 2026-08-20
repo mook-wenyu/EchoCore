@@ -31,6 +31,7 @@ import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { MEMORY_PLUGIN_ID } from './constants.js'
 import type { MemoryStore } from './store.js'
 import type { AuditRecord, CausalRelation, MemoryCausalEdge, MemoryEntry, MemorySource } from './types.js'
+import { extractBalancedJson } from './utils/balanced-json.js'
 
 /** 自动周期门控间隔（ms；建议 6 小时） */
 export const CAUSAL_INTERVAL_MS = 6 * 3_600_000
@@ -210,42 +211,7 @@ export interface ParsedCausalEdge {
   justification?: string
 }
 
-/**
- * 从文本中提取第一个平衡的 JSON 对象（跳过字符串内的花括号；与 extract.ts 同思路）。
- * 输出 JSON 后附带含 `}` 的说明文本时不会被误吞。
- */
-function extractBalancedJson(text: string): string | undefined {
-  const start = text.indexOf('{')
-  if (start === -1) return undefined
-  let depth = 0
-  let inString = false
-  let escaped = false
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i]
-    if (inString) {
-      if (escaped) {
-        escaped = false
-        continue
-      }
-      if (ch === '\\') {
-        escaped = true
-        continue
-      }
-      if (ch === '"') inString = false
-      continue
-    }
-    if (ch === '"') {
-      inString = true
-      continue
-    }
-    if (ch === '{') depth++
-    else if (ch === '}') {
-      depth--
-      if (depth === 0) return text.slice(start, i + 1)
-    }
-  }
-  return undefined
-}
+/** 复用单源 extractBalancedJson（见 utils/balanced-json）；本地不再重复实现 */
 
 /**
  * 严格解析 LLM 因果输出：首个平衡 JSON，期望 `{"edges":[{sourceId,targetId,confidence,justification}]}`。

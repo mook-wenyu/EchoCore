@@ -25,9 +25,10 @@ import type { Context } from '@deepseek-ai/cordis'
 
 import { cosineSimilarity } from './embed-index.js'
 import { MEMORY_PLUGIN_ID } from './constants.js'
-import { tokenize } from './scoring.js'
+import { jaccard, tokenize } from './scoring.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
+import { extractBalancedJson } from './utils/balanced-json.js'
 
 /** 自动周期门控：距上次成功执行未满该间隔则跳过（不打 LLM） */
 export const REFLECT_INTERVAL_MS = 6 * 3_600_000
@@ -176,39 +177,7 @@ export const REFLECTION_SYSTEM_PROMPT = `你是一个记忆反思器，审视已
 /** 反思用户消息尾部指令 */
 const REFLECT_USER_RULES = `请依据上述规则审视下列记忆条目对，只输出 JSON。`
 
-/** 从文本中提取第一个平衡的 JSON 对象（跳过字符串内的花括号；与 extract.ts 同思路） */
-function extractBalancedJson(text: string): string | undefined {
-  const start = text.indexOf('{')
-  if (start === -1) return undefined
-  let depth = 0
-  let inString = false
-  let escaped = false
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i]
-    if (inString) {
-      if (escaped) {
-        escaped = false
-        continue
-      }
-      if (ch === '\\') {
-        escaped = true
-        continue
-      }
-      if (ch === '"') inString = false
-      continue
-    }
-    if (ch === '"') {
-      inString = true
-      continue
-    }
-    if (ch === '{') depth++
-    else if (ch === '}') {
-      depth--
-      if (depth === 0) return text.slice(start, i + 1)
-    }
-  }
-  return undefined
-}
+/** 复用单源 extractBalancedJson（见 utils/balanced-json）；本地不再重复实现 */
 
 /** 解析单条裁决项：非法/未知 action/字段缺失 → undefined（丢弃该条） */
 function parseDecisionItem(item: unknown): ReflectionDecision | undefined {
@@ -246,39 +215,9 @@ export function parseReflectionDecisions(text: string): ReflectionDecision[] {
 }
 
 /**
- * 纯函数：条目对 token 集合 Jaccard（0..1），与 store.tokenJaccard 分词语义一致
- * （tokenize(content + tags)）。selectReflectionPairs 为纯函数（签名不含 store），
- * 故本地复用 tokenize 保证确定性可测，语义对齐 store 的 token 缓存。
- * 2026-08-18 调优：新增 minTokenOverlap≥2 辅助门，缓解短文本 Jaccard 过敏感问题。
+ * 已收敛至 scoring.jaccard：本地 jaccardOf / jaccardWithOverlap 已删除，
+ * selectReflectionPairs 内直接以 tokenize + scoring.jaccard 计算并另计 overlap。
  */
-function jaccardOf(a: MemoryEntry, b: MemoryEntry): number {
-  const setA = new Set(tokenize(`${a.content} ${a.tags.join(' ')}`))
-  const setB = new Set(tokenize(`${b.content} ${b.tags.join(' ')}`))
-  if (setA.size === 0 || setB.size === 0) return 0
-  let intersection = 0
-  for (const token of setA) {
-    if (setB.has(token)) intersection++
-  }
-  const union = setA.size + setB.size - intersection
-  return union === 0 ? 0 : intersection / union
-}
-
-/**
- * 带重合数的 Jaccard 计算（用于 PEER_MIN_TOKEN_OVERLAP 门控）
- * 返回 { jaccard, overlap }，与 jaccardOf 同分词语义
- */
-function jaccardWithOverlap(a: MemoryEntry, b: MemoryEntry): { jaccard: number; overlap: number } {
-  const setA = new Set(tokenize(`${a.content} ${a.tags.join(' ')}`))
-  const setB = new Set(tokenize(`${b.content} ${b.tags.join(' ')}`))
-  if (setA.size === 0 || setB.size === 0) return { jaccard: 0, overlap: 0 }
-  let intersection = 0
-  for (const token of setA) {
-    if (setB.has(token)) intersection++
-  }
-  const union = setA.size + setB.size - intersection
-  const jaccard = union === 0 ? 0 : intersection / union
-  return { jaccard, overlap: intersection }
-}
 
 /**
  * 选取反思焦点 + 各自的候选对比条目（纯函数，供测试）。
@@ -314,7 +253,12 @@ export function selectReflectionPairs(
       const finalThreshold = Math.max(threshold, thresholdB)
       return { sim, ok: sim >= finalThreshold }
     }
-    const { jaccard: j, overlap } = jaccardWithOverlap(a, b)
+    // 收敛至 scoring.jaccard：本地 tokenize 后复用纯函数，并另计 overlap 满足辅助门
+    const setA = new Set(tokenize(`${a.content} ${a.tags.join(' ')}`))
+    const setB = new Set(tokenize(`${b.content} ${b.tags.join(' ')}`))
+    let overlap = 0
+    for (const token of setA) if (setB.has(token)) overlap++
+    const j = jaccard(setA, setB)
     // 2026-08-18 调优：下界 0.08 + overlap≥2 双门控
     return { sim: j, ok: j >= PEER_MIN_JACCARD && j < PEER_MAX_JACCARD && overlap >= PEER_MIN_TOKEN_OVERLAP }
   }

@@ -337,3 +337,18 @@ export function rrfScore(kwRank: number | undefined, semRank: number | undefined
   if (semRank !== undefined) score += 1 / (k + semRank)
   return score / (2 / (k + 1))
 }
+
+/**
+ * 集合 Jaccard 相似度（0..1）：交集大小 / 并集大小。
+ * - 供 reflect / store 复用，输入为已分词的 token 集合（与 tokenize 语义一致）；
+ * - 空集合按 0 处理（与既有 jaccardOf 行为对齐，避免除零）。
+ */
+export function jaccard(aTokens: ReadonlySet<string>, bTokens: ReadonlySet<string>): number {
+  if (aTokens.size === 0 || bTokens.size === 0) return 0
+  let intersection = 0
+  for (const token of aTokens) {
+    if (bTokens.has(token)) intersection++
+  }
+  const union = aTokens.size + bTokens.size - intersection
+  return union === 0 ? 0 : intersection / union
+}

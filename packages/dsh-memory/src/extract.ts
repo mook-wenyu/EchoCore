@@ -23,6 +23,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { MEMORY_PLUGIN_ID } from './constants.js'
 import type { ExtractedMemory, MemoryKind } from './types.js'
+import { extractBalancedJson } from './utils/balanced-json.js'
 
 /** 提取系统提示词（角色界定 + 分类规则 + 输出格式约束） */
 export const EXTRACTION_SYSTEM_PROMPT = `你是一个记忆提取器，为 AI 编码助手从对话摘录中提取值得长期记住的信息。
@@ -106,43 +107,7 @@ export function renderEventsText(events: readonly SessionEvent[]): string {
   return parts.filter((part) => part.length > 0).join('\n')
 }
 
-/**
- * 从文本中提取第一个平衡的 JSON 对象（跳过字符串内的花括号）。
- * R2-11/M3：取代贪婪正则 `/\{[\s\S]*\}/`——后者会从首个 `{` 截到最后一个 `}`，
- * LLM 输出在 JSON 后附带含 `}` 的说明文本时会被错误吞并。
- */
-function extractBalancedJson(text: string): string | undefined {
-  const start = text.indexOf('{')
-  if (start === -1) return undefined
-  let depth = 0
-  let inString = false
-  let escaped = false
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i]
-    if (inString) {
-      if (escaped) {
-        escaped = false
-        continue
-      }
-      if (ch === '\\') {
-        escaped = true
-        continue
-      }
-      if (ch === '"') inString = false
-      continue
-    }
-    if (ch === '"') {
-      inString = true
-      continue
-    }
-    if (ch === '{') depth++
-    else if (ch === '}') {
-      depth--
-      if (depth === 0) return text.slice(start, i + 1)
-    }
-  }
-  return undefined
-}
+/** 复用单源 extractBalancedJson（见 utils/balanced-json）；本地不再重复实现 */
 
 /**
  * 解析 LLM 结构化输出为记忆列表。

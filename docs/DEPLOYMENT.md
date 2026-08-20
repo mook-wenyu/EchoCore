@@ -85,3 +85,26 @@ EACCES 等（真实故障上抛，不静默当无文件）。损坏文件降级�
 ⚠️ **`modelPolicies` 是 provider+model 精确匹配**——默认模型换成其它 provider 后 0.4 不再命中，
 回落默认 0.8（触发点 800K）且**无告警**；换默认模型必须同步补对应策略
 （2026-08-17 实测："长会话不再自动压缩"即此根因）。
+
+**双阈值滞回**（`COMPACTION_TRIGGER 400K / TARGET 200K / RESERVE 16K`）：触发后压缩至 200K 目标而非 399K，
+形成 200K 滞回带 + 16K 预留，避免频繁抖动。详见 [COMPACTION.md](COMPACTION.md)。
+
+**profile 引用**（宿主 `compaction-basic` patch 段，见 `~/.dsh/profiles/<name>/cordis.patch.yml`）：
+
+```yaml
+- id: compaction-basic
+  disabled: false
+  config:
+    modelPolicies:
+      - provider: opencode-go
+        model: deepseek-v4-flash
+        thresholdRatio: 0.4
+```
+
+**验证**（宿主是否生效）：
+
+```bash
+grep -r compaction ~/.dsh
+# 期望：profiles/<name>/cordis.patch.yml 含 id: compaction-basic 且 thresholdRatio: 0.4
+cat ~/.dsh/profiles/web/cordis.patch.yml | grep -A2 compaction-basic
+```

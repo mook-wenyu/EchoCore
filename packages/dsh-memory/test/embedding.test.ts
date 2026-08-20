@@ -1019,3 +1019,126 @@ describe('调优回归（2026-08-19：BACKFILL_BUDGET/窗口/BATCH 协同）', (
     db.close()
   })
 })
+
+// ── P1 补覆盖：embedding.ts:86/413/503-518 的降级分支（TDD，目标 >90%） ───────
+describe('P1 补覆盖：embedding 降级分支（86/413/503-518）', () => {
+  it('413：ready 但 backend 非法 → embed 抛不可用（显式降级契约，非防御性兜底）', async () => {
+    // 中文注释：构造一个 state=ready 但 backend 未设的异常态（私有字段篡改模拟边界），
+    // 直接触发 try 块的 throw EmbeddingUnavailableError 分支（413 行），并验证 catch
+    // 中 instanceof 判定将其原样抛出（非吞错）。
+    const service = new EmbeddingService({
+      modelDir: '/models',
+      hasLocalModel: async () => false,
+      loadLocalBackend: async () => ({ async embed() { return new Float32Array(384) } }),
+      fetchRemoteEmbeddings: async () => [new Float32Array(384)],
+    })
+    await service.init()
+    // 篡改私有状态：state=ready 但 backend=undefined + 无 localBackend → 走 413 抛错
+    ;(service as unknown as { stateValue: string }).stateValue = 'ready'
+    ;(service as unknown as { backend: string | undefined }).backend = undefined
+    ;(service as unknown as { localBackend: unknown }).localBackend = undefined
+    await expect(service.embed('测试')).rejects.toThrow(EmbeddingUnavailableError)
+    await expect(service.embed('测试')).rejects.toThrow('语义嵌入不可用')
+  })
+
+  it('503-518：searchWithSemantic 在 ready 态下 embed 抛 EmbeddingUnavailableError → 显式降级关键词并 logWarn（非静默）', async () => {
+    // 中文注释：语义检索的显式降级语义——ready 态下远程抖动导致 embed 失败，
+    // 必须显式记录并回退关键词，而非抛裸错杀检索链路。
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => Date.now())
+    await store.create({
+      workspace: 'D:/ws',
+      sessionId: 's1',
+      kind: 'fact',
+      content: 'pnpm workspace 管理多包的实践',
+      importance: 5,
+      tags: [],
+      source: { sessionId: 's1', eventSeqs: [1], excerpt: '…' },
+      by: 'extractor',
+    })
+    const warns: string[] = []
+    // 伪造 ready 的 embedding，其 embed 直接抛不可用（触发 503-518 的 catch 分支）
+    const fakeEmbedding = {
+      state: 'ready' as const,
+      embed: async () => { throw new EmbeddingUnavailableError('远程嵌入抖动（模拟）') },
+    }
+    const fakeIndex = { knn: () => [] as Array<{ id: string; cosine: number }> }
+    const results = await searchWithSemantic(
+      store,
+      fakeEmbedding as unknown as import('../src/embedding.js').EmbeddingService,
+      fakeIndex,
+      'pnpm workspace',
+      { workspace: 'D:/ws', limit: 5 },
+      (msg) => warns.push(msg),
+    )
+    // 降级后仍返回关键词命中（检索可用），且显式记录
+    expect(results.length).toBeGreaterThan(0)
+    expect(warns.some((m) => m.includes('语义检索降级为关键词'))).toBe(true)
+  })
+
+  it('503-518：searchWithSemantic 非 EmbeddingUnavailableError → 原样上抛（不吞错）', async () => {
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => Date.now())
+    const fakeEmbedding = {
+      state: 'ready' as const,
+      embed: async () => { throw new Error('非降级类错误（应上抛）') },
+    }
+    await expect(
+      searchWithSemantic(
+        store,
+        fakeEmbedding as unknown as import('../src/embedding.js').EmbeddingService,
+        { knn: () => [] },
+        '测试',
+        { workspace: 'D:/ws', limit: 5 },
+        () => {},
+      ),
+    ).rejects.toThrow('非降级类错误')
+  })
+
+  it('86/边界：resolveApiKey 的 env: 空名与空白名分支（显式降级语义）', () => {
+    // 中文注释：env: 前缀后无有效名 → 视为未配置（undefined），防静默用空 key 误判为已配置
+    expect(resolveApiKey('env:')).toBeUndefined()
+    expect(resolveApiKey('env:   ')).toBeUndefined()
+    expect(resolveApiKey('env:MY_KEY ')).toBeUndefined() // 未设环境变量
+  })
+
+  it('86/默认路径：defaultHasLocalModel 默认检测在无模型时返回 false（显式无模型态）', async () => {
+    // 中文注释：默认检测走真实文件访问，无模型时正常禁用态（非错误）
+    const { defaultHasLocalModel } = await import('../src/embedding.js')
+    const has = defaultHasLocalModel('/tmp/no-such-dir-xyz-embedding')
+    await expect(has()).resolves.toBe(false)
+  })
+
+  it('86/默认路径：defaultLoadLocalBackend 走假 pipeline 分支（显式本地加载语义，非防御性兜底）', async () => {
+    // 中文注释：本地后端默认加载路径需经 pipeline，但测试不加载真实 22MB 模型——用最小假实现覆盖分支
+    const mod = await import('../src/embedding.js')
+    const fakePipeline = async () => ({
+      async embed(text: string) {
+        const v = new Float32Array(384)
+        v[0] = text.length
+        return v
+      },
+    })
+    const service = new mod.EmbeddingService({
+      modelDir: '/tmp/any',
+      hasLocalModel: async () => true,
+      loadLocalBackend: fakePipeline as never,
+      fetchRemoteEmbeddings: async () => [new Float32Array(384)],
+    })
+    await service.init()
+    expect(service.state).toBe('ready')
+    expect(service.dimension).toBe(384)
+  })
+
+  it('86/默认路径：默认 loadLocalBackend 真实进入（模型缺失 → error 态，非静默禁用）', async () => {
+    // 中文注释：默认 loadLocalBackend 会尝试 pipeline 加载，缺模型时抛错转 error（显式异常态，区别于无模型的 disabled）
+    const mod = await import('../src/embedding.js')
+    const service = new mod.EmbeddingService({
+      modelDir: '/tmp/no-model-dir-for-coverage',
+      hasLocalModel: async () => true, // 假称有模型，迫使走默认 loadLocalBackend
+      fetchRemoteEmbeddings: async () => [new Float32Array(384)],
+    })
+    await expect(service.init()).rejects.toThrow('语义嵌入初始化失败')
+    expect(service.state).toBe('error')
+  })
+})

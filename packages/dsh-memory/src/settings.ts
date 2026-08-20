@@ -40,21 +40,18 @@ import {
 } from '@deepseek-ai/dsh-settings'
 
 import { Config, DEFAULTS, sameConfig, type Config as ConfigType, type ResolvedConfig } from './config.js'
+import { memoryRuntime, type LiveApplier, type SettingsServiceLike } from './runtime.js'
 
 /** settings 命名空间（settings.yaml 的 memory 段；kebab-case 短名） */
 export const NS = settingsNamespace('memory')
 
 /** 实时生效器（配置变更的应用方式——装配层注入：嵌入后端热换，不重启插件） */
-export type LiveApplier = (next: ResolvedConfig) => Promise<void>
+// LiveApplier 统一收敛至 runtime（消除跨模块类型重复）
+export type { LiveApplier } from './runtime.js'
 
 /** settings 持久化通道（setConfig 落盘 settings.yaml；未接线时 update 拒绝） */
 export interface SettingsChannel {
   update(patch: Record<string, unknown>): Promise<void>
-}
-
-/** settings 服务形状（ctx.inject 捕获的最小面；命名空间注册由 installSettingsSection 完成） */
-interface SettingsServiceLike {
-  update(ns: SettingsNamespace, patch: object): Promise<void>
 }
 
 /** settings seam 对外最小面（index.ts 装配与 RPC 共用） */
@@ -69,16 +66,9 @@ export interface SettingsSeam {
   setApplier: (applier: LiveApplier) => void
 }
 
-// ── 模块级单例状态（进程内一个宿主实例；resetSeamForTest 供测试隔离） ────
-
-/** 上次生效的合并配置（幂等守卫基线——防注册期初始 onChange 与面板保存重复生效） */
-let active: ResolvedConfig | undefined
-/** 实时生效器（index.ts mountMemory 挂接；默认空操作） */
-let applier: LiveApplier = () => Promise.resolve()
-/** settings 权威配置源（setSource 注入：注册后 = scope.get()，注销后 = entry 配置） */
-let currentSource: () => ResolvedConfig = () => ({ ...DEFAULTS }) as ResolvedConfig
-/** settings 服务引用（inject 后置；面板持久化通道） */
-let settingsService: SettingsServiceLike | undefined
+// ── 运行时单例（显式化 holder/settings 单例，P1 任务 1） ────
+// 模块级可变全局已收敛至 MemoryRuntime 单例（memoryRuntime.settings.*），
+// 本文件不再持有独立 let 全局——消除模块级可变状态，统一经 runtime 实例管理。
 
 /**
  * 安装 settings seam（apply 时调用一次）：
@@ -88,18 +78,18 @@ let settingsService: SettingsServiceLike | undefined
  */
 export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSeam {
   const entryConfig: ResolvedConfig = { ...DEFAULTS, ...entry }
-  currentSource = () => entryConfig
+  memoryRuntime.settings.currentSource = () => entryConfig
   // 幂等守卫基线：进程首启用 entry 配置（后续变更与之比较）
-  active = active ?? entryConfig
+  memoryRuntime.settings.active = memoryRuntime.settings.active ?? entryConfig
 
   const hooks: SettingsSectionHooks<ConfigType> = {
     setSource: (source) => {
-      currentSource = () => source() as ResolvedConfig
+      memoryRuntime.settings.currentSource = () => source() as ResolvedConfig
     },
     onChange: () => {
       // 注册期初始值 / settings.yaml 热重载 / 面板保存后 commit——统一走
       // 幂等生效门（同配置跳过），生效方式由装配层 applier 决定（实时热换）
-      void applyConfigChange(currentSource())
+      void applyConfigChange(memoryRuntime.settings.currentSource())
     },
   }
   installSettingsSection(ctx, NS, Config, entry, hooks)
@@ -107,17 +97,17 @@ export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSe
   // 面板持久化通道：settings 服务 update（命名空间注册在 installSettingsSection
   // 内部完成；本 inject 仅捕获服务引用，调用发生在用户保存时——彼时必已注册）
   ctx.inject(['settings'], (sctx) => {
-    settingsService = {
+    memoryRuntime.settings.service = {
       update: (ns, patch) =>
         (sctx as unknown as { settings: SettingsServiceLike }).settings.update(ns, patch),
     }
   })
 
   return {
-    effective: () => active ?? entryConfig,
+    effective: () => memoryRuntime.settings.active ?? entryConfig,
     channel: {
       update: (patch) => {
-        const service = settingsService
+        const service = memoryRuntime.settings.service
         if (service === undefined) {
           return Promise.reject(new Error('settings 服务不可用：配置无法持久化（当前部署未挂载 settings provider）'))
         }
@@ -126,7 +116,7 @@ export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSe
     },
     applyChange: applyConfigChange,
     setApplier: (next) => {
-      applier = next
+      memoryRuntime.settings.applier = next
     },
   }
 }
@@ -139,23 +129,23 @@ export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSe
  * 并发调用各自进入 applier（装配层以 epoch 守卫丢弃过期结果）。
  */
 export function applyConfigChange(next: ResolvedConfig): Promise<void> {
-  const prev = active
+  const prev = memoryRuntime.settings.active
   if (prev !== undefined && sameConfig(next, prev)) return Promise.resolve()
-  active = next
-  return applier(next).catch((error) => {
+  memoryRuntime.settings.active = next
+  return memoryRuntime.settings.applier(next).catch((error) => {
     // 热换失败（applier 抛错，运行态未切换，仍保留旧后端）：回滚 active 到旧值。
     // 若不回滚，active 已指向新配置而运行态仍是旧后端——配置态与运行态漂移，
     // 且后续同配置变更会被 sameConfig 幂等门拦下，无法重试/自愈（Q6 拍板修复）。
     // 回滚后 effective() 返回旧配置，下次 applyChange 新配置可再次触发生效。
-    active = prev
+    memoryRuntime.settings.active = prev
     throw error
   })
 }
 
-/** 测试隔离：重置进程级单例（仅测试调用；运行期不导出语义变化） */
+/**
+ * 测试隔离：重置进程级单例（仅测试调用；运行期不导出语义变化）
+ * 显式化后为实例方法委托（P1 任务 1：消除模块级可变全局，统一经 MemoryRuntime 实例管理）
+ */
 export function resetSeamForTest(): void {
-  active = undefined
-  applier = () => Promise.resolve()
-  settingsService = undefined
-  currentSource = () => ({ ...DEFAULTS }) as ResolvedConfig
+  memoryRuntime.resetSeamForTest()
 }

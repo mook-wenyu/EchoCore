@@ -74,6 +74,7 @@ export function createMemoryRpcHandler(
   rpc: MemoryRpcContext,
   runtime?: RuntimeHealth,
   reflector?: ReflectTrigger,
+  logger?: { warn: (message: string) => void },
 ): MemoryRpcHandler {
   return async (endpoint, payload) => {
     try {
@@ -105,7 +106,7 @@ export function createMemoryRpcHandler(
         })
       }
       if (endpoint === 'getConfig') return ok({ config: configView(rpc.config()) })
-      if (endpoint === 'setConfig') return ok(await handleSetConfig(rpc, payload))
+      if (endpoint === 'setConfig') return ok(await handleSetConfig(rpc, payload, logger))
       return internalError(`未知记忆端点：${endpoint}`)
     } catch (error) {
       return internalError(error instanceof Error ? error.message : String(error))
@@ -147,12 +148,25 @@ function configView(config: ResolvedConfig): Record<string, unknown> {
  * 持久化失败（settings 服务缺失/磁盘错误/校验拒绝）即整体拒绝——绝不"保存成功
  * 但重启丢失"（2026-08-16 实测根因：原走 fiber.update(noSave=false) 写回
  * cordis.yml，该文件每次启动被 prepareProfile 重置）。
+ * 明文密钥检测（P2）：若最终生效的 embeddingApiKey 以 sk- 开头（字面 key 直写
+ * settings.yaml），则 logger.warn 提示迁移为 env:BAILIAN_API_KEY 引用——
+ * 避免密钥落盘明文（执行 node scripts/migrate-apikey-to-env.mjs 一键迁移）。
  */
-async function handleSetConfig(rpc: MemoryRpcContext, payload: unknown): Promise<{ config: Record<string, unknown> }> {
+async function handleSetConfig(
+  rpc: MemoryRpcContext,
+  payload: unknown,
+  logger?: { warn: (message: string) => void },
+): Promise<{ config: Record<string, unknown> }> {
   const partial = parseSetConfigPayload(payload)
   // Config(...) 整体校验：未知键保留但不影响（键已在上一步白名单过滤）；
   // 类型/边界/跨字段（transform）错误在此抛 ValidationError → internal。
   const next = Config({ ...rpc.config(), ...partial }) as ResolvedConfig
+  // 明文密钥告警：最终生效 key 以 sk- 开头 → 提示迁移至 env 引用（P2 密钥 env 化）
+  if (typeof next.embeddingApiKey === 'string' && next.embeddingApiKey.startsWith('sk-')) {
+    logger?.warn(
+      '[dsh-memory] 检测到明文 apiKey（sk- 开头）已保存，建议迁移为 env:BAILIAN_API_KEY 引用（执行 node scripts/migrate-apikey-to-env.mjs 一键迁移并脱敏备份）',
+    )
+  }
   // ① 持久化：settings 命名空间 → ~/.dsh/settings.yaml（DSH 官方用户设置 seam）
   await rpc.settings.update(partial)
   // ② 生效：装配层实时热换嵌入后端（settings.ts applyChange → initEmbedding）。
@@ -181,11 +195,12 @@ export function registerMemoryRpc(
   rpc: MemoryRpcContext,
   runtime?: RuntimeHealth,
   reflector?: ReflectTrigger,
+  logger?: { warn: (message: string) => void },
 ): void {
   const connection = ctx.get('connection') as {
     rpc: { handle(channel: string, handler: MemoryRpcHandler, options: { authority: string }): () => Promise<void> }
   }
-  const dispose = connection.rpc.handle('/memory', createMemoryRpcHandler(store, rpc, runtime, reflector), { authority: 'loopback' })
+  const dispose = connection.rpc.handle('/memory', createMemoryRpcHandler(store, rpc, runtime, reflector, logger), { authority: 'loopback' })
   ctx.effect(() => () => {
     void dispose()
   })

@@ -373,4 +373,30 @@ describe('MemoryPanel 组件行为（jsdom）', () => {
       view.unmount()
     }
   })
+
+  // TDD 新增：面板归档链路（详情→归档按钮→archive 调且详情收起，列表刷新）
+  it('归档交互：打开详情后点击归档 → archive 被调且详情收起（TDD 新增）', async () => {
+    const archive = vi.fn(async () => true)
+    const get = vi.fn(async () => detailOf('mem-1', '记忆内容甲', '原文摘录'))
+    const list = vi.fn(async () => [summary('mem-1', 'fact', '记忆内容甲')])
+    // 列表刷新第二次返回空（归档后列表变空，验证 refresh 被调）
+    let listCalls = 0
+    const listWithRefresh = vi.fn(async () => {
+      listCalls++
+      return listCalls === 1 ? [summary('mem-1', 'fact', '记忆内容甲')] : []
+    })
+    const view = render(React.createElement(MemoryPanel, { api: fakeApi({ list: listWithRefresh, get, archive }), close: () => {} }))
+    try {
+      await waitFor(() => expect(screen.getByText(/\[fact\] 记忆内容甲/)).toBeTruthy())
+      fireEvent.click(screen.getByText(/\[fact\] 记忆内容甲/))
+      await waitFor(() => expect(screen.getByText(/原文摘录：原文摘录/)).toBeTruthy())
+      // 详情面板内的归档按钮
+      fireEvent.click(screen.getByText('归档'))
+      await waitFor(() => expect(archive).toHaveBeenCalledWith('mem-1'))
+      // 归档后详情收起（原文摘录不再可见，列表可能刷新为空）
+      await waitFor(() => expect(screen.queryByText(/原文摘录：原文摘录/)).toBeNull(), { timeout: 2000 })
+    } finally {
+      view.unmount()
+    }
+  })
 })

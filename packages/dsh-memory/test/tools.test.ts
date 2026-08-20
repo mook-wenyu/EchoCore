@@ -665,3 +665,84 @@ describe('memory_status 自进化/因果观测', () => {
   })
 })
 
+// ── P1 补覆盖：tools.ts:283-689 的 render 分支（TDD，目标 >90%） ───────────
+describe('P1 补覆盖：工具 render 分支（283-689）', () => {
+  it('各工具 render 分支全覆盖（8 工具的文本渲染，显式分支）', async () => {
+    // 中文注释：render 是纯函数，负责模型/UI 呈现；未覆盖会导致面板与日志不可观测
+    const { tools } = setup()
+    // memory_recall：0 条与 N 条分支
+    const recall = toolOf(tools, 'memory_recall')
+    const recallRender = recall.output.render as (args: unknown, value: { memories: Array<{ id: string; kind: string; content: string; importance: number; sessionId: string; eventSeqs: number[]; createdAt: string }>; returned: number }) => Array<{ text: string }>
+    expect(recallRender({}, { memories: [], returned: 0 })[0]?.text).toContain('未找到')
+    expect(recallRender({}, { memories: [{ id: 'a-12345678', kind: 'fact', content: '内容', importance: 5, sessionId: 's1', eventSeqs: [1], createdAt: '2026-08-01T00:00:00.000Z' }], returned: 1 })[0]?.text).toContain('找到 1 条')
+
+    // memory_search
+    const search = toolOf(tools, 'memory_search')
+    const searchRender = search.output.render as (args: unknown, value: { memories: Array<{ id: string; kind: string; content: string; importance: number; tags: string[]; sessionId: string; status: string; createdAt: string; updatedAt: string }>; returned: number }) => Array<{ text: string }>
+    expect(searchRender({}, { memories: [], returned: 0 })[0]?.text).toContain('共 0 条')
+
+    // memory_note：merged true/false
+    const note = toolOf(tools, 'memory_note')
+    const noteRender = note.output.render as (args: unknown, value: { id: string; merged: boolean; mergedWithId?: string }) => Array<{ text: string }>
+    expect(noteRender({}, { id: 'a-12345678', merged: false })[0]?.text).toContain('已记录')
+    expect(noteRender({}, { id: 'b-12345678', merged: true, mergedWithId: 'a-12345678' })[0]?.text).toContain('合并')
+
+    // memory_forget：archived true/false
+    const forget = toolOf(tools, 'memory_forget')
+    const forgetRender = forget.output.render as (args: unknown, value: { id: string; archived: boolean }) => Array<{ text: string }>
+    expect(forgetRender({}, { id: 'a-12345678', archived: true })[0]?.text).toContain('已归档')
+    expect(forgetRender({}, { id: 'missing', archived: false })[0]?.text).toContain('未找到')
+
+    // memory_audit：未找到 / 找到（含 supersede/因果/摘录截断）
+    const audit = toolOf(tools, 'memory_audit')
+    const auditRender = audit.output.render as (args: unknown, value: { found: boolean; entry?: { id: string; kind: string; content: string; importance: number; tags: string[]; workspace: string; sessionId: string; createdAt: string; updatedAt: string; source: { sessionId: string; eventSeqs: number[]; excerpt: string }; accessCount: number; status: string; audit: Array<{ action: string; at: string; by: string; detail?: string }>; supersededBy?: string; supersedes?: string }; causal?: { causedBy: Array<{ id: string; confidence: number }>; causeOf: Array<{ id: string; confidence: number }> } }) => Array<{ text: string }>
+    expect(auditRender({}, { found: false })[0]?.text).toContain('未找到')
+    const longExcerpt = 'x'.repeat(300)
+    expect(
+      auditRender({}, {
+        found: true,
+        entry: {
+          id: 'a-12345678', kind: 'fact', content: '内容', importance: 5, tags: [], workspace: 'D:/ws', sessionId: 's1',
+          createdAt: '2026-08-01T00:00:00.000Z', updatedAt: '2026-08-01T00:00:00.000Z',
+          source: { sessionId: 's1', eventSeqs: [1], excerpt: longExcerpt },
+          accessCount: 3, status: 'active',
+          supersededBy: 'b-12345678', supersedes: 'c-12345678',
+          audit: [{ action: 'create', at: '2026-08-01T00:00:00.000Z', by: 'tool', detail: '原因' }],
+        },
+        causal: { causedBy: [{ id: 'b1234567', confidence: 0.9 }], causeOf: [{ id: 'c1234567', confidence: 0.8 }] },
+      })[0]?.text,
+    ).toContain('supersede')
+    // 无 supersede/因果的简洁分支
+    expect(
+      auditRender({}, {
+        found: true,
+        entry: {
+          id: 'a-12345678', kind: 'fact', content: '内容', importance: 5, tags: [], workspace: 'D:/ws', sessionId: 's1',
+          createdAt: '2026-08-01T00:00:00.000Z', updatedAt: '2026-08-01T00:00:00.000Z',
+          source: { sessionId: 's1', eventSeqs: [], excerpt: '短摘录' },
+          accessCount: 0, status: 'active', audit: [{ action: 'create', at: '2026-08-01T00:00:00.000Z', by: 'tool' }],
+        },
+      })[0]?.text,
+    ).toContain('来源事件序号')
+
+    // memory_status：含后端/降级原因/累计的分支
+    const status = toolOf(tools, 'memory_status')
+    const statusRender = status.output.render as (args: unknown, value: { total: number; active: number; archived: number; byKind: { fact: number; preference: number; decision: number; todo: number; insight: number }; writeFailures: number; embeddingState: string; embeddingBackend: string | null; embeddingInitError: string | null; embeddingDegradedReason: string | null; lastMaintenanceAt: string | null; rejectedCount: number; reflection: unknown; lastReflectionAt: string | null; reflectionCumulative: unknown; causal: unknown; lastCausalAt: string | null }) => Array<{ text: string }>
+    // 分支：无后端/有后端、有降级原因、有累计
+    expect(statusRender({}, { total: 0, active: 0, archived: 0, byKind: { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 }, writeFailures: 0, embeddingState: 'ready', embeddingBackend: 'remote', embeddingInitError: '鉴权失败', embeddingDegradedReason: '维度不匹配已降级', lastMaintenanceAt: null, rejectedCount: 0, reflection: { reviewed: 2, decisions: 1, merged: 1, archived: 0, skipped: 0 }, lastReflectionAt: '2026-08-17T00:00:00.000Z', reflectionCumulative: { runs: 2, decisions: 2, merged: 1, archived: 0, skipped: 1 }, causal: { reviewed: 4, edges: 2, created: 2, skipped: 0 }, lastCausalAt: '2026-08-17T01:00:00.000Z' })[0]?.text).toContain('嵌入降级原因')
+    expect(statusRender({}, { total: 1, active: 1, archived: 0, byKind: { fact: 1, preference: 0, decision: 0, todo: 0, insight: 0 }, writeFailures: 0, embeddingState: 'disabled', embeddingBackend: null, embeddingInitError: null, embeddingDegradedReason: null, lastMaintenanceAt: '2026-08-16T00:00:00.000Z', rejectedCount: 1, reflection: null, lastReflectionAt: null, reflectionCumulative: null, causal: null, lastCausalAt: null })[0]?.text).toContain('记忆库统计')
+
+    // memory_reflect：ran true/false
+    const reflect = toolOf(tools, 'memory_reflect')
+    const reflectRender = reflect.output.render as (args: unknown, value: { ran: boolean; reviewed: number; decisions: number; merged: number; archived: number; skipped: number }) => Array<{ text: string }>
+    expect(reflectRender({}, { ran: false, reviewed: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 })[0]?.text).toContain('未执行')
+    expect(reflectRender({}, { ran: true, reviewed: 2, decisions: 1, merged: 1, archived: 0, skipped: 1 })[0]?.text).toContain('反思完成')
+
+    // memory_causal：ran true/false
+    const causal = toolOf(tools, 'memory_causal')
+    const causalRender = causal.output.render as (args: unknown, value: { ran: boolean; reviewed: number; edges: number; created: number; skipped: number }) => Array<{ text: string }>
+    expect(causalRender({}, { ran: false, reviewed: 0, edges: 0, created: 0, skipped: 0 })[0]?.text).toContain('未执行')
+    expect(causalRender({}, { ran: true, reviewed: 4, edges: 2, created: 2, skipped: 1 })[0]?.text).toContain('因果抽取完成')
+  })
+})
+

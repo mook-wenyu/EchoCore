@@ -22,6 +22,7 @@
 | 文档 | 说明 |
 |---|---|
 | [部署到 DSH](DEPLOYMENT.md) | 首次部署 / 更新闭环（build→刷新 store→HMR 或重启）/ HMR 机制 / 供应链策略 / 备份 / 迁移 / 密钥 |
+| [400K 双阈值压缩](COMPACTION.md) | 宿主 compaction-basic 400K 触发 / 200K 目标 / 16K 预留的双阈值滞回、cordis.patch.yml 引用与 `grep -r compaction ~/.dsh` 验证 |
 | [开发与质量门](DEVELOPMENT.md) | 命令 / 测试 / 覆盖率 / 客户端构建 / 文档约定 |
 
 ## 4. 时间点报告（dated snapshots，非活文档）

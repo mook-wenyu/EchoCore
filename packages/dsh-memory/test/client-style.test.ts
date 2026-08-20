@@ -14,8 +14,14 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
-/** 面板源码路径（相对本测试文件） */
-const CLIENT_SRC = resolve(import.meta.dirname, '../src/client.ts')
+/** 面板源码路径（相对本测试文件）——拆分后样式分布于 client/* 子模块，需聚合读取 */
+const CLIENT_SRCS = [
+  resolve(import.meta.dirname, '../src/client.ts'),
+  resolve(import.meta.dirname, '../src/client/panel.tsx'),
+  resolve(import.meta.dirname, '../src/client/config-pane.tsx'),
+  resolve(import.meta.dirname, '../src/client/error-boundary.tsx'),
+  resolve(import.meta.dirname, '../src/client/api.ts'),
+]
 
 /**
  * 官方主题 alias token 清单（design-platform.css:156-246 实证，2026-08-15）。
@@ -68,7 +74,13 @@ const OFFICIAL_ALIAS_TOKENS = new Set([
 const OFFICIAL_FONT_TOKENS = new Set(['--dsw-font-xs-13', '--dsw-font-xxs-12'])
 
 describe('记忆面板样式与 DSH 主题同步（防回归）', () => {
-  const source = readFileSync(CLIENT_SRC, 'utf8')
+  const source = CLIENT_SRCS.map((p) => {
+    try {
+      return readFileSync(p, 'utf8')
+    } catch {
+      return ''
+    }
+  }).join('\n')
 
   it('不再使用不存在的 --dsh-* 颜色变量（风格不同步根因）', () => {
     const offenders = [...source.matchAll(/var\(--dsh-[^)]*\)/g)].map((match) => match[0])
