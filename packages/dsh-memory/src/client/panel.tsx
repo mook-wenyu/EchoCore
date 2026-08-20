@@ -296,7 +296,7 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
       await refreshStats()
       // 消费 ReflectResultView（在 refresh 之后设置，避免被 refresh 清空）
       if (result.ran === false) {
-        setError('无可用模型路由/LLM 未就绪')
+        setError('无可用模型路由：请在 DSH 设置→模型页面配置默认模型（provider/model），或在记忆面板配置中设置 llm.provider + llm.model，然后发一条消息触发路由缓存')
       } else if (result.reviewed === 0) {
         setNotice('已执行：无候选对（0 审）')
       } else if (result.decisions > 0) {

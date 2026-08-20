@@ -482,7 +482,7 @@ describe('MemoryPanel P0 反思增强（TDD）', () => {
     try {
       await waitFor(() => expect(screen.getByText('运行反思')).toBeTruthy())
       fireEvent.click(screen.getByText('运行反思'))
-      await waitFor(() => expect(screen.getByText(/无可用模型路由\/LLM 未就绪/)).toBeTruthy())
+      await waitFor(() => expect(screen.getByText(/无可用模型路由/)).toBeTruthy())
     } finally {
       view.unmount()
     }

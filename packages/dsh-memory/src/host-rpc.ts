@@ -52,7 +52,9 @@ export type MemoryRpcHandler = (endpoint: string, payload: unknown) => Promise<R
  * - settings：持久化通道——setConfig 落盘 settings.yaml（DSH 官方用户设置 seam，
  *   重启不丢。不写 loader 配置树：其写回目标 cordis.yml 每次启动被
  *   prepareProfile 重置，2026-08-16 实测"保存成功但重启丢失"根因）；
- * - applyChange：应用新配置并等待生效（装配层实现：幂等内存重启 noSave=true）。
+ * - applyChange：应用新配置并等待生效（装配层实现：幂等内存重启 noSave=true）；
+ * - defaultModel：DSH 宿主 agent-default-model 回退源（memory LLM 配置为空时
+ *   经此获取宿主默认模型——面板 reflect 端点无会话路由时的权威回退）。
  */
 export interface MemoryRpcContext {
   /** 当前生效配置读取（getConfig 展示 / setConfig 合并基底） */
@@ -61,6 +63,8 @@ export interface MemoryRpcContext {
   settings: { update(patch: Record<string, unknown>): Promise<void> }
   /** 应用新配置并等待生效（幂等内存重启） */
   applyChange(next: ResolvedConfig): Promise<void>
+  /** DSH 宿主 agent-default-model 当前选择（provider + model）；宿主未挂载时返回 undefined */
+  defaultModel: () => { provider: string; model: string } | undefined
 }
 
 /** 反思触发形状（面板 RPC 手动触发；route 缺省回退反思器缓存——面板无会话） */
@@ -82,7 +86,19 @@ export function createMemoryRpcHandler(
       if (endpoint === 'search') return ok(await handleSearch(store, payload))
       if (endpoint === 'get') return ok(handleGet(store, payload))
       if (endpoint === 'archive') return ok(await handleArchive(store, payload))
-      if (endpoint === 'reflect') return ok(await handleReflect(reflector))
+      if (endpoint === 'reflect') {
+        const config = rpc.config()
+        const llm = config.llm
+        // memory 配置的 llm.provider/model 优先；为空时回退 DSH 宿主 agent-default-model
+        // 防御：config.llm 运行时可能为 undefined（旧配置格式/schema 未填充），
+        // 可选链 + 空串兜底确保 route 不因 undefined 属性抛异常
+        const provider = llm?.provider ?? ''
+        const model = llm?.model ?? ''
+        const route = provider !== '' && model !== ''
+          ? { provider, model }
+          : rpc.defaultModel()
+        return ok(await handleReflect(reflector, route))
+      }
       if (endpoint === 'status') {
         const stats = store.stats()
         return ok({
@@ -120,10 +136,11 @@ export function createMemoryRpcHandler(
  */
 async function handleReflect(
   reflector: ReflectTrigger | undefined,
-): Promise<{ ran: boolean; reviewed?: number; decisions?: number; merged?: number; archived?: number; skipped?: number }> {
-  if (reflector === undefined) return { ran: false }
-  const summary = await reflector.runOnce(undefined, { force: true })
-  if (summary === undefined) return { ran: false }
+  route: { provider: string; model: string } | undefined,
+): Promise<{ ran: boolean; reason?: string; reviewed?: number; decisions?: number; merged?: number; archived?: number; skipped?: number }> {
+  if (reflector === undefined) return { ran: false, reason: 'reflector_not_connected' }
+  const summary = await reflector.runOnce(route, { force: true })
+  if (summary === undefined) return { ran: false, reason: 'no_route_or_no_candidates' }
   return {
     ran: true,
     reviewed: summary.reviewed,
@@ -134,11 +151,18 @@ async function handleReflect(
   }
 }
 
-/** 配置视图：当前生效字段 + apiKey 解析状态（面板展示用；不含运行时派生态） */
+/** 配置视图：当前生效字段 + apiKey 解析状态 + LLM 路由（面板展示用；不含运行时派生态） */
 function configView(config: ResolvedConfig): Record<string, unknown> {
   return {
-    ...config,
+    embeddingApiBaseUrl: config.embeddingApiBaseUrl,
+    embeddingApiKey: config.embeddingApiKey,
+    embeddingModel: config.embeddingModel,
+    embeddingDimension: config.embeddingDimension,
     embeddingApiKeyResolved: resolveApiKey(config.embeddingApiKey) !== undefined,
+    // 防御：config.llm 运行时可能为 undefined（旧配置格式/schema 未填充），
+    // 可选链 + 空串兜底确保 LLM 字段始终返回字符串，面板输入框不显示 "undefined"
+    llmProvider: config.llm?.provider ?? '',
+    llmModel: config.llm?.model ?? '',
   }
 }
 
