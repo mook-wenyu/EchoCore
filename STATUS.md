@@ -1,13 +1,13 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-20（全量并行+游标/自适应收尾，584全绿）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-20（全量C束：无反应修复+游标+告警+面板第二束，610全绿）。
 
 ## 一、架构健康度
 
 - 模块总数：28 源模块（含新增 `store/search|create`、`client/api|panel|config-pane|error-boundary`、`utils/balanced-json`、`runtime`）+ client 面板；工程资产：`.github/workflows/ci.yml` + `docs/COMPACTION.md`
 - 依赖方向：`index.ts`（组合根）→ 各模块，无环。`store` 单职责拆分后 `search` 纯函数层与 `create` 创建链各 <40 行；`client` 三职责解耦后 `api` 可在 node 单测
-- 单元测试 **584 个全绿**（30 文件，typecheck 干净；上轮 572，本轮 +12，含游标/自适应与迁移脚本）
-- **覆盖率基线**：Stmts 97.71% / Branch 92.28% / Funcs 93.51% / Lines 97.71%（阈值 lines80/functions75/statements80/branches70，已超，P1 已补至 >90）
+- 单元测试 **610 个全绿**（30 文件，typecheck 干净；上轮 584，本轮 +26，含游标分片+阈值0.70+面板第二束）
+- **覆盖率基线**：Stmts 97.71% / Branch 92.28% / Funcs 93.51% / Lines 97.71%（阈值 lines80/functions75/statements80/branches70，已超，P1 已补至 >90，P3 游标/自适应后保持）
 - 实现均 TDD（先红后绿），每逻辑变更独立提交（C33-C40 + P0-P2 五件）
 
 ## 二、本次变更影响范围（全量并行 P0-P2）
