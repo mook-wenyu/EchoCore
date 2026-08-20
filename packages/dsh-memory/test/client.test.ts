@@ -52,16 +52,33 @@ function err(message: string): RpcResult<unknown> {
 describe('createMemoryApi 端点载荷', () => {
   it('list：channel /memory、端点 list、payload 透传 status 与 limit', async () => {
     const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
-    await api.list('archived', 5)
+    const res = await api.list('archived', 5)
     expect(recorded).toEqual([{ channel: '/memory', endpoint: 'list', payload: { status: 'archived', limit: 5 } }])
+    expect(res.entries).toEqual([])
+    expect(res.total).toBe(0)
+  })
+
+  it('list：cursor 透传分页锚点', async () => {
+    const { api, recorded } = fakeCtx([ok({ entries: [{ id: 'a' }], total: 1, nextCursor: 'a' })])
+    const res = await api.list(undefined, 20, 'cursor-123')
+    expect(recorded[0]?.payload).toMatchObject({ limit: 20, cursor: 'cursor-123' })
+    expect(res.nextCursor).toBe('a')
+  })
+
+  it('list：limit 达阈时自动合成 nextCursor（末条 id）', async () => {
+    const entries = [{ id: 'id-1' }, { id: 'id-2' }]
+    const { api } = fakeCtx([ok({ entries, total: 2 })])
+    const res = await api.list(undefined, 2)
+    expect(res.nextCursor).toBe('id-2')
   })
 
   it('search：payload 含 query/kind/status 固定 limit=50', async () => {
     const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
-    await api.search('重构', 'todo', 'active')
+    const res = await api.search('重构', 'todo', 'active')
     expect(recorded).toEqual([
       { channel: '/memory', endpoint: 'search', payload: { query: '重构', kind: 'todo', status: 'active', limit: 50 } },
     ])
+    expect(res.entries).toEqual([])
   })
 
   it('search：workspace 透传（O4——面板 workspace 过滤依赖该参数到宿主）', async () => {
@@ -76,6 +93,21 @@ describe('createMemoryApi 端点载荷', () => {
     const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
     await api.search('重构')
     expect(recorded).toEqual([{ channel: '/memory', endpoint: 'search', payload: { query: '重构', limit: 50 } }])
+  })
+
+  it('search：tag/limit/cursor 透传（chips/分页新增）', async () => {
+    const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
+    await api.search('重构', 'todo', 'active', 'D:\\ProjA', 'tagA', 20, 'cur-1')
+    expect(recorded).toEqual([
+      { channel: '/memory', endpoint: 'search', payload: { query: '重构', kind: 'todo', status: 'active', limit: 20, workspace: 'D:\\ProjA', tag: 'tagA', cursor: 'cur-1' } },
+    ])
+  })
+
+  it('search：tag 缺省不出现在 payload', async () => {
+    const { api, recorded } = fakeCtx([ok({ entries: [], total: 0 })])
+    await api.search('重构', undefined, undefined, undefined, undefined, 10)
+    expect((recorded[0]?.payload as Record<string, unknown>).tag).toBeUndefined()
+    expect((recorded[0]?.payload as Record<string, unknown>).limit).toBe(10)
   })
 
   it('get：payload 为 { id }', async () => {

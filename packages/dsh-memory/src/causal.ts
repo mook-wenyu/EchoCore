@@ -116,6 +116,20 @@ export interface CausalSummary {
   confidenceHist?: { lt055: number; btw055_074: number; btw075_089: number; gte09: number }
 }
 
+/** 因果抽取跨轮累计观测量（轻量质量钩子，度量是否持续 0 产出） */
+export interface CausalCumulative {
+  /** 已成功执行批次（含空批次；失败批次不计入） */
+  runs: number
+  /** LLM 提议总边数 */
+  edges: number
+  /** 实际新建总边数 */
+  created: number
+  /** 拒绝总边数 */
+  skipped: number
+  /** 连续空轮计数：reviewed>0 且 edges==0 的连续轮数，命中即重置 */
+  emptyRounds: number
+}
+
 /** 因果抽取依赖（store/边表/llm/logger/now 注入，便于单测） */
 export interface CausalExtractorDeps {
   store: MemoryStore
@@ -309,6 +323,8 @@ export class MemoryCausalExtractor {
   private routeCache: Route | undefined
   /** 最近一次成功批次的观察量（memory_status/RPC status 透出；未运行 null） */
   private lastSummaryValue: CausalSummary | null = null
+  /** 跨轮累计观测量（轻量质量钩子，度量是否持续 0 产出） */
+  private cumulativeValue: CausalCumulative = { runs: 0, edges: 0, created: 0, skipped: 0, emptyRounds: 0 }
 
   constructor(private readonly deps: CausalExtractorDeps) {}
 
@@ -320,6 +336,11 @@ export class MemoryCausalExtractor {
   /** 最近一次成功批次的观察量（审/提边/建成/跳过；未运行 null） */
   get lastSummary(): CausalSummary | null {
     return this.lastSummaryValue
+  }
+
+  /** 跨轮累计观测量（透出用；重启归零） */
+  get cumulativeSummary(): CausalCumulative {
+    return this.cumulativeValue
   }
 
   /**
@@ -368,6 +389,11 @@ export class MemoryCausalExtractor {
           this.lastRunAtValue = new Date(this.deps.now()).toISOString()
           this.routeCache = resolved
           this.lastSummaryValue = empty
+          // 累计：reviewed==0 正常空不计 emptyRounds
+          this.cumulativeValue.runs++
+          this.cumulativeValue.edges += empty.edges
+          this.cumulativeValue.created += empty.created
+          this.cumulativeValue.skipped += empty.skipped
           return empty
         }
 
@@ -410,6 +436,10 @@ export class MemoryCausalExtractor {
         }
         const confidenceMean = parsed.length > 0 ? confSum / parsed.length : undefined
         const summary: CausalSummary = { reviewed, edges: parsed.length, created: 0, skipped: 0, confidenceMean, confidenceHist: hist }
+        // 0 产出告警：reviewed>0 却 0 边需关注（区分 reviewed==0 正常空）
+        if (parsed.length === 0 && reviewed > 0) {
+          this.deps.logger.warn(`[dsh-memory] 因果 0 产出告警：审 ${reviewed} 条但 LLM 未返回有效边（edges=0，reviewed>0 需关注）`)
+        }
         // 日志输出均值（可观测）
         if (confidenceMean !== undefined) {
           this.deps.logger.info(`[dsh-memory] 因果抽取置信度均值 ${confidenceMean.toFixed(3)} 分布 ${JSON.stringify(hist)}`)
@@ -429,6 +459,16 @@ export class MemoryCausalExtractor {
         this.lastRunAtValue = new Date(this.deps.now()).toISOString()
         this.routeCache = resolved
         this.lastSummaryValue = summary
+        // 累计：连续空轮计数
+        this.cumulativeValue.runs++
+        this.cumulativeValue.edges += summary.edges
+        this.cumulativeValue.created += summary.created
+        this.cumulativeValue.skipped += summary.skipped
+        if (summary.reviewed > 0 && summary.edges === 0) {
+          this.cumulativeValue.emptyRounds++
+        } else if (summary.edges > 0) {
+          this.cumulativeValue.emptyRounds = 0
+        }
         return summary
       } catch (error) {
         this.deps.logger.warn('[dsh-memory] 因果抽取批次执行失败：', error)

@@ -88,9 +88,10 @@ export function adjustThresholdByHitRate(hitRate: number): number {
   // 低覆盖：语义信号稀缺，放宽阈值提升召回
   let next: number
   if (hitRate < 0.1) next = 0.68
+  // 中覆盖 [0.1,0.3]：原 0.72 中间档不动作（21.8% 命中无放宽），增 0.70 中间档使 21.8% 走放宽
+  else if (hitRate <= 0.3) next = 0.70
   // 高覆盖：语义充足，收紧阈值控制噪声
-  else if (hitRate > 0.3) next = 0.75
-  else next = 0.72
+  else next = 0.75
   adaptiveLocalThreshold = next
   return next
 }
@@ -164,6 +165,8 @@ export interface ReflectionCumulative {
   merged: number
   archived: number
   skipped: number
+  /** 连续空轮计数：reviewed>0 且 decisions==0 的连续轮数，命中非空即重置 */
+  emptyRounds: number
 }
 
 /**
@@ -366,7 +369,7 @@ export class MemoryReflector {
   /** 最近一次成功执行的观察量（memory_status/RPC status 透出；未运行 null） */
   private lastSummaryValue: ReflectionSummary | null = null
   /** 2b：跨轮累计观测量（轻量质量钩子，见 ReflectionCumulative 说明；进程内态） */
-  private cumulativeValue: ReflectionCumulative = { runs: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 }
+  private cumulativeValue: ReflectionCumulative = { runs: 0, decisions: 0, merged: 0, archived: 0, skipped: 0, emptyRounds: 0 }
 
   constructor(deps: ReflectionDeps) {
     this.deps = deps
@@ -429,6 +432,12 @@ export class MemoryReflector {
         this.cumulativeValue.merged += summary.merged
         this.cumulativeValue.archived += summary.archived
         this.cumulativeValue.skipped += summary.skipped
+        // 连续空轮计数：reviewed>0 且 decisions==0 递增，命中非空重置；reviewed==0 正常空不计
+        if (summary.reviewed > 0 && summary.decisions === 0) {
+          this.cumulativeValue.emptyRounds++
+        } else if (summary.decisions > 0) {
+          this.cumulativeValue.emptyRounds = 0
+        }
         return summary
       } catch (error) {
         this.deps.logger.warn('[dsh-memory] 反思批次执行失败：', error)
@@ -481,7 +490,7 @@ export class MemoryReflector {
     if (reviewed === 0) return summary
 
     const text = renderReflectionText(pairs)
-    const decisions = await this.callLlm(route, text)
+    const decisions = await this.callLlm(route, text, reviewed)
     summary.decisions = decisions.length
     for (const decision of decisions) {
       await this.applyDecision(decision, summary)
@@ -490,7 +499,7 @@ export class MemoryReflector {
   }
 
   /** 单次 LLM 调用：组装消息 → 流式 → 组装 → 解析 */
-  private async callLlm(route: { provider: string; model: string }, text: string): Promise<ReflectionDecision[]> {
+  private async callLlm(route: { provider: string; model: string }, text: string, reviewed: number): Promise<ReflectionDecision[]> {
     const userMessage: Message = createUserMessage({
       content: [{ type: 'text', text: `以下是待审视的记忆条目对：\n\n${text}\n\n${REFLECT_USER_RULES}` }],
       source: { kind: 'plugin', plugin: MEMORY_PLUGIN_ID },
@@ -522,6 +531,10 @@ export class MemoryReflector {
       this.deps.logger.warn(
         `[dsh-memory] 反思输出未含 decisions 字段，按 0 裁决处理（原文片段：${textOut.trim().slice(0, 120)}）`,
       )
+    }
+    // 0 产出告警：reviewed>0 却 0 裁决需关注（可能模型保守或提示词不足）；reviewed==0 正常空不告警
+    if (decisions.length === 0 && reviewed > 0) {
+      this.deps.logger.warn(`[dsh-memory] 反思 0 产出告警：审 ${reviewed} 条焦点但 LLM 未返回有效裁决（decisions=0，reviewed>0 需关注）`)
     }
     return decisions
   }

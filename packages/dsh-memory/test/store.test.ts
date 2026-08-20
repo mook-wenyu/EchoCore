@@ -985,3 +985,65 @@ describe('store/create 模块抽离（create/rejectedOutcome/findSupersededTarge
     expect(chineseCommentLines).toBeGreaterThanOrEqual(5)
   })
 })
+
+/**
+ * 游标分页 TDD（2026-08-20）：store.listRecentByCursor 按 (createdAt,id) 游标分页
+ * 需求：新增 store.listRecentByCursor(cursor?: {createdAt:string,id:string}, limit:number)
+ * 3 用例覆盖空库、首轮、跨轮游标正确性（无重叠无遗漏、到达尾部重置）。
+ */
+describe('MemoryStore.listRecentByCursor 游标分页', () => {
+  it('空库：游标为空或有游标均返回空数组', () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    expect(store.listRecentByCursor(undefined, 10)).toEqual([])
+    expect(store.listRecentByCursor({ createdAt: new Date(FIXED_NOW).toISOString(), id: 'any-id' }, 10)).toEqual([])
+  })
+
+  it('首轮：无游标时返回最新的前 N 条（按 createdAt 倒序，同刻按 id 倒序）', async () => {
+    let clock = FIXED_NOW
+    const store = new MemoryStore(new FakeTable(), () => clock)
+    // 依次创建 5 条，时间递增，验证倒序首轮取最新；内容需互不相似（防 Jaccard≥0.7 被 supersede 过滤）
+    const distintContents = ['苹果香蕉管理', '猫狗雨林引擎', '量子物理纠缠观测', '维特根斯坦哲学语言', '星际穿越引力时间']
+    const ids: string[] = []
+    for (let i = 0; i < 5; i++) {
+      clock = FIXED_NOW + i * 1000
+      const { entry } = await store.create(input({ content: distintContents[i]! }))
+      ids.push(entry.id)
+    }
+    // 期望倒序：最新在前
+    const page = store.listRecentByCursor(undefined, 2)
+    expect(page).toHaveLength(2)
+    // 最新两条应为最后创建的两条（按降序）
+    const allDesc = store.listRecent(10).map((e) => e.id)
+    expect(page.map((e) => e.id)).toEqual(allDesc.slice(0, 2))
+  })
+
+  it('跨轮游标正确：连续翻页无重叠无遗漏，到达尾部后返回空', async () => {
+    let clock = FIXED_NOW
+    const store = new MemoryStore(new FakeTable(), () => clock)
+    const created: MemoryEntry[] = []
+    const distintContents = ['苹果香蕉管理二', '猫狗雨林引擎二', '量子物理纠缠观测二', '维特根斯坦哲学语言二', '星际穿越引力时间二']
+    for (let i = 0; i < 5; i++) {
+      clock = FIXED_NOW + i * 1000
+      const { entry } = await store.create(input({ content: distintContents[i]! }))
+      created.push(entry)
+    }
+    const allDesc = store.listRecent(10)
+    // 第一页 2 条
+    const page1 = store.listRecentByCursor(undefined, 2)
+    expect(page1.map((e) => e.id)).toEqual(allDesc.slice(0, 2).map((e) => e.id))
+    // 第二页：以第一页最后一条为游标
+    const cursor1 = { createdAt: page1[page1.length - 1]!.createdAt, id: page1[page1.length - 1]!.id }
+    const page2 = store.listRecentByCursor(cursor1, 2)
+    expect(page2.map((e) => e.id)).toEqual(allDesc.slice(2, 4).map((e) => e.id))
+    // 无重叠
+    expect(page1.some((e) => page2.some((p) => p.id === e.id))).toBe(false)
+    // 第三页：以第二页最后一条为游标，应得最后 1 条
+    const cursor2 = { createdAt: page2[page2.length - 1]!.createdAt, id: page2[page2.length - 1]!.id }
+    const page3 = store.listRecentByCursor(cursor2, 2)
+    expect(page3.map((e) => e.id)).toEqual(allDesc.slice(4, 5).map((e) => e.id))
+    // 第四页：已到尾部，返回空
+    const cursor3 = { createdAt: page3[page3.length - 1]!.createdAt, id: page3[page3.length - 1]!.id }
+    const page4 = store.listRecentByCursor(cursor3, 2)
+    expect(page4).toEqual([])
+  })
+})

@@ -55,11 +55,13 @@ export interface MemoryStatsView {
   /** 降级原因（Q1/A：远程维度≠本地时显式 disabled 原因） */
   embeddingDegradedReason?: string
   /** E：反思/因果观测（宿主 status 已下发；缺则不渲染——跨版本兼容；宿主对未运行发 null） */
-  reflection?: { reviewed: number; decisions: number; merged: number; archived: number; skipped: number } | null
+  reflection?: { reviewed: number; decisions: number; merged: number; archived: number; skipped: number; semanticHitRate?: number } | null
   reflectionCumulative?: { runs: number; decisions: number; merged: number; archived: number; skipped: number } | null
   lastReflectionAt?: string | null
   causal?: { reviewed: number; edges: number; created: number; skipped: number } | null
   lastCausalAt?: string | null
+  /** 反思 semanticHitRate 趋势（可选，透出给面板 KPI） */
+  semanticHitRate?: number
 }
 
 /**
@@ -86,11 +88,27 @@ export interface ReflectResultView {
   skipped: number
 }
 
+/** 分页结果（暴露 limit/cursor，面板 Load More 依赖） */
+export interface PagedResult<T> {
+  entries: T[]
+  total: number
+  nextCursor?: string
+}
+
 /** 面板数据 API（apply 期从 ctx 装配，随组件 props 传递） */
 export interface MemoryPanelApi {
-  list(status?: string, limit?: number): Promise<MemorySummaryView[]>
-  /** R3：workspace 可选——传则限定该工作区搜索；面板默认不传（跨项目管理浏览） */
-  search(query: string, kind?: string, status?: string, workspace?: string): Promise<MemorySummaryView[]>
+  /** 列表分页：limit/cursor 可选，返回分页结果 + total */
+  list(status?: string, limit?: number, cursor?: string): Promise<PagedResult<MemorySummaryView>>
+  /** R3：workspace 可选——传则限定该工作区搜索；面板默认不传（跨项目管理浏览）；暴露 tag/limit/cursor */
+  search(
+    query: string,
+    kind?: string,
+    status?: string,
+    workspace?: string,
+    tag?: string,
+    limit?: number,
+    cursor?: string,
+  ): Promise<PagedResult<MemorySummaryView>>
   get(id: string): Promise<MemoryDetailView | undefined>
   archive(id: string): Promise<boolean>
   status(): Promise<MemoryStatsView>
@@ -116,15 +134,50 @@ export function createMemoryApi(ctx: Context): MemoryPanelApi {
     throw new Error(result.error.message)
   }
   return {
-    async list(status, limit) {
-      const result = await call('list', { status, limit })
-      const value = unwrap(result) as { entries: MemorySummaryView[] }
-      return value.entries
+    async list(status, limit, cursor) {
+      // 兼容：limit 未传则不发（宿主侧 optionalInt 会 fallback 200），cursor 可选
+      const payload: Record<string, unknown> = {}
+      if (status !== undefined) payload.status = status
+      if (limit !== undefined) payload.limit = limit
+      if (cursor !== undefined) payload.cursor = cursor
+      const result = await call('list', payload)
+      const value = unwrap(result) as { entries: MemorySummaryView[]; total?: number; nextCursor?: string }
+      // 宿主当前返回 { entries, total }（total = entries.length），兼容直接数组的旧形态
+      if (Array.isArray(value as unknown)) {
+        const arr = value as unknown as MemorySummaryView[]
+        return { entries: arr, total: arr.length }
+      }
+      const entries = value.entries ?? []
+      const total = typeof value.total === 'number' ? value.total : entries.length
+      // nextCursor 合成：若宿主未返回但 entries 达到 limit，则以末条 id 作为 cursor（简单分页锚点）
+      let nextCursor = value.nextCursor
+      if (nextCursor === undefined && limit !== undefined && entries.length === limit && entries.length > 0) {
+        nextCursor = entries[entries.length - 1]?.id
+      }
+      return { entries, total, nextCursor }
     },
-    async search(query, kind, status, workspace) {
-      const result = await call('search', { query, kind, status, limit: 50, workspace })
-      const value = unwrap(result) as { entries: MemorySummaryView[] }
-      return value.entries
+    async search(query, kind, status, workspace, tag, limit, cursor) {
+      const payload: Record<string, unknown> = { query, limit: limit ?? 50 }
+      if (kind !== undefined && kind !== '') payload.kind = kind
+      if (status !== undefined) payload.status = status
+      if (workspace !== undefined && workspace !== '') payload.workspace = workspace
+      if (tag !== undefined && tag !== '') payload.tag = tag
+      if (cursor !== undefined) payload.cursor = cursor
+      // 兼容旧宿主忽略 cursor/tag，但不报错（payload 多余键被 parse 时忽略或校验通过）
+      const result = await call('search', payload)
+      const value = unwrap(result) as { entries: MemorySummaryView[]; total?: number; nextCursor?: string }
+      if (Array.isArray(value as unknown)) {
+        const arr = value as unknown as MemorySummaryView[]
+        return { entries: arr, total: arr.length }
+      }
+      const entries = value.entries ?? []
+      const total = typeof value.total === 'number' ? value.total : entries.length
+      let nextCursor = value.nextCursor
+      const effLimit = limit ?? 50
+      if (nextCursor === undefined && entries.length === effLimit && entries.length > 0) {
+        nextCursor = entries[entries.length - 1]?.id
+      }
+      return { entries, total, nextCursor }
     },
     async get(id) {
       const result = await call('get', { id })

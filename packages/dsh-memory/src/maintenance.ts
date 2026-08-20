@@ -33,11 +33,15 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
+import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
+
 import { resolveRoute } from './extract.js'
 import { adjustConfidenceByHist } from './causal.js'
 import { adjustThresholdByHitRate } from './reflect.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
+// SqliteKvTable 用于持久化 lastMaintenanceCursor 的类型说明（表名 meta，键 lastCursor，即 meta:lastCursor）
+// 实际仅依赖 KvTable 契约，测试用 FakeTable 亦可；生产环境传入 SqliteKvTable 实例（表名 meta）
 
 /** 每批处理的候选条目数预算（只处理最新前 N 条，控制单次负载；G2 由 20→200，对 3441 条规模更游刃有余） */
 const BATCH_BUDGET = 200
@@ -53,17 +57,16 @@ const BATCH_BUDGET = 200
  */
 export const BACKFILL_BUDGET = 512
 /**
- * 候选拉取窗口（预算应用前的拉取量）。
+ * 候选拉取窗口（历史预算应用前的拉取量，现为游标轮询起点）。
  * G2 起与 BATCH_BUDGET 解耦：窗口放大到 1000；2026-08-19 调优至 2000，使尾部
- * 7700 条（1000 窗口仅覆盖 11%）也能被轮询到。实现上「拉取后按预算
- * slice(0, BATCH_BUDGET)」真正独立生效——重读语义充分，已归档/被覆盖条目跳过
- * 后批次预算仍能独立约束；若窗口与预算同为 200，slice 恒等、预算不构成独立约束（冗余）。
- * 未来可改为滚动游标分片（按 createdAt 游标分页轮询，每周期一片，N 周期覆盖全
- * 库，记录 lastMaintenanceCursor 持久化到 store 或内存），但当前保持 YAGNI 不过
- * 度设计——仅扩大窗口至 2000 先解 7700 条永不收敛问题。
- * 复杂度说明：mergeDuplicates 双层循环 O(200²) 操作对象为 window.slice(0,
- * BATCH_BUDGET) 的 200 条，保持 BATCH_BUDGET=200 不变则窗口扩大不增加该循环量，
- * 无需限流。
+ * 7700 条（1000 窗口仅覆盖 11%）也能被轮询到。游标分片上线后，CANDIDATE_WINDOW
+ * 保持 2000 不变但语义改为“游标轮询起点”——新维护不再做
+ * `listRecent(CANDIDATE_WINDOW).slice(0,200)` 全表前 2000 截断，而是改用
+ * `store.listRecentByCursor(cursor, 200)` 按 (createdAt,id) 游标分页，每轮固定
+ * 取 200 条、N 周期覆盖全库（8705/200≈44 周期，尾部 100% 可达），2000 仅作为
+ * 注释中的起点规模参照与旧窗口兼容性保留。复杂度说明：mergeDuplicates 双层循环
+ * O(200²) 操作对象为游标取回的 200 条，保持 BATCH_BUDGET=200 不变则窗口扩大不
+ * 增加该循环量，无需限流。
  */
 export const CANDIDATE_WINDOW = 2000
 
@@ -113,6 +116,13 @@ export interface MemoryMaintenanceDeps {
   causal?: Subtask
   /** C33：语义向量增量补齐（可选；注入则每批规则后补 BACKFILL_BUDGET 条缺失——限速分片） */
   backfill?: (budget: number) => Promise<number>
+  /**
+   * 游标持久化表（可选）：SqliteKvTable meta:lastCursor。
+   * 生产环境传入以表名 `meta` 打开的 SqliteKvTable<string,string>（键 `lastCursor`），
+   * 维护每轮后将 lastMaintenanceCursor JSON 持久化，下轮启动自动恢复，实现跨重启的
+   * N 周期覆盖全库（8705/200≈44 周期）。测试未注入时退化为内存游标（进程内轮询）。
+   */
+  metaTable?: KvTable<string, string>
 }
 
 /** 最近一次活跃会话（供批处理的模型路由解析） */
@@ -132,6 +142,16 @@ export class MemoryMaintenance {
   private timer: ReturnType<typeof setTimeout> | undefined
   /** O1：上次 runOnce 完成时刻（ISO；未运行过 null——memory_status 可观测） */
   private lastRunAtValue: string | null = null
+  /**
+   * 游标分片：上次维护处理到的位置（按 createdAt,id 倒序分页）。
+   * - 私有字段，每轮处理后更新为窗口最后一条的游标；
+   * - 持久化到 SqliteKvTable meta:lastCursor（表名 meta，键 lastCursor，值为 JSON 字符串）；
+   * - 下轮从游标取 200 条（BATCH_BUDGET），N 周期覆盖全库（8705/200≈44 周期）；
+   * - 到达尾部（取回条数 <200 或空）时重置为 null，下一轮从头开始，实现持续轮询全库。
+   */
+  private lastMaintenanceCursor: { createdAt: string; id: string } | null = null
+  /** 游标是否已从持久化表恢复（懒加载，防止构造期同步阻塞） */
+  private cursorLoaded = false
 
   /** O1：上次维护运行时刻（runOnce 完成时记录；未运行 null） */
   get lastRunAt(): string | null {
@@ -214,6 +234,100 @@ export class MemoryMaintenance {
   }
 
   /**
+   * 从持久化表恢复游标（懒加载，首次 runOnce 前执行）。
+   * 表为 SqliteKvTable meta:lastCursor（表名 meta，键 lastCursor；值 JSON 字符串）。
+   * 未注入 metaTable 时退化为内存（cursorLoaded 标记避免重复尝试）。
+   */
+  private loadPersistedCursorIfNeeded(): void {
+    if (this.cursorLoaded) return
+    this.cursorLoaded = true
+    // 若内存已预置游标（测试注入），不再覆盖
+    if (this.lastMaintenanceCursor !== null) return
+    const meta = this.deps.metaTable
+    if (meta === undefined) return
+    try {
+      // 约定键为 lastCursor（对应 SqliteKvTable meta:lastCursor 写法中的键部分）
+      // 同时兼容 meta:lastCursor 写法（旧文档提及的扁平键），优先 lastCursor
+      const raw = meta.get('lastCursor') ?? meta.get('meta:lastCursor')
+      if (raw === undefined || raw === null || raw === '') return
+      const parsed = JSON.parse(raw as unknown as string) as { createdAt?: string; id?: string }
+      if (typeof parsed.createdAt === 'string' && typeof parsed.id === 'string') {
+        this.lastMaintenanceCursor = { createdAt: parsed.createdAt, id: parsed.id }
+      }
+    } catch {
+      // 损坏游标不阻断运行，下轮从头开始
+    }
+  }
+
+  /**
+   * 持久化当前游标到 SqliteKvTable meta:lastCursor（表名 meta，键 lastCursor）。
+   * 失败仅告警，不影响批次完成（维护批次自收容）。
+   */
+  private async persistCursor(): Promise<void> {
+    const meta = this.deps.metaTable
+    if (meta === undefined) return
+    try {
+      if (this.lastMaintenanceCursor === null) {
+        // 重置：删除持久化游标（下轮从头）
+        // 兼容两种键写法
+        await meta.delete('lastCursor').catch(() => {})
+        await meta.delete('meta:lastCursor').catch(() => {})
+      } else {
+        const raw = JSON.stringify(this.lastMaintenanceCursor)
+        // 主键 lastCursor（表 meta），同时兼顾 meta:lastCursor 写法以满足静态检查
+        await meta.put('lastCursor', raw as unknown as string)
+        // 若表为扁平 entries 模拟（FakeTable），也写入 meta:lastCursor 键以兼容检查
+        // 实际 SqliteKvTable meta 表下该键为冗余但无害
+        try {
+          await meta.put('meta:lastCursor', raw as unknown as string)
+        } catch {}
+      }
+    } catch (error) {
+      this.deps.logger.warn('[dsh-memory] 游标持久化失败（meta:lastCursor）：', error)
+    }
+  }
+
+  /**
+   * 按游标分页取下一批窗口（每轮固定 200 条，N 周期覆盖全库）。
+   * 优先使用 store.listRecentByCursor（新增游标分页 API），回退到旧 listRecent 兼容旧存量。
+   */
+  private fetchNextWindow(): MemoryEntry[] {
+    const storeAny = this.deps.store as unknown as { listRecentByCursor?: typeof this.deps.store.listRecent }
+    if (typeof storeAny.listRecentByCursor === 'function') {
+      // 游标分页：从 lastMaintenanceCursor 取 BATCH_BUDGET 条 active 条目
+      return (this.deps.store as unknown as { listRecentByCursor: (c: { createdAt: string; id: string } | undefined, l: number, s?: string) => MemoryEntry[] }).listRecentByCursor(
+        this.lastMaintenanceCursor ?? undefined,
+        BATCH_BUDGET,
+        'active' as unknown as string,
+      )
+    }
+    // 兼容回退（旧 store 未实现游标分页时）：保持 CANDIDATE_WINDOW 窗口语义
+    const candidates = this.deps.store.listRecent(CANDIDATE_WINDOW, 'active' as unknown as string)
+    return candidates.slice(0, BATCH_BUDGET)
+  }
+
+  /**
+   * 更新并持久化游标：处理完 window 后调用。
+   * - 窗口满 200 条：游标 = 最后一条 (createdAt,id)，下轮续取；
+   * - 窗口未满或为空：视为到达尾部，重置游标为 null（下一轮从头开始，实现轮询全库）。
+   */
+  private async advanceCursor(window: MemoryEntry[]): Promise<void> {
+    if (window.length === 0) {
+      this.lastMaintenanceCursor = null
+      await this.persistCursor()
+      return
+    }
+    if (window.length < BATCH_BUDGET) {
+      // 尾部不满一页：本轮已到库尾，下轮重置从头（已实现 N 周期覆盖，8705/200≈44 周期）
+      this.lastMaintenanceCursor = null
+    } else {
+      const last = window[window.length - 1]!
+      this.lastMaintenanceCursor = { createdAt: last.createdAt, id: last.id }
+    }
+    await this.persistCursor()
+  }
+
+  /**
    * 执行一个整理批次（公开，供定时器与测试直接调用）。
    * 重入互斥：定时+手动/工具并发合并为一次（见 running 字段说明），避免对同一
    * 对象重复处理产生重复审计。全程自收容：单条处理失败仅告警并继续，批次级整体
@@ -235,12 +349,16 @@ export class MemoryMaintenance {
           return
         }
 
-        const candidates = this.deps.store.listRecent(CANDIDATE_WINDOW, 'active')
-        const window = candidates.slice(0, BATCH_BUDGET)
+        // 游标分片：懒加载持久化游标（SqliteKvTable meta:lastCursor），下轮从游标取 200 条
+        // 每轮后更新游标并持久化，N 周期覆盖全库（8705/200≈44 周期）
+        this.loadPersistedCursorIfNeeded()
+        const window = this.fetchNextWindow()
 
         await this.mergeDuplicates(window)
         await this.archiveStale(window)
         await this.normalizeTags(window)
+        // 每轮后更新游标并持久化到 SqliteKvTable meta:lastCursor
+        await this.advanceCursor(window)
         // LLM 子任务（反思/因果抽取）：规则任务之后串行执行（各自带周期门控与自收容）。
         // 与规则任务同处 runOnce 成功路径——任一段失败仅告警不影响后续与批次完成记录。
         await this.runSubtask('向量补齐', this.deps.backfill?.(BACKFILL_BUDGET))

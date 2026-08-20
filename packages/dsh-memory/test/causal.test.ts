@@ -556,3 +556,67 @@ describe('causal 调优：阈值与窗口', () => {
     expect(captures.some((a) => String(a[0]).includes('置信度均值'))).toBe(true)
   })
 })
+
+// ── 0 产出告警与连续空轮（因果，TDD 各补 2 用例） ─────────────
+describe('因果 0 产出告警与连续空轮', () => {
+  it('reviewed>0 且 edges==0 → warn 0 产出告警，emptyRounds 递增', async () => {
+    // 中文注释：有候选却 0 边，属 0 产出，需 warn 并计空轮
+    const { entryTable, extractor, warnings } = setupExtractor('{"edges":[]}')
+    await seedPair(entryTable)
+    const before = extractor.cumulativeSummary.emptyRounds
+    const summary = (await extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })) as CausalSummary
+    expect(summary.reviewed).toBeGreaterThan(0)
+    expect(summary.edges).toBe(0)
+    expect(warnings.some((w) => String(w).includes('0 产出告警'))).toBe(true)
+    expect(extractor.cumulativeSummary.emptyRounds).toBe(before + 1)
+    // 非空轮重置
+    const { entryTable: t2, extractor: e2, warnings: w2 } = setupExtractor('{"edges":[{"sourceId":"a","targetId":"b","confidence":0.9}]}')
+    await seedPair(t2)
+    await e2.runOnce({ provider: 'p', model: 'm' }, { force: true })
+    expect(e2.cumulativeSummary.emptyRounds).toBe(0)
+    expect(w2.some((w) => String(w).includes('0 产出告警'))).toBe(false)
+  })
+
+  it('reviewed==0 正常空不告警，emptyRounds 不递增', async () => {
+    // 中文注释：空窗口（reviewed==0）属正常空，不应计空轮也不 warn 0 产出
+    const { extractor, warnings } = setupExtractor('{"edges":[]}')
+    const before = extractor.cumulativeSummary.emptyRounds
+    const summary = (await extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })) as CausalSummary
+    expect(summary.reviewed).toBe(0)
+    expect(summary.edges).toBe(0)
+    expect(warnings.some((w) => String(w).includes('0 产出告警'))).toBe(false)
+    expect(extractor.cumulativeSummary.emptyRounds).toBe(before)
+  })
+})
+
+describe('因果阈值自适应与观测三元组', () => {
+  it('置信直方图自适应：lt055 堆积→0.5，边界堆积→0.6，其余 0.55', async () => {
+    // 中文注释：直方图驱动的置信阈值自适应，需覆盖三档
+    const { entryTable, extractor } = setupExtractor('{"edges":[]}')
+    await seedPair(entryTable)
+    // 触发 lt055 堆积：4 条 <0.55 vs 1 条在 0.55-0.74 → 0.5
+    const histLow = { lt055: 4, btw055_074: 1, btw075_089: 0, gte09: 0 }
+    // 直接调用 adjustConfidenceByHist 验证（与 maintenance 周期逻辑一致）
+    const { adjustConfidenceByHist, getAdaptiveConfidenceThreshold } = await import('../src/causal.js')
+    expect(adjustConfidenceByHist({ lt055: 4, btw055_074: 1 })).toBe(0.5)
+    expect(getAdaptiveConfidenceThreshold()).toBe(0.5)
+    expect(adjustConfidenceByHist({ lt055: 1, btw055_074: 4 })).toBe(0.6)
+    expect(getAdaptiveConfidenceThreshold()).toBe(0.6)
+    expect(adjustConfidenceByHist({ lt055: 2, btw055_074: 2 })).toBe(0.55)
+    expect(getAdaptiveConfidenceThreshold()).toBe(0.55)
+  })
+
+  it('连续空轮累计可经 memory_status 观测（emptyRounds+reviewed+confidenceMean 三元组）', async () => {
+    // 中文注释：因果批次的 reviewed/edges/emptyRounds 均透过 lastSummary/cumulative 可观测
+    const { entryTable, extractor } = setupExtractor('{"edges":[]}')
+    await seedPair(entryTable)
+    await extractor.runOnce({ provider: 'p', model: 'm' }, { force: true })
+    const summary = extractor.lastSummary!
+    const cum = extractor.cumulativeSummary
+    expect(summary.reviewed).toBeGreaterThan(0)
+    expect(typeof cum.emptyRounds).toBe('number')
+    // 空轮后 emptyRounds 应为 1，且 summary 可提供 reviewed 与 confidenceHist
+    expect(cum.emptyRounds).toBe(1)
+    expect(summary.confidenceHist).toBeDefined()
+  })
+})

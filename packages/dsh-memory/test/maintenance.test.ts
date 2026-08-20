@@ -359,8 +359,13 @@ describe('MemoryMaintenance 批预算', () => {
 describe('MemoryMaintenance 重入互斥（定时+手动并发合并为一次）', () => {
   it('并发调用 runOnce 两次：返回同一 promise，只执行一次完整批次；结束后 running 复位可再开新批次', async () => {
     const { table, store, sessionEvent, maintenance } = setup()
-    // 计数 listRecent：每次开启一个完整批次都会调用它（作为"完整批次执行"观测点）
+    // 计数 listRecentByCursor（游标分片后）/ 回退 listRecent：每次开启一个完整批次都会调用它（作为"完整批次执行"观测点）
     let listRecentCalls = 0
+    const origByCursor = store.listRecentByCursor.bind(store)
+    store.listRecentByCursor = ((cursor: unknown, limit: number, status?: unknown) => {
+      listRecentCalls++
+      return origByCursor(cursor as { createdAt: string; id: string } | undefined, limit, status as Parameters<typeof origByCursor>[2])
+    }) as typeof store.listRecentByCursor
     const origListRecent = store.listRecent.bind(store)
     store.listRecent = ((limit: number, status?: unknown) => {
       listRecentCalls++
@@ -553,22 +558,24 @@ describe('调优回归（2026-08-19：窗口与预算扩容）', () => {
     expect(CANDIDATE_WINDOW).toBe(2000)
   })
 
-  it('窗口扩大后 runOnce 仍以 CANDIDATE_WINDOW 拉取、并按 BATCH_BUDGET 200 限幅（mergeDuplicates O(200²) 不随窗口膨胀）', async () => {
+  it('游标分片后 runOnce 改为按游标分页取 200 条（CANDIDATE_WINDOW 2000 保持为游标轮询起点，N 周期覆盖全库 8705/200≈44 周期）', async () => {
     const ctx = new FakeCtx()
     const table = new FakeTable()
     const store = new MemoryStore(table, () => NOW)
-    // 监控 listRecent 调用窗口参数
-    let observedWindow = 0
-    const orig = store.listRecent.bind(store)
-    store.listRecent = ((limit: number, status?: unknown, includeSuperseded?: unknown) => {
-      observedWindow = limit
-      return orig(limit, status as Parameters<typeof orig>[1], includeSuperseded as boolean)
-    }) as typeof store.listRecent
+    // 监控 listRecentByCursor 调用（游标分页）而非旧 listRecent
+    let observedLimit = 0
+    let observedCursor: unknown = 'not-called'
+    const origByCursor = store.listRecentByCursor.bind(store)
+    store.listRecentByCursor = ((cursor: unknown, limit: number, status?: unknown, includeSuperseded?: unknown) => {
+      observedCursor = cursor
+      observedLimit = limit
+      return origByCursor(cursor as { createdAt: string; id: string } | undefined, limit, status as Parameters<typeof origByCursor>[2], includeSuperseded as boolean)
+    }) as typeof store.listRecentByCursor
     const maintenance = new MemoryMaintenance({ store, logger: { warn: () => {}, info: () => {} }, now: () => NOW })
     maintenance.install(ctx as unknown as Context)
     const sessionEvent = ctx.listener('session/event') as (session: Session, event: SessionEvent) => void
     activate(sessionEvent, makeSession('s1'))
-    // 预置 2100 条过期候选：若窗口仍为 1000 则仅拉 1000，archived 最多 200；窗口 2000 则拉 2000 仍限幅 200
+    // 预置 2100 条过期候选：游标分页每轮固定 200，首轮游标为 undefined
     for (let i = 0; i < 2100; i++) {
       const entry = makeEntry({
         id: `w${i}`,
@@ -581,9 +588,13 @@ describe('调优回归（2026-08-19：窗口与预算扩容）', () => {
       await table.put(entry.id, entry)
     }
     await maintenance.runOnce()
-    expect(observedWindow).toBe(2000)
+    // 游标分页：首轮 cursor 为 undefined，limit 为 200（BATCH_BUDGET）
+    expect(observedCursor).toBeUndefined()
+    expect(observedLimit).toBe(200)
     // 单批预算仍为 200（窗口扩大不扩大处理量，mergeDuplicates 仍 O(200²)）
     expect(store.stats().archived).toBe(200)
+    // CANDIDATE_WINDOW 保持 2000 但语义改为游标轮询起点（注释说明，非拉取量）
+    expect(CANDIDATE_WINDOW).toBe(2000)
   })
 
   it('backfill 预算恒为 512 且窗口扩大后尾部条目可被覆盖（2000 窗口包含远于 1000 的条目）', async () => {

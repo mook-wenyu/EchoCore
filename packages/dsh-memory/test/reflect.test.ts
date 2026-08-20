@@ -573,10 +573,10 @@ describe('MemoryReflector.runOnce', () => {
     )
     const route = { provider: 'deepseek', model: 'm' }
     await reflector.runOnce(route, { force: true })
-    expect(reflector.cumulativeSummary).toEqual({ runs: 1, decisions: 1, merged: 0, archived: 0, skipped: 1 })
+    expect(reflector.cumulativeSummary).toEqual({ runs: 1, decisions: 1, merged: 0, archived: 0, skipped: 1, emptyRounds: 0 })
     // 次轮（force 无视门控）：累计继续增长（"反思是否在收敛"可观测）
     await reflector.runOnce(route, { force: true })
-    expect(reflector.cumulativeSummary).toEqual({ runs: 2, decisions: 2, merged: 0, archived: 0, skipped: 2 })
+    expect(reflector.cumulativeSummary).toEqual({ runs: 2, decisions: 2, merged: 0, archived: 0, skipped: 2, emptyRounds: 0 })
   })
 
   it('callLlm：畸形输出（不含 decisions 字段）→ warn 可观测 + 0 裁决', async () => {
@@ -786,7 +786,7 @@ describe('P1 补覆盖：reflect 阈值与降级分支（75-577）', () => {
     // 更直接：检查 getSemanticThresholdForDim 在不同维度返回不同阈值，且 Math.max 生效
     // 先重置自适应阈值（前序用例可能已通过 adjustThresholdByHitRate 改为 0.68/0.75 导致状态污染）
     adjustThresholdByHitRate(0.2)
-    expect(getSemanticThresholdForDim(384)).toBe(0.72)
+    expect(getSemanticThresholdForDim(384)).toBe(0.70)
     expect(getSemanticThresholdForDim(1024)).toBe(0.75)
     expect(Math.max(getSemanticThresholdForDim(384), getSemanticThresholdForDim(1024))).toBe(0.75)
     // 实际 selectReflectionPairs 混维对：用 384+1024 混对确保代码行被执行（即使相似度计算因维度不同而异常，也已执行阈值行）
@@ -842,6 +842,64 @@ describe('P1 补覆盖：reflect 阈值与降级分支（75-577）', () => {
       expect(warns.length).toBeGreaterThan(0)
       store.archive = origArchive
     }
+  })
+})
+
+// ── 0 产出告警与阈值中间档（TDD，任务要求各补 2 用例） ─────────────
+describe('0 产出告警与连续空轮（reviewed>0 区分 reviewed==0）', () => {
+  it('reviewed>0 且 decisions==0 → warn 0 产出告警，emptyRounds 递增', async () => {
+    // 中文注释：有焦点却 0 裁决，属 0 产出，需 warn 并计空轮
+    const { older, newer } = duplicatePair()
+    const { reflector, warns } = makeReflector([older, newer], '{"decisions":[]}')
+    const before = reflector.cumulativeSummary.emptyRounds
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(summary?.reviewed).toBeGreaterThan(0)
+    expect(summary?.decisions).toBe(0)
+    expect(warns.some((w) => String(w).includes('0 产出告警'))).toBe(true)
+    expect(reflector.cumulativeSummary.emptyRounds).toBe(before + 1)
+    // 非空轮重置
+    const { reflector: r2, warns: w2 } = makeReflector([older, newer], '{"decisions":[{"focusId":"older01","peerId":"newer01","action":"none","reason":"x"}]}')
+    // 复用同一 reflector 需 force 再跑一次非空
+    await r2.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    // 新 reflector 的 emptyRounds 应为 0（非空重置）
+    expect(r2.cumulativeSummary.emptyRounds).toBe(0)
+    expect(w2.some((w) => String(w).includes('0 产出告警'))).toBe(false)
+  })
+
+  it('reviewed==0 正常空不告警，emptyRounds 不递增', async () => {
+    // 中文注释：无焦点（reviewed==0）属正常空，不应计空轮也不 warn 0 产出
+    const isolated = makeEntry({ id: 'iso', content: 'isolated z', importance: 1 })
+    const { reflector, warns } = makeReflector([isolated], '{"decisions":[]}')
+    const before = reflector.cumulativeSummary.emptyRounds
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(summary?.reviewed).toBe(0)
+    expect(summary?.decisions).toBe(0)
+    expect(warns.some((w) => String(w).includes('0 产出告警'))).toBe(false)
+    expect(reflector.cumulativeSummary.emptyRounds).toBe(before)
+  })
+})
+
+describe('阈值自适应中间档 0.70（hitRate [0.1,0.3] →0.70）', () => {
+  it('hitRate 0.218（21.8%）走放宽档 0.70，而非原 0.72 不动作', () => {
+    // 中文注释：21.8% 覆盖（8705 规模实测）原三档 0.72 不动作，增 0.70 档后应放宽至 0.70
+    expect(adjustThresholdByHitRate(0.218)).toBe(0.70)
+    expect(getSemanticThresholdForDim(384)).toBe(0.70)
+    // 21.8% 对应 384 维语义阈值应为 0.70（放宽），1024 维仍 0.75
+    expect(getSemanticThresholdForDim(1024)).toBe(0.75)
+  })
+
+  it('边界：<0.1→0.68，[0.1,0.3]→0.70，>0.3→0.75（含 0.1/0.3）', () => {
+    // 中文注释：三档边界精确覆盖，0.1 与 0.3 含于中间档
+    expect(adjustThresholdByHitRate(0.09)).toBe(0.68)
+    expect(adjustThresholdByHitRate(0.1)).toBe(0.70)
+    expect(adjustThresholdByHitRate(0.2)).toBe(0.70)
+    expect(adjustThresholdByHitRate(0.3)).toBe(0.70)
+    expect(adjustThresholdByHitRate(0.31)).toBe(0.75)
+    // 再次校验 384 维阈值随自适应变化
+    adjustThresholdByHitRate(0.05)
+    expect(getSemanticThresholdForDim(384)).toBe(0.68)
+    adjustThresholdByHitRate(0.35)
+    expect(getSemanticThresholdForDim(384)).toBe(0.75)
   })
 })
 

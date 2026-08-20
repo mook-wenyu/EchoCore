@@ -347,6 +347,37 @@ export class MemoryStore {
     return result.slice(0, limit)
   }
 
+  /**
+   * 游标分页：按 (createdAt,id) 倒序游标分页，适用于维护轮询与大库浏览。
+   * - 排序：createdAt 倒序，同刻按 id 倒序（与 listRecent 完全一致，稳定分页）；
+   * - 游标语义：返回严格小于游标的下一页（createdAt < cursor.createdAt || (createdAt===cursor.createdAt && id < cursor.id)）；
+   * - 空游标：返回最新首页；
+   * - 过滤：与 listRecent 同款 source 完整性/状态/被覆盖过滤，保证维护只处理有效条目。
+   */
+  listRecentByCursor(
+    cursor: { createdAt: string; id: string } | undefined | null,
+    limit: number,
+    status?: MemoryStatus,
+    includeSuperseded = false,
+  ): MemoryEntry[] {
+    const result: MemoryEntry[] = []
+    for (const [, entry] of this.table.entries()) {
+      if (!isSourceWellFormed(entry.source)) {
+        this.onCorruptSource?.(entry.id)
+        continue
+      }
+      if (status !== undefined && entry.status !== status) continue
+      if (entry.supersededBy !== undefined && !includeSuperseded) continue
+      result.push(entry)
+    }
+    result.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
+    // 游标过滤：取严格小于游标的尾部（下一页）
+    const filtered = cursor === undefined || cursor === null
+      ? result
+      : result.filter((entry) => entry.createdAt < cursor.createdAt || (entry.createdAt === cursor.createdAt && entry.id < cursor.id))
+    return filtered.slice(0, limit)
+  }
+
   /** 按重要度取条目（稳定快照取数）：同 workspace、active、未覆盖按有效重要度降序 */
   listByImportance(workspace: string, limit: number): MemoryEntry[] {
     const result: MemoryEntry[] = []

@@ -378,11 +378,15 @@ export async function mountMemory(
     get reflectionCumulative() {
       return reflector.cumulativeSummary
     },
+    // 连续空轮计数与 hitRate+emptyRounds+reviewed 三元组（memory_status 透出）
     get causal() {
       return causalExtractor.lastSummary
     },
     get lastCausalAt() {
       return causalExtractor.lastRunAt
+    },
+    get causalCumulative() {
+      return (causalExtractor as { cumulativeSummary?: unknown }).cumulativeSummary ?? null
     },
   }
 
