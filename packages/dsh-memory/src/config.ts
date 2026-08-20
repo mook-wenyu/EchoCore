@@ -22,6 +22,25 @@
 
 import z from '@deepseek-ai/schemastery'
 
+/** LLM 单一信任源默认值（唯一可信源，子模块禁止硬编码 openai/gpt-4） */
+export interface LlmConfig {
+  /** 提供方标识（如 deepseek、openai 兼容网关；空串 = 未配置） */
+  provider: string
+  /** 模型名（如 deepseek-chat；空串 = 未配置） */
+  model: string
+  /** API 基地址（如 https://api.deepseek.com；空串 = 未配置） */
+  api_base: string
+  /** 采样温度 0~2（默认 0.7） */
+  temperature: number
+}
+/** LLM 默认值单源（子模块禁止硬编码 openai/gpt-4，统一引用此单源） */
+export const LLM_DEFAULTS: LlmConfig = {
+  provider: '',
+  model: '',
+  api_base: '',
+  temperature: 0.7,
+} as const
+
 /** 默认值单源（schema 与 index.ts 装配共用，防双写漂移） */
 export const DEFAULTS = {
   /** 远程嵌入 API base URL（OpenAI 兼容 /embeddings 端点；空串 = 未配置远程） */
@@ -35,6 +54,8 @@ export const DEFAULTS = {
   embeddingModel: '',
   /** 远程嵌入维度（OpenAI 兼容生态无 384 维——bge-m3 固定 1024、Qwen3-0.6B 可 512/256/64；按供应商文档配置） */
   embeddingDimension: 1024,
+  /** LLM 单一信任源（根 llm 为唯一可信源） */
+  llm: LLM_DEFAULTS,
 } as const
 
 /** 插件配置（全部可省略，默认值见 DEFAULTS 与 Config schema） */
@@ -47,6 +68,8 @@ export interface Config {
   embeddingModel?: string
   /** 远程嵌入维度（默认 1024=bge-m3；本地固定 384 不随此配置） */
   embeddingDimension?: number
+  /** LLM 单一信任源（根 llm 为唯一可信源，子模块禁止硬编码） */
+  llm?: Partial<LlmConfig>
 }
 
 /**
@@ -58,10 +81,10 @@ export interface Config {
  * 代码直接读必填字段，不再逐字段 `??`（运行时兜底是死分支，类型
  * 收窄才是它的真实作用）。
  */
-export type ResolvedConfig = Required<Config>
+export type ResolvedConfig = Required<Config> & { llm: LlmConfig }
 
 /**
- * 生效配置相等判定（四字段逐一比较）。
+ * 生效配置相等判定（四字段逐一比较 + llm 四子字段）。
  * settings seam 的幂等守卫：注册期初始 onChange 与面板 setConfig 显式调用共用，
  * 配置未变则跳过重启——防"重启 → 再注册 → 再重启"环与并发双重启（见 settings.ts）。
  */
@@ -70,8 +93,123 @@ export function sameConfig(a: ResolvedConfig, b: ResolvedConfig): boolean {
     a.embeddingApiBaseUrl === b.embeddingApiBaseUrl &&
     a.embeddingApiKey === b.embeddingApiKey &&
     a.embeddingModel === b.embeddingModel &&
-    a.embeddingDimension === b.embeddingDimension
+    a.embeddingDimension === b.embeddingDimension &&
+    a.llm.provider === b.llm.provider &&
+    a.llm.model === b.llm.model &&
+    a.llm.api_base === b.llm.api_base &&
+    a.llm.temperature === b.llm.temperature
   )
+}
+
+/**
+ * 配置哈希（FNV-1a 32 位，确定性，中文注释）
+ * 用于 memory_status 可观测（llm 配置变更可追踪）
+ */
+function fnv1aHash(text: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+/** 计算配置哈希（基于 llm 四字段 JSON 规范化） */
+export function configHashOf(config: ResolvedConfig): string {
+  const payload = JSON.stringify({
+    provider: config.llm.provider,
+    model: config.llm.model,
+    api_base: config.llm.api_base,
+    temperature: config.llm.temperature,
+  })
+  return fnv1aHash(payload)
+}
+
+/**
+ * 配置管理器：单一信任源合并（显式 > env: > 默认）
+ * 中文注释：显式配置最高优先级；显式值为 env:NAME 时解析环境变量；
+ * 显式缺省时回退 env LLM_*；再回退默认。
+ */
+export class ConfigManager {
+  /**
+   * 合并配置（显式 > env: > 默认）
+   * @param explicit 显式配置（用户/面板传入，可能含 env: 占位）
+   * @param env 环境变量表（默认 process.env）
+   */
+  static mergeConfig(
+    explicit: Partial<Config> = {},
+    env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+  ): ResolvedConfig {
+    // 辅助：解析 env: 占位或直接值
+    const resolveStr = (val: unknown, envKey: string, def: string): string => {
+      if (val !== undefined) {
+        if (typeof val === 'string') {
+          const trimmed = val.trim()
+          if (trimmed.startsWith('env:')) {
+            const name = trimmed.slice(4).trim()
+            const envVal = name ? env[name] : undefined
+            if (envVal !== undefined && envVal !== '') return envVal
+            return def
+          }
+          return trimmed
+        }
+        return String(val)
+      }
+      const envVal = env[envKey]
+      if (envVal !== undefined && envVal !== '') return envVal
+      return def
+    }
+    const resolveNum = (val: unknown, envKey: string, def: number): number => {
+      if (val !== undefined) {
+        if (typeof val === 'string' && val.trim().startsWith('env:')) {
+          const name = val.trim().slice(4).trim()
+          const envVal = name ? env[name] : undefined
+          if (envVal !== undefined && envVal !== '') {
+            const n = Number(envVal)
+            return Number.isFinite(n) ? n : def
+          }
+          return def
+        }
+        const n = Number(val)
+        return Number.isFinite(n) ? n : def
+      }
+      const envVal = env[envKey]
+      if (envVal !== undefined && envVal !== '') {
+        const n = Number(envVal)
+        return Number.isFinite(n) ? n : def
+      }
+      return def
+    }
+    const expLlm = explicit.llm ?? {}
+    const llm: LlmConfig = {
+      provider: resolveStr(expLlm.provider, 'LLM_PROVIDER', LLM_DEFAULTS.provider),
+      model: resolveStr(expLlm.model, 'LLM_MODEL', LLM_DEFAULTS.model),
+      api_base: resolveStr(expLlm.api_base, 'LLM_API_BASE', LLM_DEFAULTS.api_base),
+      temperature: resolveNum(expLlm.temperature, 'LLM_TEMPERATURE', LLM_DEFAULTS.temperature),
+    }
+    // 嵌入配置保持原有显式>默认（兼容 env: 前缀）
+    const embeddingApiBaseUrl = resolveStr(explicit.embeddingApiBaseUrl, 'EMBEDDING_API_BASE_URL', DEFAULTS.embeddingApiBaseUrl)
+    const embeddingApiKeyRaw = explicit.embeddingApiKey
+    let embeddingApiKey: string
+    if (embeddingApiKeyRaw !== undefined) {
+      if (typeof embeddingApiKeyRaw === 'string' && embeddingApiKeyRaw.trim().startsWith('env:')) {
+        const name = embeddingApiKeyRaw.trim().slice(4).trim()
+        embeddingApiKey = name && env[name] ? env[name]! : DEFAULTS.embeddingApiKey
+      } else {
+        embeddingApiKey = String(embeddingApiKeyRaw)
+      }
+    } else {
+      embeddingApiKey = DEFAULTS.embeddingApiKey
+    }
+    const embeddingModel = resolveStr(explicit.embeddingModel, 'EMBEDDING_MODEL', DEFAULTS.embeddingModel)
+    const embeddingDimension = resolveNum(explicit.embeddingDimension, 'EMBEDDING_DIMENSION', DEFAULTS.embeddingDimension)
+    return {
+      embeddingApiBaseUrl,
+      embeddingApiKey,
+      embeddingModel,
+      embeddingDimension,
+      llm,
+    } as ResolvedConfig
+  }
 }
 
 /** 插件配置 schema（loader 校验与默认值填充；默认值全部引用 DEFAULTS 单源） */
@@ -84,6 +222,15 @@ export const Config = z.object({
   embeddingModel: z.string().default(DEFAULTS.embeddingModel),
   /** 远程嵌入维度（正数；本地 384 不随此配置） */
   embeddingDimension: z.number().min(1).default(DEFAULTS.embeddingDimension),
+  /** LLM 单一信任源（根 llm 为唯一可信源） */
+  llm: z
+    .object({
+      provider: z.string().default(LLM_DEFAULTS.provider),
+      model: z.string().default(LLM_DEFAULTS.model),
+      api_base: z.string().default(LLM_DEFAULTS.api_base),
+      temperature: z.number().min(0).max(2).default(LLM_DEFAULTS.temperature),
+    })
+    .default(LLM_DEFAULTS),
 }) as unknown as z<Config>
 // 类型断言理由：schemastery 的 object 返回 Schema<ObjectS, ObjectT>（输入形态含
 // null），与 z<Config> 的 meta.default 结构不兼容——输出在运行时经 default 填充，

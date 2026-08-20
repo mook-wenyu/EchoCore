@@ -76,6 +76,9 @@ export interface MemoryPanelConfigView {
   embeddingModel: string
   embeddingDimension: number
   embeddingApiKeyResolved: boolean
+  /** LLM 路由配置（provider/model/api_base/temperature；空串 = 未配置，回退 agent-default-model） */
+  llmProvider: string
+  llmModel: string
 }
 
 /** 反思执行结果视图（与宿主 handleReflect 对齐） */

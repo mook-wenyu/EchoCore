@@ -25,8 +25,11 @@ import { MEMORY_PLUGIN_ID } from './constants.js'
 import type { ExtractedMemory, MemoryKind } from './types.js'
 import { extractBalancedJson } from './utils/balanced-json.js'
 
-/** 提取系统提示词（角色界定 + 分类规则 + 输出格式约束） */
+import { EXTRACTION_PROMPT_VERSION, JSON_OUTPUT_INSTRUCTION, SECURITY_INSTRUCTION } from './constants.js'
+
+/** 提取系统提示词 v1.1（P0：合并冗余规则 + 统一输出格式 + 安全防护） */
 export const EXTRACTION_SYSTEM_PROMPT = `你是一个记忆提取器，为 AI 编码助手从对话摘录中提取值得长期记住的信息。
+${SECURITY_INSTRUCTION}
 
 分类规则：
 - fact:       客观事实（技术栈、路径、约束、版本、环境、API 行为）
@@ -36,21 +39,21 @@ export const EXTRACTION_SYSTEM_PROMPT = `你是一个记忆提取器，为 AI �
 - insight:    有价值的分析、洞察或结论
 
 提取规则：
-1. 只提取耐久信息；忽略寒暄、临时过程、工具输出细节与无关闲聊
-2. 保留精确标识符、路径、命令、数值、函数签名，不得改写
+1. 只提取耐久信息（忽略寒暄、临时过程、工具输出细节、无关闲聊、元内容如会话摘要/记忆引用/压缩摘要）
+2. 保留精确标识符、路径、命令、数值、函数签名及具体细节，不得改写或概括
 3. 不编造原文没有的信息；信息不完整时如实摘录并标注不确定
 4. 同一摘录中重复信息合并为一条
-5. 重要性 importance（1-10）：该信息对未来决策的影响程度
-6. 忽略元内容：会话摘要、'来自记忆 #xxx' 的引用、'[参考记忆]' 包裹的文本、压缩摘要——这些不是原始对话事实，不得提取
-7. 保持具体：保留时间、数值、标识符与限定条件；禁止把多条具体事实概括成一句抽象结论
-8. 状态变化：若摘录显示既有认知被更新或推翻（如"改用 X 替代 Y"、"不再使用 Z"），按新状态提取
-9. 失败教训（需求 A，2026-08-16）：已出现并被解决的工程失败（含现象、根因与恢复办法）→ kind: insight + 自动 tags 含 '失败教训'；只记录失败而未给出恢复方案的不得入库（防止"卡死无解"污染）
-10. 用户强调（需求 B，2026-08-16）：用户反复提及（≥2 次）或明确使用强调表达（"记住""务必""重点""不要再""强调"）的内容 → importance 应 ≥7（用户主观权重抬升——自动作用于衰减半衰期与快照保活）
-11. self/user 相关性 selfRelevance（1-10，W2，2026-08-18）：该信息与用户本人、长期目标或当前项目主题的相关程度（用户核心诉求、反复出现的域主题 → 高；一次性事务、与用户目标无关的外部常识 → 低）。它是"该记多久/多靠前保留"的创建期初始因子，与 importance（对未来决策影响）是**两个独立维度**——importance 可高但相关性低（影响大但与用户无关的外部事件）也可以相反。
+5. importance（1-10）：该信息对未来决策的影响程度
+6. 状态变化：若摘录显示既有认知被更新或推翻（如"改用 X 替代 Y"），按新状态提取
+7. 失败教训：已出现并被解决的工程失败（含现象、根因与恢复办法）→ kind: insight + tags 含 '失败教训'；只记录失败而未给出恢复方案的不得入库
+8. 用户强调：用户反复提及（≥2 次）或明确使用强调表达（"记住""务必""重点"）→ importance ≥7
+9. selfRelevance（1-10）：该信息与用户本人、长期目标或当前项目主题的相关程度。与 importance 是两个独立维度（importance 可高但相关性低）
 
-输出严格 JSON（不要输出任何其他文字）：
+${JSON_OUTPUT_INSTRUCTION}
 {"memories":[{"kind":"fact","content":"...","importance":7,"selfRelevance":7,"tags":["标签"]}]}
-没有可提取内容时输出：{"memories":[]}`
+没有可提取内容时输出：{"memories":[]}
+
+<!-- ${EXTRACTION_PROMPT_VERSION} -->`
 
 /** 提取用户消息尾部指令 */
 const EXTRACTION_USER_RULES = `

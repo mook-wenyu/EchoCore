@@ -21,7 +21,7 @@ interface ConfigFieldDef {
   hint?: string
 }
 
-/** 面板可编辑字段清单（配置面最小化——仅远程嵌入 4 项，用户拍板；apiKey 支持字面 key 或 env:NAME） */
+/** 面板可编辑字段清单（嵌入 4 项 + LLM 路由 2 项；apiKey 支持字面 key 或 env:NAME） */
 const CONFIG_FIELDS: ConfigFieldDef[] = [
   { key: 'embeddingApiBaseUrl', label: '远程 API Base URL', type: 'string' },
   {
@@ -30,8 +30,20 @@ const CONFIG_FIELDS: ConfigFieldDef[] = [
     type: 'string',
     hint: '可直接写字面 key，或写 env:NAME 引用环境变量（如 env:SILICONFLOW_KEY）',
   },
-  { key: 'embeddingModel', label: '远程模型名', type: 'string' },
-  { key: 'embeddingDimension', label: '远程维度', type: 'number' },
+  { key: 'embeddingModel', label: '远程嵌入模型名', type: 'string' },
+  { key: 'embeddingDimension', label: '远程嵌入维度', type: 'number' },
+  {
+    key: 'llmProvider',
+    label: 'LLM Provider',
+    type: 'string',
+    hint: '如 opencode-go、deepseek；留空回退 DSH 默认模型',
+  },
+  {
+    key: 'llmModel',
+    label: 'LLM Model',
+    type: 'string',
+    hint: '如 mimo-v2.5、deepseek-chat；留空回退 DSH 默认模型',
+  },
 ]
 
 // ── 内联样式（与 panel 对齐，零外部依赖；复刻自原 client.ts） ───────────────
@@ -77,8 +89,9 @@ export function ConfigPane(props: { api: MemoryPanelApi; onSaved?: () => void })
       .then((config) => {
         const initial: Record<string, string> = {}
         for (const field of CONFIG_FIELDS) {
-          const value = config[field.key]
-          initial[field.key] = String(value)
+          const value = (config as unknown as Record<string, unknown>)[field.key]
+          // 空值（undefined/null）→ 空字符串；非空值 String() 转换
+          initial[field.key] = value != null && value !== '' ? String(value) : ''
         }
         setDraft(initial)
         setResolved(config.embeddingApiKeyResolved)
@@ -94,12 +107,14 @@ export function ConfigPane(props: { api: MemoryPanelApi; onSaved?: () => void })
     try {
       // 仅提交变更项（减少 payload 与校验面）；类型按字段定义转换
       const partial: Record<string, unknown> = {}
+      const currentConfig = await props.api.getConfig()
       for (const field of CONFIG_FIELDS) {
         const current = draft[field.key]
         if (current === undefined) continue
-        const raw = (await props.api.getConfig())[field.key]
+        const raw = (currentConfig as unknown as Record<string, unknown>)[field.key]
         const parsed = field.type === 'number' ? Number(current) : field.type === 'boolean' ? current === 'true' : current
-        if (parsed !== raw) partial[field.key] = parsed
+        // 仅提交有变更的项（raw 未定义时跳过——旧版配置无此字段）
+        if (raw !== undefined && parsed !== raw && parsed !== '' && parsed !== undefined) partial[field.key] = parsed
       }
       if (Object.keys(partial).length === 0) {
         setNotice('无变更项')

@@ -33,6 +33,7 @@ function setup() {
       applied.push(next)
       Object.assign(rpcConfig, next)
     },
+    defaultModel: () => undefined,
   }
   const handler = createMemoryRpcHandler(store, rpc)
   return { store, handler, table, rpc, rpcConfig, calls, settingsUpdates, applied }
@@ -320,6 +321,7 @@ describe('memory RPC 配置端点（面板配置）', () => {
       async applyChange(): Promise<void> {
         calls.push('applyChange')
       },
+      defaultModel: () => undefined,
     }
     const handler = createMemoryRpcHandler(store, rpc)
     const result = await handler('setConfig', { embeddingModel: 'm' })
@@ -344,6 +346,7 @@ describe('memory RPC 配置端点（面板配置）', () => {
         calls.push('applyChange')
         throw new Error('热换嵌入后端失败（网络超时）')
       },
+      defaultModel: () => undefined,
     }
     const handler = createMemoryRpcHandler(store, rpc)
     const result = await handler('setConfig', { embeddingModel: 'm' })
@@ -411,6 +414,7 @@ describe('memory RPC reflect 端点与自进化/因果观测', () => {
     const { store, rpc } = setup()
     const reflector = {
       async runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }) {
+        // config.llm.provider/model 为空且 defaultModel() 也返回 undefined → route 仍为 undefined
         expect(route).toBeUndefined()
         expect(opts?.force).toBe(true)
         return { reviewed: 5, decisions: 3, merged: 2, archived: 1, skipped: 1 }

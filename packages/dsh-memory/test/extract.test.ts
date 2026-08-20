@@ -142,16 +142,14 @@ describe('stripReferenceMemoryParagraphs', () => {
 describe('EXTRACTION_SYSTEM_PROMPT 提取规则（O1-1 腐化防线）', () => {
   it('规则 1：忽略元内容包括会话摘要、记忆引用与 [参考记忆] 包裹文本', () => {
     expect(EXTRACTION_SYSTEM_PROMPT).toContain('会话摘要')
-    expect(EXTRACTION_SYSTEM_PROMPT).toContain('来自记忆')
-    expect(EXTRACTION_SYSTEM_PROMPT).toContain('[参考记忆]')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('记忆引用')
     expect(EXTRACTION_SYSTEM_PROMPT).toContain('压缩摘要')
   })
 
   it('规则 2：保持具体，不把多条具体事实概括为抽象结论', () => {
     expect(EXTRACTION_SYSTEM_PROMPT).toContain('数值')
     expect(EXTRACTION_SYSTEM_PROMPT).toContain('标识符')
-    expect(EXTRACTION_SYSTEM_PROMPT).toContain('限定条件')
-    expect(EXTRACTION_SYSTEM_PROMPT).toContain('概括成')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('具体细节')
   })
 
   it('规则 3：状态变化按新状态提取（更新/推翻既有认知）', () => {

@@ -75,14 +75,18 @@ export function getAdaptiveConfidenceThreshold(): number {
   return adaptiveConfidenceThreshold
 }
 
-/** 因果抽取系统提示词：只找因果/衍生关系，约束方向与输出格式，含 2 个 few-shot */
+import { CAUSAL_PROMPT_VERSION, JSON_OUTPUT_INSTRUCTION, SECURITY_INSTRUCTION } from './constants.js'
+
+/** 因果抽取系统提示词 v1.1（P0：统一输出格式 + 安全防护；P1：补置信度说明） */
 const CAUSAL_SYSTEM_PROMPT = `你是一个记忆因果分析器。给定一批记忆条目（每条以 #id 开头），找出条目之间存在的因果/衍生/前提-结果关系对。
+${SECURITY_INSTRUCTION}
 
 规则：
 1. 只对列表内存在（有 #id）的条目之间建边；禁止自环（sourceId 必须 ≠ targetId）
 2. 方向语义：source 是因/前提，target 是果/结果
 3. 为每个关系给出 confidence（0-1，自评把握度）与一句 justification（依据摘要）
-4. 只输出 JSON，不要输出任何其他文字：
+4. confidence < 0.55 的关系不会被采纳，无需输出
+5. ${JSON_OUTPUT_INSTRUCTION}
 {"edges":[{"sourceId":"...","targetId":"...","confidence":0.9,"justification":"..."}]}
 没有关系时输出：{"edges":[]}
 
@@ -98,7 +102,9 @@ const CAUSAL_SYSTEM_PROMPT = `你是一个记忆因果分析器。给定一批�
 #m3 [fact] 用户喜欢喝咖啡
 #m4 [fact] 本周气温下降，适合户外活动
 输出：
-{"edges":[]}`
+{"edges":[]}
+
+<!-- ${CAUSAL_PROMPT_VERSION} -->`
 
 /** 一次因果抽取批次的结果统计 */
 export interface CausalSummary {

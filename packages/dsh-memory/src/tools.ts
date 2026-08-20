@@ -72,6 +72,8 @@ export interface RuntimeHealth {
   causal?: CausalSummary | null
   /** 因果抽取最近一次成功批次时刻（ISO；未运行 null） */
   lastCausalAt?: string | null
+  /** LLM 单一信任源可观测（memory_status 暴露 llm.model/configHash） */
+  llm?: { model: string; configHash: string; provider?: string; api_base?: string; temperature?: number }
 }
 
 /** 记忆条目的最小规范形态（工具输出与 RPC 共用） */
@@ -626,7 +628,7 @@ function registerReflect(ctx: Context, deps: MemoryToolsDeps): void {
             type: 'text',
             text: value.ran
               ? `反思完成：审定 ${value.reviewed} 条焦点 · 提议 ${value.decisions} 个动作 · 合并 ${value.merged} · 矛盾归档 ${value.archived} · 跳过/拒绝 ${value.skipped}（审计 by:system，可回滚）`
-              : '反思未执行：当前无可用模型路由，或反思器未接线。',
+              : '反思未执行：请在记忆面板配置区设置 LLM Provider + LLM Model（如 opencode-go / mimo-v2.5），或在 settings.yaml 的 memory 段添加 llm.provider + llm.model。',
           },
         ],
       },
@@ -684,7 +686,7 @@ function registerCausal(ctx: Context, deps: MemoryToolsDeps): void {
             type: 'text',
             text: value.ran
               ? `因果抽取完成：审 ${value.reviewed} 条 · 提议 ${value.edges} 条边 · 新建 ${value.created} · 跳过/拒绝 ${value.skipped}（add-only，审计可溯源）`
-              : '因果抽取未执行：当前无可用模型路由，或抽取器未接线。',
+              : '因果抽取未执行：请在记忆面板配置区设置 LLM Provider + LLM Model，或在 settings.yaml 的 memory 段添加 llm.provider + llm.model。',
           },
         ],
       },
@@ -754,6 +756,9 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
             reflectionCumulative: { type: 'json', required: true },
             causal: { type: 'json', required: true },
             lastCausalAt: { type: 'json', required: true },
+            // LLM 单一信任源可观测（memory_status 暴露 llm.model/configHash）
+            llm: { type: 'json', required: true },
+            configHash: { type: 'json', required: true },
           },
           additionalProperties: false,
         },
@@ -782,6 +787,8 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
               `因果链：上次 ${value.lastCausalAt ?? '未运行'}${
                 value.causal ? `（审 ${(value.causal as unknown as CausalSummary).reviewed} · 建边 ${(value.causal as unknown as CausalSummary).created} · 跳过 ${(value.causal as unknown as CausalSummary).skipped}）` : ''
               }`,
+              // LLM 单一信任源可观测（中文注释）
+              `LLM：${(value.llm as unknown as { model?: string })?.model ?? '未配置'} · 配置哈希 ${(value.configHash as unknown as string) ?? (value.llm as unknown as { configHash?: string })?.configHash ?? '—'}`,
             ].join('\n'),
           },
         ],
@@ -789,7 +796,24 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
       execute: async () => {
         const stats = deps.store.stats()
         // O1：装配层 runtime 覆盖健康字段（测试/未装配 → 占位）
-        const runtime = deps.runtime
+        const runtime = deps.runtime as RuntimeHealth & { llm?: { model: string; configHash: string } }
+        // 若运行时未注入 llm，则回退至 LlmFactory 单例（单一信任源，保证合约一致）
+        let llm = runtime?.llm ?? null
+        let configHash: string | null = null
+        if (llm !== null && llm !== undefined) {
+          configHash = llm.configHash ?? null
+        } else {
+          try {
+            const { LlmFactory } = await import('./runtime.js')
+            const snap = LlmFactory.getInstance().getSnapshot()
+            llm = { model: snap.model, configHash: snap.configHash, provider: snap.provider, api_base: snap.api_base, temperature: snap.temperature }
+            configHash = snap.configHash
+          } catch {
+            llm = null
+          }
+        }
+        // 兼容顶层 configHash 字段（独立可观测）
+        const topHash = configHash ?? (llm as unknown as { configHash?: string })?.configHash ?? null
         return {
           total: stats.total,
           active: stats.active,
@@ -811,6 +835,8 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
           reflectionCumulative: (runtime?.reflectionCumulative ?? null) as JsonValue,
           causal: (runtime?.causal ?? null) as JsonValue,
           lastCausalAt: runtime?.lastCausalAt ?? null,
+          llm: (llm ?? null) as unknown as JsonValue,
+          configHash: (topHash ?? null) as unknown as JsonValue,
         }
       },
     }),

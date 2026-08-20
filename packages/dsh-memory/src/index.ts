@@ -33,7 +33,7 @@ import { MemoryStore } from './store.js'
 import { installSettingsSeam, type SettingsSeam } from './settings.js'
 import { registerMemoryTools } from './tools.js'
 import { jiebaWords } from './scoring.js'
-import { memoryRuntime } from './runtime.js'
+import { LlmFactory, memoryRuntime } from './runtime.js'
 import type { MemoryCausalEdge, MemoryEntry } from './types.js'
 
 export const name = 'memory'
@@ -66,7 +66,19 @@ export function apply(ctx: Context, config: ConfigType): Promise<void> {
  * 无 seam（测试直连 mountMemory）：配置视图用装配传入值；持久化/重启拒绝——
  * 测试面不触碰真实配置源（index.test 只验证装配，配置端点契约见 host-rpc.test）。
  */
-function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig): MemoryRpcContext {
+function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig, ctx: Context): MemoryRpcContext {
+  // DSH 宿主 agent-default-model 回退源：memory LLM 配置为空时经此获取宿主默认模型。
+  // ctx.agentDefaultModel 为 Cordis 服务注入（dsh-agent-default-model 插件提供），
+  // 宿主未挂载时 ctx.get 返回 undefined——回退函数统一返回 undefined（诚实返回）。
+  const getDefaultModel = (): { provider: string; model: string } | undefined => {
+    try {
+      const svc = ctx.get('agentDefaultModel') as { currentSelection?: () => { provider: string; model: string } } | undefined
+      if (svc !== undefined && typeof svc.currentSelection === 'function') {
+        return svc.currentSelection()
+      }
+    } catch {}
+    return undefined
+  }
   if (seam === undefined) {
     return {
       config: () => fallback,
@@ -74,9 +86,10 @@ function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig
         update: () => Promise.reject(new Error('settings seam 未接线：配置无法持久化（测试直连装配）')),
       },
       applyChange: () => Promise.resolve(),
+      defaultModel: getDefaultModel,
     }
   }
-  return { config: seam.effective, settings: seam.channel, applyChange: seam.applyChange }
+  return { config: seam.effective, settings: seam.channel, applyChange: seam.applyChange, defaultModel: getDefaultModel }
 }
 
 /** 旧 JSON 嵌入索引文件路径（vec0 迁移源：memory-embeddings-<dim>.json；迁移后改名 .bak） */
@@ -388,6 +401,14 @@ export async function mountMemory(
     get causalCumulative() {
       return (causalExtractor as { cumulativeSummary?: unknown }).cumulativeSummary ?? null
     },
+    // LLM 单一信任源可观测（memory_status 暴露 llm.model/configHash，中文注释）
+    get llm() {
+      const snap = LlmFactory.getInstance().getSnapshot()
+      return { model: snap.model, configHash: snap.configHash, provider: snap.provider, api_base: snap.api_base, temperature: snap.temperature }
+    },
+    get configHash() {
+      return LlmFactory.getInstance().getSnapshot().configHash
+    },
   }
 
   // 模型工具：recall / search / note / forget / audit / status / reflect
@@ -411,7 +432,7 @@ export async function mountMemory(
   // settings.yaml 并经实时生效器热换嵌入后端——根因修复见 settings.ts 文件头）；
   // reflect 端点 = 面板手动触发反思（route 缺省回退反思器缓存——面板无会话）
   // P2：明文密钥检测（sk- 开头）经 logger.warn 提示迁移 env:BAILIAN_API_KEY
-  registerMemoryRpc(ctx, store, rpcContextFrom(overrides.seam, config), runtime, reflector, logger)
+  registerMemoryRpc(ctx, store, rpcContextFrom(overrides.seam, config, ctx), runtime, reflector, logger)
 
   logger.info(`记忆领域已打开（${store.stats().total} 条既有记忆）`)
 }

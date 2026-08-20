@@ -169,38 +169,43 @@ export interface ReflectionCumulative {
   emptyRounds: number
 }
 
+import { REFLECTION_PROMPT_VERSION, JSON_OUTPUT_INSTRUCTION, SECURITY_INSTRUCTION } from './constants.js'
+
 /**
- * 反思系统提示词（只判定近似重复/矛盾，禁止其它动作）
- * 2026-08-18 调优：补充 2 个 few-shot 示例（1 个该合并的重复对、1 个该判 none 的无关对），
- * 并显式说明"已预筛高相似对，多数应判 merge/archive"，纠正模型倾向 none 的保守偏置。
+ * 反思系统提示词 v1.1（P0：统一输出格式 + 安全防护；P1：增加边界示例）
  */
 export const REFLECTION_SYSTEM_PROMPT = `你是一个记忆反思器，审视已有记忆条目之间的语义近似重复与跨条目矛盾。
+${SECURITY_INSTRUCTION}
 
 输入说明：下列记忆对已由相似度预筛（语义余弦≥阈值或 Jaccard∈[0.08,0.85)且重合token≥2），多数对确实存在近似重复或矛盾，请倾向于判 merge/archive；仅当两条确实无关或证据不足时判 none，避免过度保守。
 
 判断规则：
-1. 语义近似重复（action: merge）：两条记忆表述同一事实，仅措辞/详略不同（token 重合度低于既有规则的 0.85 合并域）。
-2. 矛盾（action: archive）：两条记忆针对同一主题给出相互冲突的结论。
-3. 无关或不足以判定（action: none）。
+1. 语义近似重复（action: merge）：两条记忆表述同一事实，仅措辞/详略不同
+2. 矛盾（action: archive）：两条记忆针对同一主题给出相互冲突的结论
+3. 无关或不足以判定（action: none）
 
-禁止：
-- 不得建议改写任何记忆内容、调整重要性、或新建/合成新记忆。
-- 只允许在两个都来自记忆库（都有来源引用）的条目之间判定。
-- 每条裁决必须引用 focus 与 peer 的完整 id（#<id>）。
+禁止：不得建议改写、调整重要性、新建记忆；只允许在都来自记忆库的条目之间判定；每条裁决必须引用 focus 与 peer 的完整 id（#<id>）。
 
-示例1（应判 merge——同一事实的措辞改写）：
+示例1（merge——同一事实的措辞改写）：
 焦点 #dupOld kind=fact content=CourtGrantTypes 迁至 Project persistence
 对比 #dupNew kind=fact content=CourtGrantTypes 已迁移到 Project 持久化机制
 → {"focusId":"dupOld","peerId":"dupNew","action":"merge","reason":"同一事实的措辞改写"}
 
-示例2（应判 none——主题无关）：
+示例2（none——主题无关）：
 焦点 #aaa kind=fact content=优先使用 pnpm 管理依赖
 对比 #bbb kind=fact content=项目部署在 Vercel 平台
 → {"focusId":"aaa","peerId":"bbb","action":"none","reason":"主题无关，无重复或矛盾"}
 
-输出严格 JSON（不要输出任何其他文字）：
+示例3（none——看似相关但实际不同方法）：
+焦点 #ccc kind=insight content=使用 TDD 提升代码质量
+对比 #ddd kind=insight content=使用 Code Review 提升代码质量
+→ {"focusId":"ccc","peerId":"ddd","action":"none","reason":"都是质量实践但方法不同，非重复"}
+
+${JSON_OUTPUT_INSTRUCTION}
 {"decisions":[{"focusId":"<focus 完整 id>","peerId":"<peer 完整 id>","action":"merge|archive|none","reason":"简短中文理由"}]}
-没有需要处理的输出：{"decisions":[]}`
+没有需要处理的输出：{"decisions":[]}
+
+<!-- ${REFLECTION_PROMPT_VERSION} -->`
 
 /** 反思用户消息尾部指令 */
 const REFLECT_USER_RULES = `请依据上述规则审视下列记忆条目对，只输出 JSON。`

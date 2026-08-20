@@ -39,8 +39,8 @@ import {
   type SettingsSectionHooks,
 } from '@deepseek-ai/dsh-settings'
 
-import { Config, DEFAULTS, sameConfig, type Config as ConfigType, type ResolvedConfig } from './config.js'
-import { memoryRuntime, type LiveApplier, type SettingsServiceLike } from './runtime.js'
+import { Config, ConfigManager, DEFAULTS, sameConfig, type Config as ConfigType, type ResolvedConfig } from './config.js'
+import { LlmFactory, memoryRuntime, type LiveApplier, type SettingsServiceLike } from './runtime.js'
 
 /** settings 命名空间（settings.yaml 的 memory 段；kebab-case 短名） */
 export const NS = settingsNamespace('memory')
@@ -77,7 +77,12 @@ export interface SettingsSeam {
  * 配置运行；面板保存会经 channel.update 明确报错，不静默降级）。
  */
 export function installSettingsSeam(ctx: Context, entry: ConfigType): SettingsSeam {
-  const entryConfig: ResolvedConfig = { ...DEFAULTS, ...entry }
+  // 单一信任源合并（显式 > env: > 默认），llm 字段深合并保证完整 LlmConfig
+  const entryConfig: ResolvedConfig = ConfigManager.mergeConfig(entry as Record<string, unknown> as Partial<ConfigType>)
+  // 同步 LLM 工厂（保证工厂与配置同源，满足一致性合约）
+  try {
+    LlmFactory.getInstance().updateConfig(entryConfig.llm)
+  } catch {}
   memoryRuntime.settings.currentSource = () => entryConfig
   // 幂等守卫基线：进程首启用 entry 配置（后续变更与之比较）
   memoryRuntime.settings.active = memoryRuntime.settings.active ?? entryConfig
@@ -132,6 +137,10 @@ export function applyConfigChange(next: ResolvedConfig): Promise<void> {
   const prev = memoryRuntime.settings.active
   if (prev !== undefined && sameConfig(next, prev)) return Promise.resolve()
   memoryRuntime.settings.active = next
+  // 单一信任源同步：LLM 工厂随配置热换（保证四处任务快照一致）
+  try {
+    LlmFactory.getInstance().updateConfig(next.llm)
+  } catch {}
   return memoryRuntime.settings.applier(next).catch((error) => {
     // 热换失败（applier 抛错，运行态未切换，仍保留旧后端）：回滚 active 到旧值。
     // 若不回滚，active 已指向新配置而运行态仍是旧后端——配置态与运行态漂移，
