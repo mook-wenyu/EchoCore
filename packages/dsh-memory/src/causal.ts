@@ -49,6 +49,32 @@ export const CAUSAL_MIN_CONFIDENCE = 0.55
 /** LLM 输出 token 上限 */
 export const CAUSAL_MAX_TOKENS = 1024
 
+/** 自适应后置信阈值（初始 0.55，直方图驱动动态调整） */
+let adaptiveConfidenceThreshold = CAUSAL_MIN_CONFIDENCE
+
+/**
+ * 置信阈值自适应：基于置信度直方图动态调整建边阈值 0.55
+ * - lt055 显著堆积（低分多，说明阈值过严导致大量截断）→ 降至 0.50 提升召回
+ * - btw055_074 较多（边界样本多，说明噪声在边界）→ 升至 0.60 控制噪声
+ * - 其余保持 0.55
+ * 中文注释：直方图来自 CausalSummary/confidenceHist，经 memory_status 观测
+ */
+export function adjustConfidenceByHist(hist: { lt055: number; btw055_074: number }): number {
+  // 低分堆积显著多于边界：阈值过严，放宽以提升召回
+  let next: number
+  if (hist.lt055 > hist.btw055_074 * 1.5 && hist.lt055 > 3) next = 0.5
+  // 边界样本多于低分：边界噪声多，收紧以控噪
+  else if (hist.btw055_074 > hist.lt055 && hist.btw055_074 > 3) next = 0.6
+  else next = 0.55
+  adaptiveConfidenceThreshold = next
+  return next
+}
+
+/** 获取当前自适应置信阈值（供测试/观测） */
+export function getAdaptiveConfidenceThreshold(): number {
+  return adaptiveConfidenceThreshold
+}
+
 /** 因果抽取系统提示词：只找因果/衍生关系，约束方向与输出格式，含 2 个 few-shot */
 const CAUSAL_SYSTEM_PROMPT = `你是一个记忆因果分析器。给定一批记忆条目（每条以 #id 开头），找出条目之间存在的因果/衍生/前提-结果关系对。
 
@@ -388,6 +414,11 @@ export class MemoryCausalExtractor {
         if (confidenceMean !== undefined) {
           this.deps.logger.info(`[dsh-memory] 因果抽取置信度均值 ${confidenceMean.toFixed(3)} 分布 ${JSON.stringify(hist)}`)
         }
+        // 阈值自适应：基于直方图动态调整置信阈值并透出日志（memory_status/causal.hist 驱动）
+        {
+          const adjusted = adjustConfidenceByHist({ lt055: hist.lt055, btw055_074: hist.btw055_074 })
+          this.deps.logger.info(`[dsh-memory] 因果阈值自适应：hist=${JSON.stringify(hist)} 阈值→${adjusted}`)
+        }
 
         // 逐条校验建边（重读 store 当前状态）
         for (const edge of parsed) {
@@ -441,7 +472,7 @@ export class MemoryCausalExtractor {
       summary.skipped++
       return
     }
-    if (edge.confidence < CAUSAL_MIN_CONFIDENCE) {
+    if (edge.confidence < adaptiveConfidenceThreshold) {
       summary.skipped++
       return
     }

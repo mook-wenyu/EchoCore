@@ -67,7 +67,32 @@ export const REFLECT_SEMANTIC_THRESHOLD_REMOTE = 0.75
  */
 export function getSemanticThresholdForDim(dim: number): number {
   // 显式判断：仅 384 走宽松阈值，其余一律 0.75（不过严也不过松）
+  // 若已自适应，384 维走自适应阈值（见 adjustThresholdByHitRate）
+  if (dim === 384 && adaptiveLocalThreshold !== REFLECT_SEMANTIC_THRESHOLD_LOCAL) {
+    return adaptiveLocalThreshold
+  }
   return dim === 384 ? REFLECT_SEMANTIC_THRESHOLD_LOCAL : REFLECT_SEMANTIC_THRESHOLD_REMOTE
+}
+
+/** 自适应后本地阈值（初始 0.72，hitRate 驱动动态调整） */
+let adaptiveLocalThreshold = REFLECT_SEMANTIC_THRESHOLD_LOCAL
+
+/**
+ * 阈值自适应：基于语义向量覆盖率动态调整本地语义阈值
+ * - hitRate < 0.1 向量稀缺 → 阈值 0.72→0.68 放宽召回
+ * - hitRate > 0.3 覆盖良好 → 阈值 0.72→0.75 收紧控噪
+ * - 中间区间保持 0.72
+ * 中文注释：覆盖率来自 memory_status/semanticHitRate，经维护周期采样
+ */
+export function adjustThresholdByHitRate(hitRate: number): number {
+  // 低覆盖：语义信号稀缺，放宽阈值提升召回
+  let next: number
+  if (hitRate < 0.1) next = 0.68
+  // 高覆盖：语义充足，收紧阈值控制噪声
+  else if (hitRate > 0.3) next = 0.75
+  else next = 0.72
+  adaptiveLocalThreshold = next
+  return next
 }
 
 /** LLM 输出上限 */
@@ -439,6 +464,11 @@ export class MemoryReflector {
       this.deps.logger.info(
         `[dsh-memory] 反思候选直方图：窗口=${candidates.length}/${REFLECT_WINDOW} 向量覆盖=${(semanticHitRate * 100).toFixed(1)}% 焦点=${reviewed}/${pairs.length}`,
       )
+      // 阈值自适应：基于 hitRate 动态调整本地语义阈值并透出日志（memory_status/semanticHitRate 驱动）
+      if (semanticHitRate !== undefined) {
+        const adjusted = adjustThresholdByHitRate(semanticHitRate)
+        this.deps.logger.info(`[dsh-memory] 语义阈值自适应：hitRate=${(semanticHitRate * 100).toFixed(1)}% 阈值→${adjusted}`)
+      }
     }
     const summary: ReflectionSummary = {
       reviewed,

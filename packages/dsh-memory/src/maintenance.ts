@@ -34,6 +34,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
 import { resolveRoute } from './extract.js'
+import { adjustConfidenceByHist } from './causal.js'
+import { adjustThresholdByHitRate } from './reflect.js'
 import type { MemoryStore } from './store.js'
 import type { MemoryEntry } from './types.js'
 
@@ -243,7 +245,29 @@ export class MemoryMaintenance {
         // 与规则任务同处 runOnce 成功路径——任一段失败仅告警不影响后续与批次完成记录。
         await this.runSubtask('向量补齐', this.deps.backfill?.(BACKFILL_BUDGET))
         await this.runSubtask('反思', this.deps.reflector?.runOnce(route))
+        // 阈值自适应：基于反思语义覆盖率（memory_status/semanticHitRate）动态调整阈值并透出日志
+        try {
+          const summary = (this.deps.reflector as unknown as { lastSummary?: { semanticHitRate?: number } })?.lastSummary
+          const hitRate = summary?.semanticHitRate
+          if (typeof hitRate === 'number' && Number.isFinite(hitRate)) {
+            const adjusted = adjustThresholdByHitRate(hitRate)
+            this.deps.logger.info(`[dsh-memory] 维护期语义阈值自适应：hitRate=${(hitRate * 100).toFixed(1)}% 阈值→${adjusted}`)
+          }
+        } catch {
+          // 自适应为观测增强，失败不影响主流程
+        }
         await this.runSubtask('因果抽取', this.deps.causal?.runOnce(route))
+        // 因果阈值自适应：基于直方图（memory_status/causal.hist）动态调整
+        try {
+          const cSummary = (this.deps.causal as unknown as { lastSummary?: { confidenceHist?: { lt055: number; btw055_074: number } } })?.lastSummary
+          const hist = cSummary?.confidenceHist
+          if (hist !== undefined && typeof hist.lt055 === 'number' && typeof hist.btw055_074 === 'number') {
+            const adjusted = adjustConfidenceByHist({ lt055: hist.lt055, btw055_074: hist.btw055_074 })
+            this.deps.logger.info(`[dsh-memory] 维护期因果阈值自适应：hist=${JSON.stringify(hist)} 阈值→${adjusted}`)
+          }
+        } catch {
+          // 自适应为观测增强，失败不影响主流程
+        }
         // O1：批次完成时刻记录（成功路径；失败由 catch 告警且不更新——可观测"上次成功维护"）
         this.lastRunAtValue = new Date().toISOString()
       } catch (error) {
