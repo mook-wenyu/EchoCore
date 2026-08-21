@@ -23,7 +23,8 @@
 import { BlockAssembler, createUserMessage, type LlmRuntime, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 
-import { cosineSimilarity } from './embed-index.js'
+// P0 卡死修复后 pairSim 改用预取向量+预计算范数的内联点积（与 cosineSimilarity 数学
+// 恒等），本模块不再直接依赖 embed-index 运行时导出
 import { MEMORY_PLUGIN_ID } from './constants.js'
 import { jaccard, tokenize } from './scoring.js'
 import type { MemoryStore } from './store.js'
@@ -259,7 +260,18 @@ export function parseReflectionDecisions(text: string): ReflectionDecision[] {
  */
 
 /**
- * 选取反思焦点 + 各自的候选对比条目（纯函数，供测试）。
+ * 选取反思焦点 + 各自的候选对比条目（纯函数语义 + 协作式让出，供测试）。
+ *
+ * P0 卡死修复（2026-08-20 用户拍板方案 B）：
+ * - 旧实现每对 pairSim 内联调用 embedding.getVector()（每次一条 SQLite vec0 虚拟表
+ *   查询，2560 维 ≈10KB BLOB，实测 ~260µs/次）与 tokenize()（jieba 同步分词），
+ *   O(n²)=~17.6 万次调用致主线程冻结实测 45.8s（test/reflect-bench.test.ts 场景 D）；
+ * - 现改为【预取层】：向量每条目至多取一次（Map 缓存）、范数预计算（余弦由 3 次遍历
+ *   降为单次点积，累加顺序与 cosineSimilarity 一致保证结果位级相同）、token 惰性
+ *   预取每条目至多切一次——O(n²) 内循环零 IO、零分词；
+ * - 【协作式让出】：每 REFLECT_YIELD_ROWS 行 await setImmediate 挂起一次宏任务，
+ *   任意窗口规模下宿主事件循环单次停顿有界（本函数因此为 async）。
+ *
  * - 焦点策略（2026-08-18 实证修复 + C34 语义门 + 2026-08-18 调优）：
  *   ① 焦点 = window 内"存在 ≥1 个合格对比对"的条目，按【最强对相似度降序 → 重要度
  *      降序 → 创建时间倒序 → id 稳定】取前 REFLECT_FOCUS_BUDGET；无 peer 的孤条目
@@ -273,28 +285,76 @@ export function parseReflectionDecisions(text: string): ReflectionDecision[] {
  * - 每焦点的 peers = 同 workspace 合格对，按相似度降序取前 REFLECT_PEERS_PER_FOCUS。
  * 注意：≥0.85（Jaccard）由既有规则合并/覆盖域处理，本函数只补盲区。
  */
-export function selectReflectionPairs(
+export const REFLECT_YIELD_ROWS = 16
+
+/** 让出事件循环：setImmediate 宏任务（无 setTimeout 的 ≥1ms 钳制，让出粒度最细） */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
+export async function selectReflectionPairs(
   entries: MemoryEntry[],
   embedding?: { getVector(id: string): Float32Array | undefined },
-): Array<{ focus: MemoryEntry; peers: MemoryEntry[] }> {
-  // 对级相似度：{ sim 排序值, ok 是否合格 }。双侧向量 → 余弦（阈值按维度区分）；否则 Jaccard+overlap。
+  opts?: {
+    /** 分片让出行数（默认 REFLECT_YIELD_ROWS；测试可注入更小值驱动多轮让出） */
+    yieldEveryRows?: number
+    /**
+     * 焦点资格集（水位线增量反思用）：提供时仅集合内条目可作焦点（peer 资格不变）。
+     * 缺省 = 全部条目可作焦点。空集 ⇒ 无焦点 ⇒ 调用方自然走"无新增候选"快路径。
+     */
+    focusEligible?: ReadonlySet<string>
+  },
+): Promise<Array<{ focus: MemoryEntry; peers: MemoryEntry[] }>> {
+  const yieldEvery = Math.max(1, opts?.yieldEveryRows ?? REFLECT_YIELD_ROWS)
+  // ── 预取层①：向量每条目至多一次 getVector（旧实现每对 2 次 ≈ 数万次 SQL）。
+  // 预取本身也分片让出：400 次 vec0 查询同步执行实测 ~104ms 停顿，每 128 条挂起一次
+  // 宏任务后单段停顿降至 ~33ms 以内（与行扫描让出同粒度策略）。──
+  const vectors = new Map<string, Float32Array | undefined>()
+  if (embedding !== undefined) {
+    let fetched = 0
+    for (const entry of entries) {
+      vectors.set(entry.id, embedding.getVector(entry.id))
+      if (++fetched % 128 === 0) await yieldToEventLoop()
+    }
+  }
+  // ── 预取层②：范数预计算（累加顺序与 cosineSimilarity 的 na/nb 循环一致，
+  // dot/sqrt(na)/sqrt(nb) 数学恒等 ⇒ sim 与旧实现位级相同，阈值行为不漂移）──
+  const norms = new Map<string, number>()
+  for (const [id, vec] of vectors) {
+    if (vec === undefined) continue
+    let sumSq = 0
+    for (let i = 0; i < vec.length; i++) sumSq += vec[i]! * vec[i]!
+    norms.set(id, Math.sqrt(sumSq))
+  }
+  // ── 预取层③：token 惰性缓存（Jaccard 回退路径每条目至多切一次 jieba）──
+  const tokens = new Map<string, Set<string>>()
+  const tokensOf = (entry: MemoryEntry): Set<string> => {
+    const cached = tokens.get(entry.id)
+    if (cached !== undefined) return cached
+    const fresh = new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
+    tokens.set(entry.id, fresh)
+    return fresh
+  }
+  // 对级相似度：{ sim 排序值, ok 是否合格 }。双侧有预取向量 → 余弦（阈值按维度区分）；否则 Jaccard+overlap。
   const pairSim = (a: MemoryEntry, b: MemoryEntry): { sim: number; ok: boolean } => {
-    const va = embedding?.getVector(a.id)
-    const vb = embedding?.getVector(b.id)
+    const va = vectors.get(a.id)
+    const vb = vectors.get(b.id)
     if (va !== undefined && vb !== undefined) {
-      const sim = cosineSimilarity(va, vb)
+      // 单次点积 + 预计算范数（与 cosineSimilarity 全等的数学分解，见预取层②注释）
+      const len = Math.min(va.length, vb.length)
+      let dot = 0
+      for (let i = 0; i < len; i++) dot += va[i]! * vb[i]!
+      const denom = (norms.get(a.id) ?? 0) * (norms.get(b.id) ?? 0)
+      const sim = denom === 0 ? 0 : dot / denom
       // 2026-08-18 调优：阈值按模型维度区分（向量长度判断：384→0.72, 其他→0.75）
       // 显式降级语义+中文注释：非防御性兜底，维度即模型身份
-      const threshold = getSemanticThresholdForDim(va.length)
-      // 若两向量维度不一致（极端异常），取更严格者（防御不一致但显式处理）
-      // 注释：正常同库维度一致，此分支仅为显式说明不一致时的取严策略
-      const thresholdB = getSemanticThresholdForDim(vb.length)
-      const finalThreshold = Math.max(threshold, thresholdB)
+      // 若两向量维度不一致（极端异常），取更严格者（显式说明不一致时的取严策略）
+      const finalThreshold = Math.max(getSemanticThresholdForDim(va.length), getSemanticThresholdForDim(vb.length))
       return { sim, ok: sim >= finalThreshold }
     }
-    // 收敛至 scoring.jaccard：本地 tokenize 后复用纯函数，并另计 overlap 满足辅助门
-    const setA = new Set(tokenize(`${a.content} ${a.tags.join(' ')}`))
-    const setB = new Set(tokenize(`${b.content} ${b.tags.join(' ')}`))
+    // 收敛至 scoring.jaccard：复用预取 token 集合（每条目至多 tokenize 一次），并另计 overlap 满足辅助门
+    const setA = tokensOf(a)
+    const setB = tokensOf(b)
     let overlap = 0
     for (const token of setA) if (setB.has(token)) overlap++
     const j = jaccard(setA, setB)
@@ -304,10 +364,11 @@ export function selectReflectionPairs(
   // 每条目 → 其同 workspace 最强合格对相似度（maxSim；无合格对为 0，不参与焦点）
   const maxSim = new Map<string, number>()
   for (let i = 0; i < entries.length; i++) {
+    const a = entries[i]
+    if (a === undefined) continue
     for (let k = i + 1; k < entries.length; k++) {
-      const a = entries[i]
       const b = entries[k]
-      if (a === undefined || b === undefined || a.workspace !== b.workspace) continue
+      if (b === undefined || a.workspace !== b.workspace) continue
       const { sim, ok } = pairSim(a, b)
       if (ok) {
         const set = (id: string) => maxSim.set(id, Math.max(maxSim.get(id) ?? 0, sim))
@@ -315,9 +376,13 @@ export function selectReflectionPairs(
         set(b.id)
       }
     }
+    // 协作式让出：每 yieldEvery 行挂起一次宏任务（宿主事件循环保持响应）
+    if ((i + 1) % yieldEvery === 0) await yieldToEventLoop()
   }
   const focusList = entries
     .filter((entry) => (maxSim.get(entry.id) ?? 0) > 0)
+    // 水位线增量：仅资格集内条目可作焦点（缺省全量；peer 不受限）
+    .filter((entry) => opts?.focusEligible?.has(entry.id) ?? true)
     .sort(
       (a, b) =>
         (maxSim.get(b.id) ?? 0) - (maxSim.get(a.id) ?? 0) ||
@@ -327,7 +392,9 @@ export function selectReflectionPairs(
     )
     .slice(0, REFLECT_FOCUS_BUDGET)
   const result: Array<{ focus: MemoryEntry; peers: MemoryEntry[] }> = []
-  for (const focus of focusList) {
+  for (let fi = 0; fi < focusList.length; fi++) {
+    const focus = focusList[fi]
+    if (focus === undefined) continue
     const scored: Array<{ peer: MemoryEntry; sim: number }> = []
     for (const entry of entries) {
       if (entry.id === focus.id) continue
@@ -339,6 +406,8 @@ export function selectReflectionPairs(
     }
     scored.sort((x, y) => y.sim - x.sim)
     result.push({ focus, peers: scored.slice(0, REFLECT_PEERS_PER_FOCUS).map((s) => s.peer) })
+    // 焦点复核阶段同样协作式让出（foci×entries 仍可达数千次点积）
+    if ((fi + 1) % yieldEvery === 0) await yieldToEventLoop()
   }
   return result
 }
@@ -470,7 +539,7 @@ export class MemoryReflector {
     const candidates = this.deps.store.listRecent(REFLECT_WINDOW, 'active')
     // hot-swap 守卫：优先用 getter（延迟读 holder.index），回退静态 embedding
     const embeddingIndex = this.deps.getEmbeddingIndex?.() ?? this.deps.embedding
-    const pairs = selectReflectionPairs(candidates, embeddingIndex)
+    const pairs = await selectReflectionPairs(candidates, embeddingIndex)
     const reviewed = pairs.filter((pair) => pair.peers.length > 0).length
     // 可观测：向量覆盖率（语义救援能力的直观度量）
     // 2026-08-18 调优：向量覆盖仅 21.8% 时双侧命中 p²≈3.5%，救援失效；暴露覆盖率便于
