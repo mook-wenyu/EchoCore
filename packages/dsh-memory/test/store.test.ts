@@ -855,7 +855,7 @@ describe('store/search 模块抽离（search/withScore/RRF/IDF + tokenCache）',
     expect(mod.semanticTopK(undefined)).toBe(400)
   })
 
-  it('导出 TOKEN_CACHE_MAX 与 token 缓存助手：getCachedTokens 命中/填充且超限清空', async () => {
+  it('导出 TOKEN_CACHE_MAX 与 token 缓存助手：getCachedTokens 命中/填充且超限淘汰最旧 1/4（非整体清空）', async () => {
     const mod = await import('../src/store/search.js')
     expect(mod.TOKEN_CACHE_MAX).toBe(5000)
     expect(typeof mod.getCachedTokens).toBe('function')
@@ -885,12 +885,18 @@ describe('store/search 模块抽离（search/withScore/RRF/IDF + tokenCache）',
     expect(first.has('pnpm')).toBe(true)
     mod.invalidateTokenCache(cache, entry.id)
     expect(cache.has(entry.id)).toBe(false)
-    // 超限清空：塞满后未命中应清空
+    // 超限分片淘汰（P1 缓存命中优化，2026-08-20 拍板）：库 8882 条 > 上限 5000 时，
+    // 旧"整体清空"使缓存命中率归零、每轮检索全量重切 jieba；改为淘汰最旧 ⌈MAX/4⌉=1250 条，
+    // 保留 75% 热条目。塞满后插入 1 条：size = 5000-1250+1 = 3751，且最旧四分位被清、其余保留。
     const bigCache = new Map<string, Set<string>>()
     for (let i = 0; i < 5000; i++) bigCache.set(`id-${i}`, new Set(['x']))
     const after = mod.getCachedTokens(bigCache, { ...entry, id: 'new-id' })
-    expect(bigCache.size).toBe(1)
+    expect(bigCache.size).toBe(3751)
     expect(after.has('pnpm')).toBe(true)
+    expect(bigCache.has('id-0')).toBe(false) // 最旧四分位起点被淘汰
+    expect(bigCache.has('id-1249')).toBe(false) // 淘汰边界内最后一条
+    expect(bigCache.has('id-1250')).toBe(true) // 淘汰边界外第一条保留
+    expect(bigCache.has('id-4999')).toBe(true) // 最新条目保留
   })
 
   it('导出候选过滤与评分：filterCandidates/includeArchived/includeSuperseded 与 IDF/RRF 分流', async () => {

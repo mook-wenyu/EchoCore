@@ -91,15 +91,30 @@ export function isSourceWellFormed(source: unknown): source is { sessionId: stri
 }
 
 /**
+ * 超限淘汰最旧 1/4（P1 缓存命中优化，2026-08-20 用户拍板）：
+ * 旧策略整体清空在库规模（~8882 条）超过上限（5000）时使缓存命中率归零——
+ * 每轮检索/维护都对全量条目重切 jieba（同步 CPU 浪费）。改为按 Map 插入序
+ * （即最旧优先）淘汰 ⌈MAX/4⌉ 条，保留 75% 热条目，摊销重建成本且上界不变。
+ */
+function evictOldestQuarter(cache: Map<string, Set<string>>): void {
+  const evictCount = Math.ceil(TOKEN_CACHE_MAX / 4)
+  let removed = 0
+  for (const key of cache.keys()) {
+    cache.delete(key)
+    if (++removed >= evictCount) break
+  }
+}
+
+/**
  * 取条目 token 集合（缓存命中直接返回；未命中则计算并缓存）。
- * 超限（≥ TOKEN_CACHE_MAX）时整体清空重建，防 10 万条规模无界常驻。
+ * 超限（≥ TOKEN_CACHE_MAX）时淘汰最旧 1/4（见 evictOldestQuarter），防无界常驻。
  */
 export function getCachedTokens(cache: Map<string, Set<string>>, entry: MemoryEntry): Set<string> {
   // 先查缓存，命中即返回零重建
   let tokens = cache.get(entry.id)
   if (tokens !== undefined) return tokens
-  // 未命中且超限：整体清空（下次检索全量重建，代价一次 vs 常驻 100MB）
-  if (cache.size >= TOKEN_CACHE_MAX) cache.clear()
+  // 未命中且超限：淘汰最旧四分位（保留热条目，非整体清空）
+  if (cache.size >= TOKEN_CACHE_MAX) evictOldestQuarter(cache)
   // 计算：content + tags 拼接后分词（与原 cachedTokens 等价）
   tokens = new Set(tokenize(`${entry.content} ${entry.tags.join(' ')}`))
   cache.set(entry.id, tokens)
