@@ -13,7 +13,7 @@
 
 - **审计结论**：生产环境可用。六项证据链（部署哈希/宿主启动时序/符号链接新 store/vec 迁移完成/数据活性/嵌入链实际工作）
 - **Q1=B 密钥延后（拍板）**：settings.yaml 为字面 sk-key（YAML 跨行折叠）——功能正常、明文落盘安全债保留；`env:BAILIAN_API_KEY` 用户级变量未设置，迁移脚本未执行。历史记忆"已迁 env:"与现状不符，以文件为准
-- **Q2=A CI 上线（拍板，push 已授权）**：`.github/workflows/ci.yml`（typecheck+test+coverage 门槛 80/75/80/70+docs 断链+markdownlint）随 master 推送 origin 生效
+- **Q2=A CI 上线（拍板，push 已授权）✅ 已生效**：`.github/workflows/ci.yml`（typecheck+test+coverage 门槛+docs 断链+markdownlint）随 master 推送 origin；首跑连修两处后 **success（57s）**——修复① pnpm 双版本声明冲突（action 改读 packageManager 单一事实源）② O3 墙钟基准在共享 runner 超时（6.4s>阈值），改 DSH_BENCH=1 门控（与 reflect-bench 同策略）；遗留警告：actions v4 目标 Node20 被强制 Node24（上游弃用通告，暂无碍）
 - **Q3=B 压测协议就绪**：`docs/COMPACTION_STRESS.md`——前置核验（modelPolicies 精确匹配陷阱）/触发步骤/六观察点 SQL/通过标准；待用户执行长会话投喂
 - 无代码接口契约变更（本轮纯审计+文档+推送）
 
@@ -27,6 +27,6 @@
 ## 四、下次最该做的事
 
 1. **执行压缩压测**：按 COMPACTION_STRESS.md 投喂专用会话至 400K，采集 O1-O4
-2. **核对 GitHub CI 首跑结果**（push 后 Actions 页）
-3. **数据面调优窗口**：injectStats/recallStats 积累一周后校准 MIN_SCORE/FOLD_JACCARD/原子化强度
-4. **密钥迁移**：随时可做（三步，见 R1）
+2. **数据面调优窗口**：injectStats/recallStats 积累一周后校准 MIN_SCORE/FOLD_JACCARD/原子化强度
+3. **密钥迁移**：随时可做（三步，见 R1）
+4. **CI 维护**：actions 升 v5 消 Node20 弃用警告（低优先）
