@@ -1,6 +1,6 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（"运行反思"四层根因全部修复：路由服务/inject 登记/失败可观测/max_tokens 截断；Playwright 实测端到端已通——审 60·选择器与 LLM 批次全链路工作）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（"运行反思"五层根因全部修复：路由/inject/可观测/截断拦截/推理预算；用户复测确认错误显形机制生效，待最终重启验证产出裁决）。
 
 ## 一、架构健康度
 
@@ -20,7 +20,7 @@
 ## 三、已知风险点（诚实自曝）
 
 1. 🔴 **明文密钥落盘（前轮拍板保留）**
-2. ✅ **"运行反思"四层根因全部修复（2026-08-22 Playwright 实测端到端打通）**：① getDefaultModel 改官方服务 ctx.agentDefaultModel（55d222a）；② inject 补登 agentDefaultModel——Cordis 守卫（ee4fc22）；③ 失败原因可观测 lastError 透传（6fd0241）；④ **零裁决根因=REFLECT_MAX_TOKENS 1024 截断**——每批 10 对裁决需 ~1.5-2K token，截断 JSON 解析为空静默呈现"裁0跳0"；修复=max-tokens finish 显式失败 + 上限 4096（6114e83）。实测轨迹：修正默认模型路由（opencode-new 未注册→opencode-go/mimo-v2.5）后 审60·裁0·跳0 → ④ 修复后待重启复跑预期产出真实裁决；agent-default-model 配置已同步修正
+2. 🟡 **"运行反思"五层根因修复，待最终重启复跑**：① 官方路由服务（55d222a）；② inject 补登（ee4fc22）；③ 失败可观测 lastError 透传（6fd0241）——**用户复测确认生效：面板显形真实错误**；④ max_tokens 截断拦截+上限 4096（6114e83）；⑤ 推理模型思考链计入输出预算——reasoningEffort='low' + 上限 8192（db6e5b0）。另有配置层修正：agent-default-model 原指向未注册 provider（opencode-new），已改为 opencode-go/mimo-v2.5。选择器已实证正常（离线复现 60 焦点全带 peer）
 3. 🟢 原子化条目增速观察 / meta 双键残留 / reject 偶发嵌入浪费 / 反思 LLM 保守判 none 的裁决质量需多轮观察
 
 ## 四、下次最该做的事
