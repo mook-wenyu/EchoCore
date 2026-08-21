@@ -16,7 +16,9 @@ import {
   MemoryReflector,
   PEER_MIN_JACCARD,
   PEER_MIN_TOKEN_OVERLAP,
+  REFLECT_BATCH_SIZE,
   REFLECT_CURSOR_KEY,
+  REFLECT_FOCUS_BUDGET,
   REFLECT_INTERVAL_MS,
   REFLECT_SEMANTIC_THRESHOLD,
   REFLECT_SEMANTIC_THRESHOLD_LOCAL,
@@ -264,14 +266,40 @@ describe('selectReflectionPairs', () => {
     expect(pairs[0]?.peers).toHaveLength(3)
   })
 
-  it('焦点预算受 REFLECT_FOCUS_BUDGET 上限约束（20）', async () => {
+  it('焦点预算受 REFLECT_FOCUS_BUDGET 上限约束（常量驱动，P2 后为 60）', async () => {
     // 调优后需 overlap≥2 才算候选，故用至少 2 个公共 token 的内容（word common）而非单 token "word"
     const entries: MemoryEntry[] = []
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < REFLECT_FOCUS_BUDGET + 5; i++) {
       entries.push(makeEntry({ id: `e${i}`, content: `word common token ${i} extra`, importance: i % 10 + 1 }))
     }
     const pairs = await selectReflectionPairs(entries)
-    expect(pairs).toHaveLength(20)
+    expect(pairs).toHaveLength(REFLECT_FOCUS_BUDGET)
+  })
+
+  it('P2 多批流水线：焦点按 REFLECT_BATCH_SIZE 切批，每批独立一次 LLM 调用且互不串批', async () => {
+    // 构造 12 对两两独立（对内带内相似、跨对零重合）的条目；与 duplicatePair 同理
+    // 每对两端互为带内 peer → 24 焦点 → 批次 10+10+4 = 3 次 LLM 调用
+    const entries: MemoryEntry[] = []
+    for (let i = 0; i < 12; i++) {
+      const topic = `topic${i}`
+      entries.push(makeEntry({ id: `pA${i}`, content: `${topic} alpha beta gamma`, importance: 5 }))
+      entries.push(makeEntry({ id: `pB${i}`, content: `${topic} alpha beta gamma delta`, importance: 4 }))
+    }
+    const { reflector, llm } = makeReflector(entries, '{"decisions":[]}')
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(summary?.reviewed).toBe(24)
+    // 24 焦点 → ⌈24/10⌉ = 3 批 → 恰好 3 次 LLM 调用，每批 ≤ REFLECT_BATCH_SIZE 个焦点
+    expect(llm.calls).toHaveLength(Math.ceil(24 / REFLECT_BATCH_SIZE))
+    const focusIdsPerCall = llm.calls.map((call) => {
+      const text = JSON.stringify(call)
+      return [...text.matchAll(/焦点 #(p[AB]\d+)/g)].map((m) => m[1]!)
+    })
+    // 批间不串：焦点 id 全局不相交，且合计覆盖全部 24 个焦点
+    const all = focusIdsPerCall.flat()
+    expect(new Set(all).size).toBe(24)
+    for (const ids of focusIdsPerCall) expect(ids.length).toBeLessThanOrEqual(REFLECT_BATCH_SIZE)
+    // 聚合观察量跨批累计（空裁决 JSON）
+    expect(summary?.decisions).toBe(0)
   })
 })
 

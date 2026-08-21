@@ -42,8 +42,19 @@ export const REFLECT_INTERVAL_MS = 6 * 3_600_000
  */
 export const REFLECT_WINDOW = 400
 
-/** 每批「焦点」条目数上限 */
-export const REFLECT_FOCUS_BUDGET = 20
+/**
+ * 每批「焦点」条目数上限。
+ * 2026-08-20 P2 拍板（完整多批流水线）：20→60——配合 REFLECT_BATCH_SIZE 分批送审，
+ * 单轮覆盖翻三倍；批内规模不变（每批 ≤10 焦点），单次 prompt 负载反而低于旧单批 20。
+ */
+export const REFLECT_FOCUS_BUDGET = 60
+
+/**
+ * P2 多批流水线：每批送审焦点数上限（每批独立一次 LLM 调用）。
+ * 依据：小批 prompt 让模型注意力集中在少量候选对上（旧单批 20 焦点×4 行/焦点
+ * 的长尾易被忽略）；批间串行执行，applyDecision 的 getById 重读保证跨批竞态安全。
+ */
+export const REFLECT_BATCH_SIZE = 10
 
 /** 每个焦点的候选对比条目数 */
 export const REFLECT_PEERS_PER_FOCUS = 3
@@ -654,11 +665,26 @@ export class MemoryReflector {
     }
     if (reviewed === 0) return summary
 
-    const text = renderReflectionText(pairs)
-    const decisions = await this.callLlm(route, text, reviewed)
-    summary.decisions = decisions.length
-    for (const decision of decisions) {
-      await this.applyDecision(decision, summary)
+    // P2 多批流水线（2026-08-20 用户拍板完整方案 B）：有 peer 的焦点按
+    // REFLECT_BATCH_SIZE 切批，每批独立一次 LLM 调用；批间串行——applyDecision
+    // 的 getById 重读保证前一批归档/合并后下一批看到最新状态（防重复动作）。
+    const batches: Array<Array<{ focus: MemoryEntry; peers: MemoryEntry[] }>> = []
+    for (const pair of pairs) {
+      if (pair.peers.length === 0) continue // 无对可审的孤焦点不入批（喂 LLM 纯浪费）
+      const last = batches[batches.length - 1]
+      if (last !== undefined && last.length < REFLECT_BATCH_SIZE) last.push(pair)
+      else batches.push([pair])
+    }
+    for (let bi = 0; bi < batches.length; bi++) {
+      const batch = batches[bi]!
+      const text = renderReflectionText(batch)
+      const decisions = await this.callLlm(route, text, batch.length)
+      summary.decisions += decisions.length
+      for (const decision of decisions) {
+        await this.applyDecision(decision, summary)
+      }
+      // 批次直方图日志（低成本可观测）：定位"哪一批 0 产出"（模型保守/提示词不足归因）
+      this.deps.logger.info(`[dsh-memory] 反思批次 ${bi + 1}/${batches.length}：焦点=${batch.length} 裁决=${decisions.length}`)
     }
     // 水位线推进（P1）：本轮窗口已审毕，游标 = 窗口最新条目；失败路径不会到达此处
     await this.advanceCursorToNewest(candidates)
