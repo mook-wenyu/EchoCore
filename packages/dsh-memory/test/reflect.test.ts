@@ -1055,9 +1055,9 @@ describe('P1 反思水位线（metaTable 注入）', () => {
     expect(metaTable.get(REFLECT_CURSOR_KEY)).toBeUndefined()
   })
 
-  it('常量钉住：REFLECT_MAX_TOKENS=32768（推理模型思考链不可控；mimo 上限 128K 的安全量级）+ BATCH_SIZE=10（用户拍板不降速）', () => {
+  it('常量钉住：REFLECT_MAX_TOKENS=32768（推理模型思考链不可控；mimo 上限 128K 的安全量级）+ BATCH_SIZE=8（用户拍板：速度与负载折中）', () => {
     expect(REFLECT_MAX_TOKENS).toBe(32768)
-    expect(REFLECT_BATCH_SIZE).toBe(10)
+    expect(REFLECT_BATCH_SIZE).toBe(8)
   })
 
   // Q-fix 第二层（2026-08-22 生产实测）：mimo-v2.5 High 推理档的 <think> 链计入输出
