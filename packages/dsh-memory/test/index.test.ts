@@ -131,8 +131,8 @@ async function cleanup(ctx: FakeCtx, dir: string): Promise<void> {
 }
 
 describe('插件组合根（index.ts）', () => {
-  it('inject 声明四服务硬依赖（存储自建 SQLite——不依赖 storageDomain）', () => {
-    expect(inject).toEqual(['llm', 'tools', 'connection', 'systemPrompt'])
+  it('inject 声明五服务硬依赖（存储自建 SQLite——不依赖 storageDomain）', () => {
+    expect(inject).toEqual(['llm', 'tools', 'connection', 'systemPrompt', 'agentDefaultModel'])
   })
 
   it('装配成功：监听注册、effect 收集 disposer（SQLite 打开不报错）', async () => {

@@ -57,4 +57,9 @@ describe('rpcContextFrom.getDefaultModel（agent-default-model 官方服务回�
     const lib = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf-8')
     expect(lib.includes("require('node:fs')")).toBe(false)
   })
+
+  it('回归钉住：插件 inject 声明必须含 agentDefaultModel（Cordis 守卫——漏登即抛 without inject）', async () => {
+    const mod = (await import('../src/index.js')) as { inject: string[] }
+    expect(mod.inject).toContain('agentDefaultModel')
+  })
 })

@@ -37,14 +37,17 @@ import { LlmFactory, memoryRuntime } from './runtime.js'
 import type { MemoryCausalEdge, MemoryEntry } from './types.js'
 
 export const name = 'memory'
-// 直接访问的服务必须全部声明注入（Cordis 守卫：未声明即拒绝）：
+// 直接访问的服务必须全部声明注入（Cordis 守卫：未声明即拒绝——2026-08-22 实证：
+// 漏登 agentDefaultModel 时属性访问抛 "cannot get property without inject"）：
 // - llm：提取/摘要调用（透传给提取器）
 // - tools：注册六个模型工具（registerMemoryTools 内 ctx.tools.register）
 // - connection：面板 RPC 通道（registerMemoryRpc 内 ctx.connection.rpc.handle）
 // - systemPrompt：稳定快照段注册（MemoryStableSnapshot 内 ctx.systemPrompt.context）
+// - agentDefaultModel：宿主默认模型回退源（getDefaultModel 经 currentSelection()
+//   解析"运行反思"路由；dsh-base 组合包注册，声明后 Cordis 保证先于本插件就绪）
 // 注：存储自建 SQLite（SqliteKvTable，node:sqlite）——不依赖宿主 storageDomain
 // （2026-08-15 结构性改造：整文件原子写 → WAL O(1) 写，见 sqlite-kv.ts）。
-export const inject = ['llm', 'tools', 'connection', 'systemPrompt']
+export const inject = ['llm', 'tools', 'connection', 'systemPrompt', 'agentDefaultModel']
 
 export function apply(ctx: Context, config: ConfigType): Promise<void> {
   const logger = ctx.logger('memory')
