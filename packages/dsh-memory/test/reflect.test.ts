@@ -302,6 +302,49 @@ describe('selectReflectionPairs', () => {
     // 聚合观察量跨批累计（空裁决 JSON）
     expect(summary?.decisions).toBe(0)
   })
+
+  // Q-fix（2026-08-22 反思质量实证）：系统模板条目（会话快照/会话摘要）词面相似度
+  // 虚高（实测 cos≥0.97 Top 对全是此类）但语义上是独立审计事实，不该送 LLM 审——
+  // 它们的归档已有专属自动链（snapshot Jaccard≥0.5 / summary 合并链）。
+  it('候选排除系统模板条目：snapshot/session-summary 标签不入窗口，普通相似对照常送审', async () => {
+    const entries = [
+      makeEntry({ id: 'tplA', content: '会话快照：会话 aaa 期间产生记忆 5 条', tags: ['insight', 'snapshot'] }),
+      makeEntry({ id: 'tplB', content: '会话快照：会话 bbb 期间产生记忆 7 条', tags: ['insight', 'snapshot'] }),
+      makeEntry({ id: 'sumA', content: '会话摘要：讨论了部署方案', tags: ['insight', 'session-summary'] }),
+      makeEntry({ id: 'sumB', content: '会话摘要：讨论了部署与回滚方案', tags: ['insight', 'session-summary'] }),
+      // 普通相似对（带内 Jaccard）
+      makeEntry({ id: 'realA', content: 'alpha beta gamma delta epsilon', importance: 5 }),
+      makeEntry({ id: 'realB', content: 'alpha beta gamma delta', importance: 4 }),
+    ]
+    const { reflector, llm } = makeReflector(entries, '{"decisions":[]}')
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    const focusText = JSON.stringify(llm.calls)
+    expect(focusText).not.toContain('#tpl')
+    expect(focusText).not.toContain('#sumA')
+    expect(summary?.reviewed).toBe(2) // 仅 realA/realB 普通对入选
+  })
+
+  it('skipped 原因细分：none 计 skipNone；无效 id 计 skipInvalid（幻觉归因可观测）', async () => {
+    const entries = [
+      makeEntry({ id: 'dupOld', content: 'alpha beta gamma delta epsilon', importance: 5, createdAt: new Date(NOW - MS_PER_DAY).toISOString() }),
+      makeEntry({ id: 'dupNew', content: 'alpha beta gamma delta', importance: 4 }),
+    ]
+    // 裁决含三类：合法 none、合法 merge（真实条目）、幻觉 id（不在库中）
+    const json = JSON.stringify({
+      decisions: [
+        { focusId: 'dupNew', peerId: 'dupOld', action: 'none', reason: '模型保守判无动作' },
+        { focusId: 'ghostX', peerId: 'dupNew', action: 'merge', reason: '幻觉条目应计 skipInvalid' },
+        { focusId: 'dupNew', peerId: 'dupOld', action: 'merge', reason: '真实合并' },
+      ],
+    })
+    const { reflector } = makeReflector(entries, json)
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(summary?.decisions).toBe(3)
+    expect(summary?.skipped).toBe(2)
+    expect(summary?.skipNone).toBe(1)
+    expect(summary?.skipInvalid).toBe(1)
+    expect(summary?.merged).toBe(1)
+  })
 })
 
 describe('阈值调优：语义阈值按维度区分（384→0.72, 1024→0.75）', () => {
@@ -456,7 +499,7 @@ describe('MemoryReflector.runOnce', () => {
     )
     const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
 
-    expect(summary).toEqual({ reviewed: 2, decisions: 1, merged: 0, archived: 0, skipped: 1 })
+    expect(summary).toEqual({ reviewed: 2, decisions: 1, merged: 0, archived: 0, skipped: 1, skipNone: 1 })
     expect(store.getById('older01')?.status).toBe('active')
     expect(store.getById('newer01')?.status).toBe('active')
   })
@@ -469,7 +512,7 @@ describe('MemoryReflector.runOnce', () => {
       '{"decisions":[{"focusId":"missing","peerId":"newer01","action":"merge","reason":"x"}]}',
     )
     const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
-    expect(summary).toEqual({ reviewed: 2, decisions: 1, merged: 0, archived: 0, skipped: 1 })
+    expect(summary).toEqual({ reviewed: 2, decisions: 1, merged: 0, archived: 0, skipped: 1, skipInvalid: 1 })
     // 两条真实条目都未被误动
     expect(store.getById('older01')?.status).toBe('active')
     expect(store.getById('newer01')?.status).toBe('active')

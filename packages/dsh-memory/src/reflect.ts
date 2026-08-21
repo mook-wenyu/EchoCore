@@ -174,6 +174,15 @@ export interface ReflectionSummary {
   /** none 或拒绝执行（已归档/被覆盖/跨域等）数量 */
   skipped: number
   /**
+   * Q-fix（2026-08-22 反思质量实证）：跳过原因细分——"合理吗"不能靠总数猜。
+   * skipNone=模型判无动作（含模型保守漏杀的正确/错误无法在此区分）；
+   * skipInvalid=裁决引用的条目缺失/非 active/跨 workspace（LLM id 幻觉信号）；
+   * skipSuperseded=条目已被覆盖（批间竞态正常防护）。
+   */
+  skipNone?: number
+  skipInvalid?: number
+  skipSuperseded?: number
+  /**
    * 可观测：语义向量覆盖率（0..1），用于度量"向量覆盖仅 21.8% 双侧命中 p²≈3.5% 导致救援失效"
    * 计算 = 候选窗口内有向量条目数 / 窗口总条目数；无 embedding 时 undefined。
    * 低成本可观测，不引入直方图日志的额外复杂度亦可（此处同时在 runReflection 中 info 日志）。
@@ -637,7 +646,14 @@ export class MemoryReflector {
     route: { provider: string; model: string },
     opts?: { focusNewerThan?: { createdAt: string; id: string } | null },
   ): Promise<ReflectionSummary> {
-    const candidates = this.deps.store.listRecent(REFLECT_WINDOW, 'active')
+    // Q-fix（2026-08-22 反思质量实证）：排除系统模板条目（会话快照/会话摘要）——
+    // 它们内容结构雷同（"会话快照：会话 xxx…"）导致词面/向量相似度虚高（实测
+    // cos≥0.97 的 Top 对全是此类），但语义上各自是独立审计事实，本就不该互相合并；
+    // 且已有专属自动链（snapshot.ts Jaccard≥0.5 归档旧摘要）无需 LLM 参与。送审
+    // 它们既浪费名额又制造噪声对，诱导模型大量 none（实测 裁174 中跳172）。
+    const candidates = this.deps.store
+      .listRecent(REFLECT_WINDOW, 'active')
+      .filter((entry) => !entry.tags.includes('session-summary') && !entry.tags.includes('snapshot'))
     // hot-swap 守卫：优先用 getter（延迟读 holder.index），回退静态 embedding
     const embeddingIndex = this.deps.getEmbeddingIndex?.() ?? this.deps.embedding
     // 水位线增量：计算焦点资格集（严格新于游标）；空集 ⇒ 无焦点 ⇒ 自然走零 LLM 快路径
@@ -780,22 +796,27 @@ export class MemoryReflector {
     const peer = this.deps.store.getById(decision.peerId)
     if (focus === undefined || peer === undefined) {
       summary.skipped++
+      summary.skipInvalid = (summary.skipInvalid ?? 0) + 1
       return
     }
     if (focus.status !== 'active' || peer.status !== 'active') {
       summary.skipped++
+      summary.skipInvalid = (summary.skipInvalid ?? 0) + 1
       return
     }
     if (focus.supersededBy !== undefined || peer.supersededBy !== undefined) {
       summary.skipped++
+      summary.skipSuperseded = (summary.skipSuperseded ?? 0) + 1
       return
     }
     if (focus.workspace !== peer.workspace) {
       summary.skipped++
+      summary.skipInvalid = (summary.skipInvalid ?? 0) + 1
       return
     }
     if (decision.action === 'none') {
       summary.skipped++
+      summary.skipNone = (summary.skipNone ?? 0) + 1
       return
     }
     const newer = newerOf(focus, peer)
