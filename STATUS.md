@@ -1,32 +1,31 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（压缩压测实测通过——生产自然触发，主链路全过；CI 首绿；生产可用性审计完成）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（修复面板"运行反思"恒报无可用模型路由——路由回退改用官方 ctx.agentDefaultModel 服务；待宿主重启生效）。
 
 ## 一、架构健康度
 
-- 模块总数：28 源模块 + client 面板 + docs 三页（CACHE_HIT/COMPACTION_STRESS/COMPACTION）；无新增代码模块
-- 依赖方向：`index.ts`（组合根）→ 各模块，无环；**vec2_memory_2560 已在生产运行（旧表已清理，向量 2116 行持续增长）**
-- 单元测试 **641 个全绿** + typecheck 干净；**GitHub CI 首绿（57s success）**
-- **生产可用性实证（2026-08-22）**：部署哈希一致 / 宿主 00:18:58 启动晚于部署 → 新代码运行中；entries 9154 条活性写入；因果边 6 条
-- **压缩链路实证（2026-08-22）**：生产会话自然触发压缩（352 条/~127K tokens），摘要登记/提取通道/滞回带全部按设计工作
+- 模块总数：28 源模块 + client 面板 + docs 三页；无新增代码模块
+- 依赖方向：`index.ts`（组合根）→ 各模块，无环
+- 单元测试 **640 全绿 / 10 门控跳过**（DSH_BENCH×2 组）+ typecheck 干净；GitHub CI 随 push 验证
+- 生产：新代码链路已验证（vec2 迁移/压缩触发/观测面），本轮修复待重启生效
 
-## 二、本次变更影响范围（压测执行 + CI 上线）
+## 二、本次变更影响范围（"运行反思"无可用路由根因修复）
 
-- **Q3=B 压缩压测 ✅ 实测通过（免人工投喂）**：生产长会话自然越过 400K 触发压缩——O1 压缩事件/GUI 横幅、O2 摘要登记（session-summary @15:55 与会话 32dc8778 吻合）、O3 通道 A 提取（当日 extractor 新增 50 条）、O5/O6 无感体验（缓存命中 98%、压后占用 25%≈TARGET 同量级）全部通过；O4 归档链未达 Jaccard 阈值属预期语义。详见 COMPACTION_STRESS.md §4 实测记录
-- **附带发现（低危观察项）**：① meta 表 `lastCursor`/`meta:lastCursor` 双键并存（维护游标新旧命名残留双写）；② `meta:reflectCursor` 未初始化（水位线特性上线后尚无自动轮）
-- **Q2=A CI 上线 ✅ 已生效**：首跑连修两处后 success（57s）——修复① pnpm 双版本声明冲突（action 改读 packageManager 单一事实源）② O3 墙钟基准共享 runner 超时改 DSH_BENCH=1 门控；遗留警告：actions v4 目标 Node20 被强制 Node24（上游弃用通告，暂无碍）
-- **Q1=B 密钥延后（拍板保留）**：settings.yaml 字面 sk-key，功能正常、明文落盘安全债保留
-- 无代码接口契约变更（本轮纯验证+文档+推送）
+**根因（双层全错，源码级实证）**：`getDefaultModel` 旧实现两路皆废——① 猜测 `ctx.get('settings').get('agent-default-model')` 契约不存在；② ESM 产物里调 CJS `require('node:fs')` 读 YAML，ReferenceError 被空 `catch {}` 静默吞掉 → 恒返回 undefined → 面板点击"运行反思"恒报"无可用模型路由"。settings.yaml 中数据一直存在（opencode-new/x-preview-f-free）。
+
+**修复（55d222a）**：改用官方契约 `ctx.agentDefaultModel.currentSelection()`——dsh-base 组合包注册的共享 Cordis 服务（apiproxy/headless 同款消费），返回叠加 settings.yaml 用户层后的选择。删除猜测性 YAML 手写解析兜底（ESM 下必死）；服务未挂载诚实返回 undefined；服务抛错向 RPC 边界传播（禁静默兜底）。新增 test/default-model.test.ts 四用例含**产物级回归钉住**（构建产物中不得再现 require 兜底字面量）。
+
+**接口契约变更**：rpcContextFrom 导出（供单测）；defaultModel 回退链行为变更（从恒空→正确解析宿主默认模型）。
 
 ## 三、已知风险点（诚实自曝）
 
-1. 🔴 **明文密钥落盘（拍板保留）**：settings.yaml 字面 sk-key；泄露面=本机文件读取；迁移三步随时可做
-2. 🟡 **原子化 v1.2 条目增速**：entries 9154 持续增长，粒度效果需 injectStats/recallStats 数据积累复核
-3. 🟢 meta 双键残留（低危：值相同无行为差异，可在下轮清理为单键）/ 反思水位线未初始化（等首个维护周期）/ reject 步骤偶发嵌入浪费 / 缓存命中率宿主不可观测
+1. 🔴 **明文密钥落盘（前轮拍板保留）**
+2. 🟡 **修复待重启生效**：运行中宿主仍是旧码——重启后点"运行反思"应正常执行（路由=opencode-new/x-preview-f-free）
+3. 🟢 原子化条目增速观察 / meta 双键残留 / reflectCursor 未初始化（等首个维护周期）/ reject 偶发嵌入浪费
 
 ## 四、下次最该做的事
 
-1. **数据面调优窗口**：injectStats/recallStats 积累一周后校准 MIN_SCORE/FOLD_JACCARD/原子化强度三参数
-2. **观察反思水位线首轮**：下个维护周期后核对 `meta:reflectCursor` 出现与 LLM 调用收缩
-3. **密钥迁移**：随时可做（三步，见 R1）
-4. **CI 维护**：actions 升 v5 消 Node20 弃用警告（低优先）；meta 双键清理可并入下次代码变更
+1. **重启 DSH 并复点"运行反思"**：预期正常执行（不再报无可用路由）；水位线首启后 meta 应出现 reflectCursor
+2. **数据面调优窗口**：injectStats/recallStats 积累一周后校准三参数
+3. **密钥迁移**：随时可做
+4. **CI 维护**：actions 升 v5 消 Node20 弃用警告（低优先）
