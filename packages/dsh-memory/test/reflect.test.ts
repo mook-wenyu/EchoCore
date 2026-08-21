@@ -1027,16 +1027,37 @@ describe('P1 反思水位线（metaTable 注入）', () => {
 
   // Q-fix（2026-08-22 生产实测）：max-tokens 截断曾静默放行——输出 JSON 断裂被解析为
   // 空数组，面板呈现"审 N·裁 0"且无任何失败痕迹（生产 6 批全零裁决根因）。
-  it('max-tokens 截断 → 显式失败：runOnce undefined + lastError 可观测 + 游标不动', async () => {
-    const { reflector, metaTable } = makeWatermarkReflector(watermarkEntries(), '{"decisions":[{"focusId":"a"', 'max-tokens')
+  it('max-tokens 截断 → 显式失败：错误附 usage 诊断（思考/输出占比可归因）+ 游标不动', async () => {
+    const db = new DatabaseSync(':memory:')
+    const metaTable = new SqliteKvTable<string, string>(db, 'meta')
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => NOW)
+    for (const entry of watermarkEntries()) void table.put(entry.id, entry)
+    const chunks: StreamChunk[] = [
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: '{"decisions":[{"focusId":"a"' },
+      { type: 'usage', usage: { inputTokens: 1200, outputTokens: 8192, reasoningTokens: 7600 } },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ] as StreamChunk[]
+    const llm = new FakeLlm(chunks)
+    const reflector = new MemoryReflector({
+      store,
+      llm: llm as never,
+      logger: { warn: () => {}, info: () => {} },
+      now: () => NOW,
+      metaTable,
+    })
     const result = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
     expect(result).toBeUndefined()
     expect(reflector.lastError).toContain('max_tokens')
+    expect(reflector.lastError).toContain('8192 tok')
+    expect(reflector.lastError).toContain('7600 tok')
     expect(metaTable.get(REFLECT_CURSOR_KEY)).toBeUndefined()
   })
 
-  it('常量钉住：REFLECT_MAX_TOKENS=8192（推理模型思考链计入输出预算，4096 仍被 mimo-high 吃满）', () => {
-    expect(REFLECT_MAX_TOKENS).toBe(8192)
+  it('常量钉住：REFLECT_MAX_TOKENS=32768（推理模型思考链不可控；mimo 上限 128K 的安全量级）+ BATCH_SIZE=10（用户拍板不降速）', () => {
+    expect(REFLECT_MAX_TOKENS).toBe(32768)
+    expect(REFLECT_BATCH_SIZE).toBe(10)
   })
 
   // Q-fix 第二层（2026-08-22 生产实测）：mimo-v2.5 High 推理档的 <think> 链计入输出

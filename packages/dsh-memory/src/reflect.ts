@@ -53,11 +53,10 @@ export const REFLECT_FOCUS_BUDGET = 60
  * P2 多批流水线：每批送审焦点数上限（每批独立一次 LLM 调用）。
  * 依据：小批 prompt 让模型注意力集中在少量候选对上（旧单批 20 焦点×4 行/焦点
  * 的长尾易被忽略）；批间串行执行，applyDecision 的 getById 重读保证跨批竞态安全。
- * Q-fix（2026-08-22 生产实测两轮截断）：10→4——推理模型（mimo High）思考链计入
- * 输出预算且长度不可控，4 对裁决 ~600-800 tok + 思考在 8192 内余量充足；
- * 批数增多换每次调用的确定性成功（失败重试粒度也更小）。
+ * 2026-08-22 用户拍板：恢复 10（4 太慢）——截断问题由输出预算侧解决
+ * （REFLECT_MAX_TOKENS=32768 + reasoningEffort='low'），不再压缩批规模。
  */
-export const REFLECT_BATCH_SIZE = 4
+export const REFLECT_BATCH_SIZE = 10
 
 /** 每个焦点的候选对比条目数 */
 export const REFLECT_PEERS_PER_FOCUS = 3
@@ -115,12 +114,12 @@ export function adjustThresholdByHitRate(hitRate: number): number {
 /** LLM 输出上限 */
 /**
  * 单批 LLM 输出 token 上限。
- * Q-fix 两轮（2026-08-22 生产实测）：① 1024 < 每批 10 对裁决所需 ~1.5-2K，截断
- * 静默零裁决；② 提至 4096 仍截断——mimo-v2.5 High 推理档的 <think> 链计入输出
- * 预算，10 对逐对深思即耗尽数千 token。8192 + 调用级 reasoningEffort='low'
- * （见 callLlm）双保险；推理模型思考长度不可控，此值为兜底上限而非精确预算。
+ * Q-fix 演进（2026-08-22 生产三轮实测）：1024/4096/8192 均被截断——mimo-v2.5
+ * High 推理档思考链计入输出预算且长度不可控（reasoningEffort='low' 见 callLlm，
+ * 若模型能力集接受则大幅省预算）。终值 32768：mimo 模型声明上限 128000 的 1/4，
+ * 思考链再长也在量级安全区；maxTokens 只是上限不预扣费，实际按生成计。
  */
-export const REFLECT_MAX_TOKENS = 8192
+export const REFLECT_MAX_TOKENS = 32768
 
 /**
  * peer 相似带下界：低于此值语义关联太弱，交由纯函数时剔除
@@ -743,7 +742,13 @@ export class MemoryReflector {
       throw new Error(`反思调用未正常完成（${finishKind} finish）`)
     }
     if (finishKind === 'max-tokens') {
-      throw new Error('反思调用因 max_tokens 截断——输出不完整已丢弃（批次对数过多或 REFLECT_MAX_TOKENS 不足）')
+      // Q-fix（2026-08-22 用户三轮复测）：截断必须带 usage 诊断——思考链 vs 可见
+      // 输出的占比是归因关键（reasoningTokens 高 → 模型档位问题；output 高 → 批次过大）
+      const usage = assembler.usage
+      const detail = usage === undefined
+        ? '（无 usage 数据）'
+        : `输出 ${usage.outputTokens} tok${usage.reasoningTokens !== undefined ? `（其中思考 ${usage.reasoningTokens} tok）` : ''}`
+      throw new Error(`反思调用因 max_tokens 截断——${detail}。若思考占比高：为反思路由换非推理模型，或在记忆面板 llm 配置指定轻量模型`)
     }
     const textOut = assembler
       .blocks()
