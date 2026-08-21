@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
+import { EXTRACTION_PROMPT_VERSION } from '../src/constants.js'
 import {
   EXTRACTION_SYSTEM_PROMPT,
   parseExtractionOutput,
@@ -156,6 +157,17 @@ describe('EXTRACTION_SYSTEM_PROMPT 提取规则（O1-1 腐化防线）', () => {
     expect(EXTRACTION_SYSTEM_PROMPT).toContain('更新')
     expect(EXTRACTION_SYSTEM_PROMPT).toContain('推翻')
     expect(EXTRACTION_SYSTEM_PROMPT).toContain('新状态')
+  })
+
+  it('Q4=A 原子化 v1.2：一条记忆=一个原子事实，复合陈述必须拆分（Mem0/A-MEM 原子事实实践）', () => {
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('原子')
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('拆分')
+    // 与规则 4 的边界显式化：去重合并优先于拆分（防规则自相矛盾）
+    expect(EXTRACTION_SYSTEM_PROMPT).toContain('重复信息合并')
+  })
+
+  it('版本号随原子化规则升级 v1.2（提示词变更可追踪）', () => {
+    expect(EXTRACTION_PROMPT_VERSION).toBe('v1.2')
   })
 })
 
