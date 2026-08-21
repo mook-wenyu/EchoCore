@@ -23,11 +23,10 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # 2. 安装/缓存 pnpm（v4 action 会读取 packageManager 字段并缓存 pnpm）
+      # 2. 安装/缓存 pnpm（v4 action 读取 package.json 的 packageManager 字段——
+      #    单一事实源；此前显式 version:11 与 packageManager 双声明冲突致 CI 早夭）
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 11
 
       # 3. 安装 Node 22，并配置 pnpm 依赖缓存（cache: 'pnpm' 复用 store 加速安装）
       - name: 设置 Node.js
