@@ -223,6 +223,26 @@ describe('memory RPC 端点', () => {
     const value = result.value as { embeddingDegradedReason?: string }
     expect(value.embeddingDegradedReason).toContain('维度')
   })
+
+  it('status：Q5=A 注入观测计数透出（runtime 直传；未接线 null）', async () => {
+    const { store, handler } = setup()
+    // 未接线 → null（lossless-JSON 纪律：不得 undefined）
+    const bare = await handler('status', null)
+    expect(bare.ok).toBe(true)
+    if (!bare.ok) return
+    expect((bare.value as { injectStats?: unknown }).injectStats).toBeNull()
+    // runtime 注入计数对象 → 原样透出
+    const stats = { steps: 3, injectedPacks: 2, injectedEntries: 5, dedupSkipped: 1, snapshotSkipped: 0, foldedDuplicates: 1, budgetSkipped: 0, searchMs: 12.5 }
+    const withRuntime = createMemoryRpcHandler(store, {
+      config: () => ({ ...DEFAULTS }) as ResolvedConfig,
+      settings: { update: async () => {} },
+      applyChange: async () => {},
+    }, { writeFailures: 0, embeddingState: 'ready', lastMaintenanceAt: null, injectStats: stats })
+    const result = await withRuntime('status', null)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect((result.value as { injectStats?: unknown }).injectStats).toEqual(stats)
+  })
 })
 
 describe('memory RPC 载荷校验', () => {

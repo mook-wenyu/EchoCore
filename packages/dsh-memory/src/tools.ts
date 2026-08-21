@@ -19,6 +19,7 @@ import { resolveRoute } from './extract.js'
 import { searchWithSemantic, type EmbeddingHolder } from './embedding.js'
 import type { CausalSummary } from './causal.js'
 import { formatMemoryLine } from './render.js'
+import type { InjectorStats } from './injector.js'
 import type { ReflectionCumulative, ReflectionSummary } from './reflect.js'
 import type { MemoryStableSnapshot } from './stable-snapshot.js'
 import type { MemoryStore } from './store.js'
@@ -74,6 +75,8 @@ export interface RuntimeHealth {
   lastCausalAt?: string | null
   /** LLM 单一信任源可观测（memory_status 暴露 llm.model/configHash） */
   llm?: { model: string; configHash: string; provider?: string; api_base?: string; temperature?: number }
+  /** Q5=A 注入链路观测计数（进程内累计；未接线 null——lossless-JSON 纪律） */
+  injectStats?: InjectorStats | null
 }
 
 /** 记忆条目的最小规范形态（工具输出与 RPC 共用） */
@@ -759,6 +762,8 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
             // LLM 单一信任源可观测（memory_status 暴露 llm.model/configHash）
             llm: { type: 'json', required: true },
             configHash: { type: 'json', required: true },
+            // Q5=A：注入链路观测计数（null = 未接线；json 承载对象或 null）
+            injectStats: { type: 'json', required: true },
           },
           additionalProperties: false,
         },
@@ -789,6 +794,12 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
               }`,
               // LLM 单一信任源可观测（中文注释）
               `LLM：${(value.llm as unknown as { model?: string })?.model ?? '未配置'} · 配置哈希 ${(value.configHash as unknown as string) ?? (value.llm as unknown as { configHash?: string })?.configHash ?? '—'}`,
+              // Q5=A：注入链路观测（调优数据面——步/包/条/去重跳过/折叠/预算截断/检索耗时）
+              ...(value.injectStats
+                ? [
+                    `注入观测：步 ${(value.injectStats as unknown as InjectorStats).steps} · 包 ${(value.injectStats as unknown as InjectorStats).injectedPacks} · 条 ${(value.injectStats as unknown as InjectorStats).injectedEntries} · 去重跳过 ${((value.injectStats as unknown as InjectorStats).dedupSkipped + (value.injectStats as unknown as InjectorStats).snapshotSkipped)} · 折叠 ${(value.injectStats as unknown as InjectorStats).foldedDuplicates} · 预算截断 ${(value.injectStats as unknown as InjectorStats).budgetSkipped} · 检索累计 ${Math.round((value.injectStats as unknown as InjectorStats).searchMs)}ms`,
+                  ]
+                : []),
             ].join('\n'),
           },
         ],
@@ -837,6 +848,8 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
           lastCausalAt: runtime?.lastCausalAt ?? null,
           llm: (llm ?? null) as unknown as JsonValue,
           configHash: (topHash ?? null) as unknown as JsonValue,
+          // Q5=A：注入链路观测计数（json 承载对象或 null——未接线/测试占位）
+          injectStats: (runtime?.injectStats ?? null) as JsonValue,
         }
       },
     }),

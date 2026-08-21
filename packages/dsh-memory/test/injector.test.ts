@@ -554,6 +554,23 @@ describe('MemoryInjector 注入冗余折叠（Q4=A）', () => {
     const injected = decision.messages[decision.messages.length - 1]
     return (injected?.content ?? []).find((block) => block.type === 'text')?.text ?? ''
   }
+
+  it('Q5=A 观测计数：步/包/条/折叠计数随注入行为累加（getter 返回浅拷贝）', async () => {
+    const { preStep, store, injector } = setup()
+    // 关键词路径夹具（与折叠测试同款）：A/B 近重复对 j≈0.667∈(0.6,0.7)，每步折叠 1 条
+    await seed(store, { content: longContent('pnpm workspace alpha beta gamma delta epsi va1 va2'), importance: 9 })
+    await seed(store, { content: longContent('pnpm workspace alpha beta gamma delta epsi vb1 vb2'), importance: 5 })
+    await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision())
+    await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision())
+    const stats = injector.stats
+    expect(stats.steps).toBe(2)
+    expect(stats.injectedPacks).toBe(2)
+    expect(stats.injectedEntries).toBeGreaterThanOrEqual(2)
+    expect(stats.foldedDuplicates).toBe(2) // 每步各折叠 1 条次分变体
+    // 浅拷贝：外部改写不影响内部累计
+    stats.steps = 999
+    expect(injector.stats.steps).toBe(2)
+  })
 })
 
 // P3（2026-08-16 会话上下文派生查询）：近期消息主题词参与召回（openclaw 轻量近似）

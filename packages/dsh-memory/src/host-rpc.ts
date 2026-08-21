@@ -119,6 +119,8 @@ export function createMemoryRpcHandler(
           reflectionCumulative: runtime?.reflectionCumulative ?? null,
           causal: runtime?.causal ?? null,
           lastCausalAt: runtime?.lastCausalAt ?? null,
+          // Q5=A：注入链路观测计数（面板调优数据面；未接线 null）
+          injectStats: runtime?.injectStats ?? null,
         })
       }
       if (endpoint === 'getConfig') return ok({ config: configView(rpc.config()) })

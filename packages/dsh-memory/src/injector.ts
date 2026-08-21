@@ -93,6 +93,30 @@ interface QueryVectorCacheEntry {
   expiresAt: number
 }
 
+/**
+ * Q5=A 注入链路观测计数（2026-08-20 拍板；进程内累计，重启归零）。
+ * 经 host-rpc status / 面板透出，为预算、阈值、折叠阈值的后续调优提供数据面
+ * （此前调优全凭猜）。全数值字段——遵守宿主 lossless-JSON 纪律（不得含 undefined）。
+ */
+export interface InjectorStats {
+  /** pre-step 步数（批次含用户文本才计） */
+  steps: number
+  /** 实际追加注入包次数（渲染非空） */
+  injectedPacks: number
+  /** 注入记忆条数（渲染进包的行数） */
+  injectedEntries: number
+  /** 表层去重跳过条数（已注入且未被压缩遮蔽） */
+  dedupSkipped: number
+  /** 快照去重跳过条数（稳定快照已含） */
+  snapshotSkipped: number
+  /** Q4=A 冗余折叠条数（同主题变体只留最高分） */
+  foldedDuplicates: number
+  /** 预算截断跳过条数（进目录兜底的部分） */
+  budgetSkipped: number
+  /** 检索累计耗时 ms（含语义嵌入与融合评分） */
+  searchMs: number
+}
+
 /** 注入器依赖（store 可注入，便于单测） */
 export interface InjectorDeps {
   store: MemoryStore
@@ -124,8 +148,24 @@ export class MemoryInjector {
   private readonly recentQueries = new Map<string, string[]>()
   /** Q2=B：查询向量 LRU（相同查询文本 TTL 内零嵌入；服务热换按身份失效） */
   private readonly queryVectorCache = new Map<string, QueryVectorCacheEntry>()
+  /** Q5=A：观测计数（进程内累计；getter 返回浅拷贝防外部改写） */
+  private readonly statsValue: InjectorStats = {
+    steps: 0,
+    injectedPacks: 0,
+    injectedEntries: 0,
+    dedupSkipped: 0,
+    snapshotSkipped: 0,
+    foldedDuplicates: 0,
+    budgetSkipped: 0,
+    searchMs: 0,
+  }
 
   constructor(private readonly deps: InjectorDeps) {}
+
+  /** 注入链路观测计数（浅拷贝；进程内累计，重启归零） */
+  get stats(): InjectorStats {
+    return { ...this.statsValue }
+  }
 
   /** P3/Q2=B 步内查询文本：当前消息 + 近期窗口（各截断防稀释；两处调用点共用同一拼装） */
   private buildStepQuery(session: Session, current: string): string {
@@ -208,6 +248,8 @@ export class MemoryInjector {
     const decision = await next()
     if (decision.kind !== 'enter' || decision.messages.length === 0) return decision
     if (current.trim() === '') return decision
+    // Q5=A：有效步计数（批次含用户文本）
+    this.statsValue.steps++
 
     const session = payload.agent.session
     const workspace = session.header.cwd ?? DEFAULT_WORKSPACE
@@ -236,6 +278,7 @@ export class MemoryInjector {
     // `search(options): T[]`），可选 withScore 走重载 0 → T=MemoryEntry；运行时
     // 实际走 store.search 重载 1（withScore: true）返回带分数组——断言只收窄
     // 类型不改变行为。
+    const searchStart = performance.now()
     const candidates = (await searchWithSemantic(
       this.deps.store,
       this.deps.embedding?.service,
@@ -245,14 +288,24 @@ export class MemoryInjector {
       (message, error) => this.deps.logger.warn(message, error),
       prefetched,
     )) as unknown as Array<{ entry: MemoryEntry; score: number; relevance: number }>
-    const fresh = candidates.filter(
-      (item) =>
+    // Q5=A：检索耗时累计（含语义嵌入等待与融合评分）
+    this.statsValue.searchMs += performance.now() - searchStart
+    // 双层去重（Q5=A 起分原因计数）：表层未压缩去重 + 快照已含去重
+    const fresh: typeof candidates = []
+    for (const item of candidates) {
+      if (this.isCurrentlyInjected(payload.agent.id, item.entry.id)) {
         // 表层去重：已注入且未被压缩遮蔽的不再注入
-        !this.isCurrentlyInjected(payload.agent.id, item.entry.id) &&
+        this.statsValue.dedupSkipped++
+        continue
+      }
+      if (this.deps.snapshot.snapshotIds(workspace).has(item.entry.id)) {
         // P2 快照去重：稳定快照已含的记忆不再进实时包（避免同一记忆
         // 同时出现在 system 快照段与实时包，重复占预算）
-        !this.deps.snapshot.snapshotIds(workspace).has(item.entry.id),
-    )
+        this.statsValue.snapshotSkipped++
+        continue
+      }
+      fresh.push(item)
+    }
     if (fresh.length === 0) return decision
 
     // Q4=A 冗余折叠（2026-08-20 拍板）：fresh 已按排序分降序——与任一已保留条目
@@ -262,6 +315,7 @@ export class MemoryInjector {
     for (const item of fresh) {
       const isNearDuplicate = deduped.some((kept) => this.deps.store.tokenJaccard(kept.entry, item.entry) > INJECT_FOLD_JACCARD)
       if (!isNearDuplicate) deduped.push(item)
+      else this.statsValue.foldedDuplicates++
     }
 
     // P1 三档渲染（Q1=A 解耦后语义）：relevance ≥0.7（双榜印证）完整行；
@@ -289,6 +343,10 @@ export class MemoryInjector {
       (skipped) => `…另有 ${skipped} 条相关记忆未展示（可用 memory_recall 查看）`,
     )
     if (pack === undefined) return decision
+    // Q5=A：包级计数（注入包次/条数/预算截断数）
+    this.statsValue.injectedPacks++
+    this.statsValue.injectedEntries += pack.renderedIds.length
+    this.statsValue.budgetSkipped += lines.length - pack.renderedIds.length
 
     // N2（目录注入）：renderBudgetedPack 预算截断跳过的条目对模型不可见（模型
     // 无从发现"还有 N 条相关记忆"的细节——known-information forgetting 根因）。

@@ -373,8 +373,10 @@ export async function mountMemory(
     now: () => Date.now(),
   })
   snapshotService.install(ctx)
-  // embedding 传 holder（调用时读 service/index——面板保存热换后即生效，无需重启）
-  new MemoryInjector({ store, snapshot: snapshotService, embedding: holder, logger }).install(ctx)
+  // embedding 传 holder（调用时读 service/index——面板保存热换后即生效，无需重启）。
+  // 保留引用：runtime.injectStats 经此读取注入观测计数（Q5=A）
+  const injector = new MemoryInjector({ store, snapshot: snapshotService, embedding: holder, logger })
+  injector.install(ctx)
 
   // LLM 子任务（自进化/因果链）：复用 ctx.llm（与提取器同通道）。维护周期每批
   // 规则任务后按各自周期门控自动执行；工具/RPC 可 force 手动触发。
@@ -447,6 +449,10 @@ export async function mountMemory(
     },
     get causalCumulative() {
       return (causalExtractor as { cumulativeSummary?: unknown }).cumulativeSummary ?? null
+    },
+    // Q5=A：注入链路观测计数（步/包/条/去重跳过/折叠/预算截断/检索耗时——调优数据面）
+    get injectStats() {
+      return injector.stats
     },
     // LLM 单一信任源可观测（memory_status 暴露 llm.model/configHash，中文注释）
     get llm() {
