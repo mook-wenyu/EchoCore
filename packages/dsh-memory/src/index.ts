@@ -353,6 +353,8 @@ export async function mountMemory(
         holder.index?.remove(id)
         void causalStore.removeEdgesFor(id).catch((error: unknown) => logger.warn(`[dsh-memory] 覆盖关联因果边清理失败（${id}）：`, error))
       },
+      // WP-F：访问追踪回写失败统一走插件 logger（替代 search 层裸 console.warn）
+      onAccessWriteError: (error: unknown) => logger.warn('[dsh-memory] 访问追踪回写失败：', error),
     },
   ))
   // 1b：test seam（装配完成后把 store 句柄交给调用方；运行期不传则无作用）

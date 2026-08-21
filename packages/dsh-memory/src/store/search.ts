@@ -318,7 +318,10 @@ export function sortScored(scored: Array<{ entry: MemoryEntry; score: number }>)
 
 /**
  * 访问追踪节流回写：同会话+记忆 60s 内至多落盘一次，避免高频检索反复写盘。
- * 异步 fire-and-forget，失败仅 warn，不影响检索结果与主流程。
+ * 异步 fire-and-forget，失败仅经 onError 上报（缺省 console——生产装配层注入
+ * 插件 logger），不影响检索结果与主流程。
+ * 节流表超限：淘汰最旧 1/4（与 getCachedTokens 同策略）——整体 clear 会让节流
+ * 窗口频繁失效、放大写盘次数。
  */
 export function trackAccess(
   top: MemoryEntry[],
@@ -327,16 +330,26 @@ export function trackAccess(
     lastTrackedAt: Map<string, number>
     now: number
     iso: () => string
+    /** 回写失败上报（生产传 logger.warn；缺省 console.warn 兜底可见性） */
+    onWriteError?: (error: unknown) => void
   },
 ): void {
   for (const entry of top) {
     const key = `${entry.sessionId}::${entry.id}`
     const last = ctx.lastTrackedAt.get(key)
     if (last !== undefined && ctx.now - last < ACCESS_TRACK_WINDOW_MS) continue
-    // 节流表上限保护：超限整体清空（节流失效一次无碍，防无界增长）
-    if (ctx.lastTrackedAt.size >= TOKEN_CACHE_MAX) ctx.lastTrackedAt.clear()
+    // 节流表上限保护：淘汰最旧四分位（保留近期节流窗口，防无界增长）
+    if (ctx.lastTrackedAt.size >= TOKEN_CACHE_MAX) {
+      const evictCount = Math.ceil(TOKEN_CACHE_MAX / 4)
+      let removed = 0
+      for (const staleKey of ctx.lastTrackedAt.keys()) {
+        ctx.lastTrackedAt.delete(staleKey)
+        if (++removed >= evictCount) break
+      }
+    }
     ctx.lastTrackedAt.set(key, ctx.now)
     // 异步回写 lastAccessAt/accessCount（尽力而为）
+    const reportError = ctx.onWriteError ?? ((error: unknown) => console.warn(`[dsh-memory] 访问追踪回写失败（记忆 ${entry.id}）：`, error))
     void ctx.table
       .update(entry.id, (current) => ({
         ...current,
@@ -344,7 +357,7 @@ export function trackAccess(
         accessCount: current.accessCount + 1,
       }))
       .catch((error: unknown) => {
-        console.warn(`[dsh-memory] 访问追踪回写失败（记忆 ${entry.id}）：`, error)
+        reportError(error)
       })
   }
 }

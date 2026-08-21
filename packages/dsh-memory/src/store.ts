@@ -92,7 +92,13 @@ export class MemoryStore {
     table: KvTable<string, MemoryEntry>,
     now: NowFn = () => Date.now(),
     private readonly onCorruptSource?: (id: string) => void,
-    private readonly hooks?: { onCreate?: (entry: MemoryEntry) => void; onArchive?: (id: string) => void; onSupersede?: (targetId: string) => void },
+    private readonly hooks?: {
+      onCreate?: (entry: MemoryEntry) => void
+      onArchive?: (id: string) => void
+      onSupersede?: (targetId: string) => void
+      /** Q5=A/WP-F：访问追踪回写失败上报（生产注入 logger.warn，替代 search 层裸 console） */
+      onAccessWriteError?: (error: unknown) => void
+    },
   ) {
     this.table = table
     this.now = now
@@ -286,7 +292,14 @@ export class MemoryStore {
     const scored = this.scoreMatches(matches, queryTokens, now, options, minScore)
     sortScored(scored)
     const top = scored.slice(0, limit).map((item) => item.entry)
-    trackAccess(top, { table: this.table, lastTrackedAt: this.lastTrackedAt, now, iso: () => this.iso() })
+    trackAccess(top, {
+      table: this.table,
+      lastTrackedAt: this.lastTrackedAt,
+      now,
+      iso: () => this.iso(),
+      // WP-F：回写失败经装配层 logger 上报（替代 search 层裸 console.warn）
+      onWriteError: this.hooks?.onAccessWriteError,
+    })
     if (options.withScore === true) {
       const topScored = scored.slice(0, limit)
       return top.map((entry, i) => ({ entry, score: topScored[i]?.score ?? 0, relevance: topScored[i]?.relevance ?? 0 }))
