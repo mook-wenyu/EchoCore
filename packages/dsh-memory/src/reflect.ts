@@ -53,8 +53,11 @@ export const REFLECT_FOCUS_BUDGET = 60
  * P2 多批流水线：每批送审焦点数上限（每批独立一次 LLM 调用）。
  * 依据：小批 prompt 让模型注意力集中在少量候选对上（旧单批 20 焦点×4 行/焦点
  * 的长尾易被忽略）；批间串行执行，applyDecision 的 getById 重读保证跨批竞态安全。
+ * Q-fix（2026-08-22 生产实测两轮截断）：10→4——推理模型（mimo High）思考链计入
+ * 输出预算且长度不可控，4 对裁决 ~600-800 tok + 思考在 8192 内余量充足；
+ * 批数增多换每次调用的确定性成功（失败重试粒度也更小）。
  */
-export const REFLECT_BATCH_SIZE = 10
+export const REFLECT_BATCH_SIZE = 4
 
 /** 每个焦点的候选对比条目数 */
 export const REFLECT_PEERS_PER_FOCUS = 3
