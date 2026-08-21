@@ -1,6 +1,6 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（修复面板"运行反思"恒报无可用模型路由——路由回退改用官方 ctx.agentDefaultModel 服务；待宿主重启生效）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（"运行反思"三层根因修复：官方路由服务/inject 登记/失败原因可观测；Playwright 实测路由已通、批次执行存在真实错误待重启后显形）。
 
 ## 一、架构健康度
 
@@ -20,7 +20,7 @@
 ## 三、已知风险点（诚实自曝）
 
 1. 🔴 **明文密钥落盘（前轮拍板保留）**
-2. 🟡 **修复待重启生效（两层根因均已修）**：① getDefaultModel 改用官方服务（55d222a）；② inject 声明补 agentDefaultModel——Cordis 守卫拒绝未声明服务的属性访问（ee4fc22）。重启后点"运行反思"应正常执行
+2. 🟡 **"运行反思"三层根因修复完成，待最终重启验证**：① getDefaultModel 改官方服务 ctx.agentDefaultModel（55d222a）；② inject 补登 agentDefaultModel——Cordis 守卫拒绝未声明访问（ee4fc22）；③ 失败原因可观测：lastError 透传面板，不再把批次执行错误误标为路由问题（6fd0241）。**Playwright 实测**：修正默认模型为已注册路由（opencode-go/mimo-v2.5，原 opencode-new/x-preview-f-free 未注册适配器）后，路由解析成功、反思真实运行约 5-6 分钟后失败——真实错误被当时运行的旧码吞掉，重启加载 ③ 后下一轮点击将显示真实 error.message；另 agent-default-model 配置已同步修正
 3. 🟢 原子化条目增速观察 / meta 双键残留 / reflectCursor 未初始化（等首个维护周期）/ reject 偶发嵌入浪费
 
 ## 四、下次最该做的事
