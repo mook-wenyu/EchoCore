@@ -45,6 +45,7 @@ function setup(opts?: {
   store?: MemoryStore
   runtime?: RuntimeHealth
   causal?: MemoryCausalStore
+  recallStats?: import('../src/tools.js').RecallStats
   reflector?: { runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<import('../src/reflect.js').ReflectionSummary | undefined> }
   causalExtractor?: { runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<import('../src/causal.js').CausalSummary | undefined> }
 }) {
@@ -58,6 +59,7 @@ function setup(opts?: {
     causal: opts?.causal,
     reflector: opts?.reflector,
     causalExtractor: opts?.causalExtractor,
+    recallStats: opts?.recallStats,
   })
   return { tools: ctx.toolDefs, store, table }
 }
@@ -157,6 +159,27 @@ describe('memory_recall', () => {
     const def = toolOf(setup({ store: harness.store, snapshotOf: () => new Set([id]) }).tools, 'memory_recall')
     const r = (await def.execute({ query: 'pnpm', limit: 5 }, fakeExec() as never)) as { returned: number }
     expect(r.returned).toBe(0)
+  })
+
+  // Q3=A（2026-08-20 拍板）：扩展路径观测计数——调用次数/返回条数/去重跳过随执行累加；
+  // 未接线（deps.recallStats 缺省）时不计数、不报错
+  it('Q3=A recall 计数器随执行累加；未接线时不计数', async () => {
+    const harness = setup()
+    const id = await seed(harness.store)
+    const stats = { calls: 0, returnedTotal: 0, dedupedSkipped: 0 }
+    const def = toolOf(
+      setup({ store: harness.store, snapshotOf: () => new Set([id]), recallStats: stats }).tools,
+      'memory_recall',
+    )
+    await def.execute({ query: 'pnpm', limit: 5 }, fakeExec() as never) // 唯一命中被快照去重
+    await def.execute({ query: 'pnpm', limit: 5 }, fakeExec() as never) // 同上
+    expect(stats.calls).toBe(2)
+    expect(stats.returnedTotal).toBe(0)
+    expect(stats.dedupedSkipped).toBe(2)
+    // 未接线：缺省 deps 不带 recallStats → 执行正常、无计数副作用
+    const bare = toolOf(setup({ store: harness.store }).tools, 'memory_recall')
+    const r = (await bare.execute({ query: 'pnpm', limit: 5 }, fakeExec() as never)) as { returned: number }
+    expect(r.returned).toBe(1)
   })
 })
 

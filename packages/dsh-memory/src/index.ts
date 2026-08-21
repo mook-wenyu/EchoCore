@@ -411,6 +411,9 @@ export async function mountMemory(
   })
   maintenance.install(ctx)
 
+  // Q3=A：扩展路径观测计数器（同一对象供 memory_recall 工具累加与 runtime getter 读出）
+  const recallStatsValue = { calls: 0, returnedTotal: 0, dedupedSkipped: 0 }
+
   // O1：运行健康指标组装（写链失败/嵌入状态/上次维护/反思因果——tools status 与 RPC status 共用）
   const runtime = {
     writeFailures: table.writeFailures,
@@ -456,6 +459,10 @@ export async function mountMemory(
     get injectStats() {
       return injector.stats
     },
+    // Q3=A：扩展路径观测计数（memory_recall 显式召回——与工具累加同一对象）
+    get recallStats() {
+      return recallStatsValue
+    },
     // LLM 单一信任源可观测（memory_status 暴露 llm.model/configHash，中文注释）
     get llm() {
       const snap = LlmFactory.getInstance().getSnapshot()
@@ -466,6 +473,7 @@ export async function mountMemory(
     },
   }
 
+  // Q3=A：扩展路径观测计数器（同一对象供工具累加与 runtime getter 读出）
   // 模型工具：recall / search / note / forget / audit / status / reflect
   // （G3：snapshot 传入供工具回路去重——快照已注入的记忆不再由工具重复输出）
   registerMemoryTools(ctx, {
@@ -477,6 +485,7 @@ export async function mountMemory(
     causal: causalStore,
     reflector,
     causalExtractor,
+    recallStats: recallStatsValue,
   })
 
   // 会话快照：压缩摘要登记 + 会话结束快照（跨会话检索的连续性基底）

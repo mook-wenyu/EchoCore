@@ -231,17 +231,20 @@ describe('memory RPC 端点', () => {
     expect(bare.ok).toBe(true)
     if (!bare.ok) return
     expect((bare.value as { injectStats?: unknown }).injectStats).toBeNull()
+    expect((bare.value as { recallStats?: unknown }).recallStats).toBeNull()
     // runtime 注入计数对象 → 原样透出
     const stats = { steps: 3, injectedPacks: 2, injectedEntries: 5, dedupSkipped: 1, snapshotSkipped: 0, foldedDuplicates: 1, budgetSkipped: 0, searchMs: 12.5 }
+    const recall = { calls: 2, returnedTotal: 3, dedupedSkipped: 1 }
     const withRuntime = createMemoryRpcHandler(store, {
       config: () => ({ ...DEFAULTS }) as ResolvedConfig,
       settings: { update: async () => {} },
       applyChange: async () => {},
-    }, { writeFailures: 0, embeddingState: 'ready', lastMaintenanceAt: null, injectStats: stats })
+    }, { writeFailures: 0, embeddingState: 'ready', lastMaintenanceAt: null, injectStats: stats, recallStats: recall })
     const result = await withRuntime('status', null)
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect((result.value as { injectStats?: unknown }).injectStats).toEqual(stats)
+    expect((result.value as { recallStats?: unknown }).recallStats).toEqual(recall)
   })
 })
 

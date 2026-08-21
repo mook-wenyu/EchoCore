@@ -50,6 +50,25 @@ export interface MemoryToolsDeps {
   causalExtractor?: {
     runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<CausalSummary | undefined>
   }
+  /**
+   * Q3=A（2026-08-20 拍板）：扩展路径观测计数器（装配层创建并持有同一对象——
+   * 工具执行累加、runtime getter 读出，双通道指向同一份进程内态）。未接线时
+   * memory_recall 不计数（测试/独立使用场景零负担）。
+   */
+  recallStats?: RecallStats
+}
+
+/**
+ * Q3=A 扩展路径观测计数（memory_recall 显式召回；进程内累计，重启归零）。
+ * 目录点击归因不可精确实现（诚实标注：无法区分"模型读了目录才召回"），仅总量观测。
+ */
+export interface RecallStats {
+  /** memory_recall 调用次数 */
+  calls: number
+  /** 去重后实际返回条数累计 */
+  returnedTotal: number
+  /** 快照去重跳过条数累计（快照段已含、工具不再重复输出） */
+  dedupedSkipped: number
 }
 
 /** O1：运行健康指标（写链失败/嵌入状态/维护时间——"写失败一眼可见"闭环） */
@@ -77,6 +96,8 @@ export interface RuntimeHealth {
   llm?: { model: string; configHash: string; provider?: string; api_base?: string; temperature?: number }
   /** Q5=A 注入链路观测计数（进程内累计；未接线 null——lossless-JSON 纪律） */
   injectStats?: InjectorStats | null
+  /** Q3=A 扩展路径观测计数（memory_recall；未接线 null） */
+  recallStats?: RecallStats | null
 }
 
 /** 记忆条目的最小规范形态（工具输出与 RPC 共用） */
@@ -232,6 +253,12 @@ function registerRecall(ctx: Context, deps: MemoryToolsDeps): void {
         const workspace = workspaceOf(exec)
         const snapshotIds = deps.snapshot.snapshotIds(workspace)
         const deduped = results.filter((entry) => !snapshotIds.has(entry.id))
+        // Q3=A：扩展路径观测计数（deps 未接线时不计数——测试/独立使用零负担）
+        if (deps.recallStats !== undefined) {
+          deps.recallStats.calls++
+          deps.recallStats.returnedTotal += deduped.length
+          deps.recallStats.dedupedSkipped += results.length - deduped.length
+        }
         return {
           memories: deduped.map((entry) => ({
             id: entry.id,
@@ -764,6 +791,8 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
             configHash: { type: 'json', required: true },
             // Q5=A：注入链路观测计数（null = 未接线；json 承载对象或 null）
             injectStats: { type: 'json', required: true },
+            // Q3=A：扩展路径观测计数（null = 未接线）
+            recallStats: { type: 'json', required: true },
           },
           additionalProperties: false,
         },
@@ -798,6 +827,12 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
               ...(value.injectStats
                 ? [
                     `注入观测：步 ${(value.injectStats as unknown as InjectorStats).steps} · 包 ${(value.injectStats as unknown as InjectorStats).injectedPacks} · 条 ${(value.injectStats as unknown as InjectorStats).injectedEntries} · 去重跳过 ${((value.injectStats as unknown as InjectorStats).dedupSkipped + (value.injectStats as unknown as InjectorStats).snapshotSkipped)} · 折叠 ${(value.injectStats as unknown as InjectorStats).foldedDuplicates} · 预算截断 ${(value.injectStats as unknown as InjectorStats).budgetSkipped} · 检索累计 ${Math.round((value.injectStats as unknown as InjectorStats).searchMs)}ms`,
+                  ]
+                : []),
+              // Q3=A：扩展路径观测（memory_recall 显式召回——目录点击归因不可精确，仅总量）
+              ...(value.recallStats
+                ? [
+                    `扩展观测：recall 调用 ${(value.recallStats as unknown as RecallStats).calls} 次 · 返回 ${(value.recallStats as unknown as RecallStats).returnedTotal} 条 · 快照去重跳过 ${(value.recallStats as unknown as RecallStats).dedupedSkipped} 条`,
                   ]
                 : []),
             ].join('\n'),
@@ -850,6 +885,8 @@ function registerStatus(ctx: Context, deps: MemoryToolsDeps): void {
           configHash: (topHash ?? null) as unknown as JsonValue,
           // Q5=A：注入链路观测计数（json 承载对象或 null——未接线/测试占位）
           injectStats: (runtime?.injectStats ?? null) as JsonValue,
+          // Q3=A：扩展路径观测计数（json 承载对象或 null——未接线）
+          recallStats: (runtime?.recallStats ?? null) as JsonValue,
         }
       },
     }),
