@@ -62,8 +62,16 @@ const TOP_K = 8
 const INJECT_HIGH_CONFIDENCE_SCORE = 0.7
 /** P1：中置信档摘要渲染的 content 截断长度（字符） */
 const INJECT_MID_SUMMARY_CHARS = 80
-/** P1：注入最低综合分（<0.4 跳过——防污染底线；语义融合 RRF 单榜靠前条目依旧可召回） */
+/** P1：注入最低综合分（<0.4 跳过——防污染底线；解耦后门槛建在纯相关性上） */
 const MIN_SCORE = 0.4
+
+/**
+ * Q4=A（2026-08-20 拍板）：注入侧冗余折叠阈值——候选按排序分降序到达，
+ * 与已保留条目的 tokenJaccard > 此值视为同主题变体，只留最高分条。
+ * 读端轻量去冗余（复用 store.tokenJaccard 缓存）；写端 supersede(≥0.7)/
+ * merge 是主治理，本阈值刻意低于 0.7 以覆盖"未被写端判定重复的松散变体"。
+ */
+const INJECT_FOLD_JACCARD = 0.6
 /**
  * P3（2026-08-16 会话上下文派生查询）：每会话保留最近 N 条真实用户消息文本，
  * pre-step 检索时拼接近期消息（openclaw-hybrid-memory #156 的轻量近似——
@@ -247,10 +255,19 @@ export class MemoryInjector {
     )
     if (fresh.length === 0) return decision
 
+    // Q4=A 冗余折叠（2026-08-20 拍板）：fresh 已按排序分降序——与任一已保留条目
+    // tokenJaccard > INJECT_FOLD_JACCARD 的后到条目视为同主题变体，只留最高分。
+    // 复用 store.tokenJaccard 的进程内 token 缓存（O(保留数) 次集合交并，零额外分词）。
+    const deduped: typeof fresh = []
+    for (const item of fresh) {
+      const isNearDuplicate = deduped.some((kept) => this.deps.store.tokenJaccard(kept.entry, item.entry) > INJECT_FOLD_JACCARD)
+      if (!isNearDuplicate) deduped.push(item)
+    }
+
     // P1 三档渲染（Q1=A 解耦后语义）：relevance ≥0.7（双榜印证）完整行；
     // 0.4-0.7（单榜）摘要行；<0.4 已被 minScore 排除
     const lines: Array<{ id: string; line: string }> = []
-    for (const { entry, relevance } of fresh) {
+    for (const { entry, relevance } of deduped) {
       const view = {
         id: entry.id,
         kind: entry.kind,
@@ -279,7 +296,7 @@ export class MemoryInjector {
     // 跳过 = 未进 pack.renderedIds 的行；保留 renderBudgetedPack 自带的计数提示
     // （pack.text 已含），在其后追加这些条目的标题目录（导航段，独立预算）。
     if (pack.renderedIds.length < lines.length) {
-      const byId = new Map(fresh.map(({ entry }) => [entry.id, entry]))
+      const byId = new Map(deduped.map(({ entry }) => [entry.id, entry]))
       const skipped = lines
         .filter((item) => !pack.renderedIds.includes(item.id))
         .map((item) => ({ entry: byId.get(item.id)!, line: item.line }))

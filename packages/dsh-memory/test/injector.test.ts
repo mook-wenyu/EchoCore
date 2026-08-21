@@ -523,6 +523,39 @@ describe('MemoryInjector 置信度分档（P1）', () => {
   })
 })
 
+// Q4=A（2026-08-20 拍板）：注入侧 Jaccard 冗余折叠——同主题近重复只留最高分，
+// TOP_K 坑位不被变体浪费（读端轻量去冗余；写端 supersede/merge 仍是主治理）
+describe('MemoryInjector 注入冗余折叠（Q4=A）', () => {
+  it('tokenJaccard>0.6 的近重复只保留最高分条，无关记忆不受影响', async () => {
+    const { preStep, store } = setup()
+    // 三条长尾记忆（超快照预算 → 可实时注入）。夹具关键：A/B 的 token Jaccard
+    // 落在 (0.6, 0.7) 开区间——低于写端 supersede 阈值 0.7（否则 create 扫描会先
+    // 标记覆盖、检索里根本不会同现），高于读端折叠阈值 0.6：
+    // token 集 {pnpm,workspace,alpha,beta,gamma,delta,epsi,va?,x} vs {…vb?,x}：
+    // |∩|=8（含 x 填充 token），|∪|=12 → j=0.667 ✓；C 与二者仅共享 x → j≈1/19
+    await seed(store, { content: longContent('pnpm workspace alpha beta gamma delta epsi va1 va2'), importance: 9 })
+    await seed(store, { content: longContent('pnpm workspace alpha beta gamma delta epsi vb1 vb2'), importance: 5 })
+    // C 与查询相关（关键词命中）且与 A/B 仅共享 x 填充 token——验证折叠不误伤异题
+    await seed(store, { content: longContent('git rebase 工作流要点记录'), importance: 7 })
+    const decision = await preStep(makePayload('s1', 'pnpm workspace git'), async () => enterDecision())
+    expect(decision.kind).toBe('enter')
+    if (decision.kind !== 'enter') return
+    expect(decision.messages).toHaveLength(2)
+    const text = injectedTextLocal(decision)
+    // 最高分变体保留、次分变体被折叠（摘要行含 content 前 80 字符，头部含 va1/vb1）
+    expect(text).toContain('va1')
+    expect(text).not.toContain('vb1')
+    // 相关的异题记忆照常注入（折叠不误伤）
+    expect(text).toContain('rebase')
+  })
+
+  function injectedTextLocal(decision: PreStepDecision): string {
+    if (decision.kind !== 'enter') throw new Error('应注入')
+    const injected = decision.messages[decision.messages.length - 1]
+    return (injected?.content ?? []).find((block) => block.type === 'text')?.text ?? ''
+  }
+})
+
 // P3（2026-08-16 会话上下文派生查询）：近期消息主题词参与召回（openclaw 轻量近似）
 describe('MemoryInjector 会话上下文派生查询（P3）', () => {
   function injectedText(decision: PreStepDecision): string {
@@ -674,4 +707,5 @@ describe('renderCatalog（N2 目录段预算截断）', () => {
     expect(text).toContain('- [decision] pnpm workspace 决策条目 0')
   })
 })
+
 
