@@ -17,6 +17,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { EMBED_BATCH_SIZE, EmbeddingIndex, cosineSimilarity } from '../src/embed-index.js'
+import { getLoadablePath } from '@photostructure/sqlite-vec'
 import { EmbeddingService, EmbeddingUnavailableError, cosine, defaultHasLocalModel, remoteEmbedFetch, resolveApiKey, searchWithSemantic } from '../src/embedding.js'
 import { BACKFILL_BUDGET, CANDIDATE_WINDOW } from '../src/maintenance.js'
 import { MemoryStore } from '../src/store.js'
@@ -629,12 +630,64 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     return v
   }
 
-  it('构造即建表；空表 knn 返回空', () => {
+  it('构造即建表（含 workspace metadata 列）；空表 knn 返回空', () => {
     const db = new DatabaseSync(':memory:', { allowExtension: true })
     const warns: string[] = []
     const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: (m) => warns.push(m) })
-    expect(index.table).toBe('vec_memory_384')
+    // Q3=B 拍板（2026-08-20）：表升级为 vec2_* 并带 workspace metadata 列——KNN 过滤下推
+    expect(index.table).toBe('vec2_memory_384')
+    const ddl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vec2_memory_384'`).get() as { sql: string }
+    expect(ddl.sql).toContain('workspace')
     expect(index.knn(queryVec(4), 10)).toEqual([])
+    db.close()
+  })
+
+  it('Q3=B：knn 带 workspace 过滤时跨域最近邻被下推排除（metadata filter 实证可用）', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: () => {} })
+    // mCross 与查询完全同向（cosine≈1）但属其它 workspace；mOwn 略偏但同域
+    // （假服务向量热位 = content 长度 mod 384：'abcd'=4、'abcdefghi'=9）
+    await index.indexEntry({ id: 'm-cross', content: 'abcd', workspace: 'D:/other' } as unknown as MemoryEntry)
+    await index.indexEntry({ id: 'm-own', content: 'abcdefghi', workspace: 'D:/own' } as unknown as MemoryEntry)
+    // 与 m-cross 同向的查询（热位 4）
+    const q = new Float32Array(384)
+    q[4] = 1
+    const unfiltered = index.knn(q, 10)
+    expect(unfiltered[0]!.id).toBe('m-cross')
+    // 下推过滤：其它域条目被 SQLite 层排除，仅剩本域
+    const filtered = index.knn(q, 10, 'D:/own')
+    expect(filtered.map((h) => h.id)).toEqual(['m-own'])
+    db.close()
+  })
+
+  it('R2-Q2=A：存量旧表 vec_memory_<dim> 自动迁移到 vec2 表（二进制复制不重嵌），旧表清理', async () => {
+    const db = new DatabaseSync(':memory:', { allowExtension: true })
+    // 手工建旧 schema 前须先加载 vec0 模块（生产中扩展由首次 EmbeddingIndex 加载；
+    // 此处模拟"升级前已存在的旧表"，需提前加载扩展才能建旧表）
+    db.loadExtension(getLoadablePath())
+    // 手工建旧 schema 表并写入一条向量（模拟生产升级前的存量）
+    db.exec(
+      `CREATE VIRTUAL TABLE "vec_memory_384" USING vec0(embedding float[384] distance_metric=cosine, memory_id TEXT)`,
+    )
+    const v = new Float32Array(384)
+    v[7] = 1
+    const lit = `X'${Buffer.from(v.buffer).toString('hex')}'`
+    db.exec(`INSERT INTO "vec_memory_384"(memory_id, embedding) VALUES ('legacy-1', ${lit})`)
+    // listAll 提供 legacy-1 的 workspace 映射（store 是 workspace 权威源）
+    const storeEntries = [
+      { id: 'legacy-1', content: '长度7', workspace: 'D:/wsZ' },
+      { id: 'gone', content: '已不在库', workspace: 'D:/wsZ' },
+    ] as unknown as MemoryEntry[]
+    const warns: string[] = []
+    const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => storeEntries, logWarn: (m) => warns.push(m) })
+    // 迁移后：新表命中该向量，且过滤查询按补写的 workspace 生效
+    const hits = index.knn(queryVec(7), 10, 'D:/wsZ')
+    expect(hits.map((h) => h.id)).toContain('legacy-1')
+    // store 中不存在的 id（gone）不被迁移（无 workspace 权威来源）
+    expect(index.knn(queryVec(5), 10).map((h) => h.id)).not.toContain('gone')
+    // 旧主表已被清理（影子表随 vtab xDestroy 级联）
+    const leftover = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vec_memory_384'`).get()
+    expect(leftover).toBeUndefined()
     db.close()
   })
 
@@ -797,7 +850,7 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     db.close()
   })
 
-  it('loadLegacy：旧 JSON 索引迁移入表；非空表幂等跳过', async () => {
+  it('loadLegacy：旧 JSON 索引迁移入表（workspace 由 entries 表补写）；非空表幂等跳过', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'embed-legacy-'))
     const file = join(dir, 'memory-embeddings-384.json')
     const vectors: Record<string, number[]> = {}
@@ -810,7 +863,13 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     try {
       const db = new DatabaseSync(':memory:', { allowExtension: true })
       const warns: string[] = []
-      const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: (m) => warns.push(m) })
+      // Q3=B 后 loadLegacy 要求库中存在归属条目（workspace 权威源）；提供 5 条映射
+      const storeEntries = Array.from({ length: 5 }, (_, i) => ({
+        id: `legacy-${i}`,
+        content: `内容${i}`,
+        workspace: 'D:/ws',
+      })) as unknown as MemoryEntry[]
+      const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => storeEntries, logWarn: (m) => warns.push(m) })
       const migrated = await index.loadLegacy(file)
       expect(migrated).toBe(5)
       // knn 命中（查询首位=3）
@@ -856,7 +915,12 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     try {
       const db = new DatabaseSync(':memory:', { allowExtension: true })
       const warns: string[] = []
-      const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: (m) => warns.push(m) })
+      // Q3=B 后需提供库中归属（workspace 权威源）：ok-0/ok-1 在库，bad-dim 不在
+      const storeEntries = [
+        { id: 'ok-0', content: 'x', workspace: 'D:/ws' },
+        { id: 'ok-1', content: 'y', workspace: 'D:/ws' },
+      ] as unknown as MemoryEntry[]
+      const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => storeEntries, logWarn: (m) => warns.push(m) })
       const migrated = await index.loadLegacy(file)
       expect(migrated).toBe(2) // 维度不匹配行被跳过
       expect(warns.some((m) => m.includes('维度'))).toBe(true)
@@ -870,18 +934,19 @@ describe('EmbeddingIndex（sqlite-vec vec0，2026-08-17 用户拍板）', () => 
     }
   })
 
-  it('dropOtherDimensionTables：只删除非当前维度表（防旧维度表堆积，Q2 拍板）', () => {
+  it('dropOtherDimensionTables：清理旧代（vec_memory_*）与非当前维度表（vec2_memory_*，Q2 拍板+Q3=B 升级）', () => {
     const db = new DatabaseSync(':memory:', { allowExtension: true })
     const index = new EmbeddingIndex({ db, service: fakeService(), listAll: () => [], logWarn: () => {} }) // 当前维度 384
-    // 手工模拟历史遗留的同库其它维度表（换维后 ensureAll 已按新维重嵌，旧表无引用价值）
+    // 手工模拟历史遗留：上一代表 vec_memory_512/768 + 同代其它维度 vec2_memory_512
     db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS "vec_memory_512" USING vec0(embedding float[512] distance_metric=cosine, memory_id TEXT)')
     db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS "vec_memory_768" USING vec0(embedding float[768] distance_metric=cosine, memory_id TEXT)')
+    db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS "vec2_memory_512" USING vec0(embedding float[512] distance_metric=cosine, memory_id TEXT, workspace TEXT)')
     index.dropOtherDimensionTables()
-    const rows = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_memory_%'`).all() as Array<{ name: string }>
-    // 仅断言纯维度表（vec_memory_<digits>）：vec0 影子表（_info/_rowid 等）受 SQLite
-    // 保护不可 DROP，属预期残留；换维后旧维度表应已清理
-    const dimTables = rows.filter((r) => /^vec_memory_\d+$/.test(r.name)).map((r) => r.name).sort()
-    expect(dimTables).toEqual(['vec_memory_384'])
+    const rows = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec%memory_%'`).all() as Array<{ name: string }>
+    // 仅断言纯维度表：影子表受 SQLite 保护不可 DROP 属预期残留；其余应已清理，
+    // 仅剩当前表 vec2_memory_384
+    const dimTables = rows.filter((r) => /^vec\d*_memory_\d+$/.test(r.name)).map((r) => r.name).sort()
+    expect(dimTables).toEqual(['vec2_memory_384'])
     db.close()
   })
 

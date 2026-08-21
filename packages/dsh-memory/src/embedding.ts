@@ -492,7 +492,11 @@ export interface EmbeddingHolder {
 export async function searchWithSemantic<T>(
   store: { search(options: import('./store.js').SearchOptions): T[] },
   embedding: EmbeddingService | undefined,
-  index: { knn(queryVector: Float32Array, k: number): Array<{ id: string; cosine: number }> } | undefined,
+  index:
+    | {
+        knn(queryVector: Float32Array, k: number, workspace?: string): Array<{ id: string; cosine: number }>
+      }
+    | undefined,
   query: string,
   options: SemanticSearchExtra,
   logWarn: (message: string, error?: unknown) => void,
@@ -506,8 +510,9 @@ export async function searchWithSemantic<T>(
       query,
       ...options,
       queryEmbedding: queryVector,
-      // 语义榜 = vec0 KNN top-k（榜单宽度 k 由 store 侧 semanticTopK 派生）
-      semanticRank: (vector, k) => index.knn(vector as Float32Array, k),
+      // 语义榜 = vec0 KNN top-k（榜单宽度 k 由 store 侧 semanticTopK 派生）；
+      // Q3=B 拍板：workspace 过滤下推 SQLite——跨域条目不再挤占本域语义榜
+      semanticRank: (vector, k) => index.knn(vector as Float32Array, k, options.workspace),
     })
   } catch (error) {
     if (error instanceof EmbeddingUnavailableError) {

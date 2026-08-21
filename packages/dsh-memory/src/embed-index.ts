@@ -100,8 +100,14 @@ function parseJsonVec(list: unknown, expectedLength?: number): Float32Array | un
 }
 
 export class EmbeddingIndex {
-  /** vec0 表名（维度隔离：本地 384 / 远程配置值） */
+  /**
+   * vec0 表名（2026-08-20 Q3=B 拍板升级为第二代表 vec2_*：新增 workspace metadata 列
+   * 支持 KNN 过滤下推——实证 @photostructure/sqlite-vec@1.2.0 支持等值过滤，跨域最近邻
+   * 在 SQLite 层被排除，本域语义榜不再被其它 workspace 条目挤占）。
+   */
   readonly table: string
+  /** 上一代表名（无 workspace 列；构造时若存在则自动迁移到新表并清理） */
+  private readonly legacyTable: string
   /** UPSERT 用：按 memory_id 查找既有 rowid */
   private readonly findRowStmt
   /** 按 memory_id 删除 */
@@ -120,15 +126,69 @@ export class EmbeddingIndex {
       db.loadExtension(getLoadablePath())
       loadedDbs.add(db)
     }
-    this.table = `vec_memory_${service.dimension}`
-    // vec0 表：embedding float[dim] + cosine 度量 + memory_id metadata 列
+    this.table = `vec2_memory_${service.dimension}`
+    this.legacyTable = `vec_memory_${service.dimension}`
+    // vec0 表：embedding float[dim] + cosine 度量 + metadata 列
+    // （memory_id/workspace——workspace 为 KNN 过滤下推列，值以 entries 表为权威源）
     db.exec(
-      `CREATE VIRTUAL TABLE IF NOT EXISTS "${this.table}" USING vec0(embedding float[${service.dimension}] distance_metric=cosine, ${MID_COL} TEXT);`,
+      `CREATE VIRTUAL TABLE IF NOT EXISTS "${this.table}" USING vec0(embedding float[${service.dimension}] distance_metric=cosine, ${MID_COL} TEXT, workspace TEXT);`,
     )
     this.findRowStmt = db.prepare(`SELECT rowid FROM "${this.table}" WHERE ${MID_COL} = ? LIMIT 1`)
     this.deleteStmt = db.prepare(`DELETE FROM "${this.table}" WHERE ${MID_COL} = ?`)
     this.getVecStmt = db.prepare(`SELECT embedding FROM "${this.table}" WHERE ${MID_COL} = ? LIMIT 1`)
     this.listIdsStmt = db.prepare(`SELECT ${MID_COL} FROM "${this.table}"`)
+    // 存量旧代表迁移（R2-Q2=A）：二进制复制不重嵌；幂等，失败不阻断挂载
+    this.migrateLegacyDimension()
+  }
+
+  /**
+   * 存量旧代表迁移（R2-Q2=A 拍板）：旧 vec_memory_<dim>（无 workspace 列）→ 新表
+   * 二进制复制。幂等：旧表不存在即跳过；新表已有数据时仅清理旧表残留。workspace 以
+   * listAll()（entries 表）为权威源，库中不存在的 id 不迁移（无归属依据防跨域污染）；
+   * 维度异常行跳过（防 KNN MATCH 维度错乱）。事务包批全有或全无；失败告警保留旧表
+   * 待下轮重试，缺失向量由 backfill 收敛（与 loadLegacy 同降级语义，不阻断挂载）。
+   */
+  private migrateLegacyDimension(): void {
+    const exists = this.deps.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(this.legacyTable)
+    if (exists === undefined) return
+    try {
+      if ((this.listIdsStmt.all() as unknown[]).length === 0) {
+        const wsOf = new Map(this.deps.listAll().map((entry) => [entry.id, entry.workspace]))
+        const rows = this.deps.db
+          .prepare(`SELECT ${MID_COL}, embedding FROM "${this.legacyTable}"`)
+          .all() as Array<{ [MID_COL]: string; embedding: Uint8Array }>
+        let migrated = 0
+        let skipped = 0
+        this.deps.db.exec('BEGIN')
+        try {
+          for (const row of rows) {
+            const ws = wsOf.get(row[MID_COL])
+            if (ws === undefined) {
+              skipped++
+              continue
+            }
+            const vector = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4)
+            if (vector.length !== this.deps.service.dimension) {
+              skipped++
+              continue
+            }
+            this.writeVector(row[MID_COL], vector, ws)
+            migrated++
+          }
+          this.deps.db.exec('COMMIT')
+        } catch (error) {
+          this.deps.db.exec('ROLLBACK')
+          throw error
+        }
+        this.deps.logWarn(
+          `[dsh-memory] 向量表升级迁移完成：${this.legacyTable} → ${this.table}（复制 ${migrated} 条，跳过 ${skipped} 条无归属/维度异常）`,
+        )
+      }
+      // DROP 主虚拟表：sqlite vtab xDestroy 级联清理影子表（与 dropOtherDimensionTables 同语义）
+      this.deps.db.exec(`DROP TABLE IF EXISTS "${this.legacyTable}"`)
+    } catch (error) {
+      this.deps.logWarn('[dsh-memory] 向量表升级迁移失败（旧表保留待下轮，缺失向量由补齐收敛）：', error)
+    }
   }
 
   /** SQL 字符串字面量转义（memory_id 拼进动态 SQL——vec0 的 embedding 列绑定参数
@@ -142,14 +202,20 @@ export class EmbeddingIndex {
    * 写一条向量（UPDATE-or-INSERT，动态 SQL 内联向量字面量）：
    * 实测 vec0 对 embedding 列 prepared 绑定参数整体拒绝（二进制/JSON 文本均
    * "Input does not start with '['"），内联 X'hex' 字面量则正常——见模块头。
+   * workspace：Q3=B 下推过滤列（UPDATE 同步刷新防归属变化残留；缺省写空串——
+   * 等值过滤永不命中空串，仅无过滤 KNN 可见；生产路径恒有 workspace）。
    */
-  private writeVector(id: string, vector: Float32Array): void {
+  private writeVector(id: string, vector: Float32Array, workspace?: string): void {
     const existing = this.findRowStmt.get(id) as { rowid: number } | undefined
     const lit = vecLiteral(vector)
     if (existing !== undefined) {
-      this.deps.db.exec(`UPDATE "${this.table}" SET embedding = ${lit} WHERE rowid = ${existing.rowid}`)
+      this.deps.db.exec(
+        `UPDATE "${this.table}" SET embedding = ${lit}, workspace = ${EmbeddingIndex.esc(workspace ?? '')} WHERE rowid = ${existing.rowid}`,
+      )
     } else {
-      this.deps.db.exec(`INSERT INTO "${this.table}"(${MID_COL}, embedding) VALUES (${EmbeddingIndex.esc(id)}, ${lit})`)
+      this.deps.db.exec(
+        `INSERT INTO "${this.table}"(${MID_COL}, workspace, embedding) VALUES (${EmbeddingIndex.esc(id)}, ${EmbeddingIndex.esc(workspace ?? '')}, ${lit})`,
+      )
     }
   }
 
@@ -158,20 +224,24 @@ export class EmbeddingIndex {
    * `{ id, cosine }[]`（store 语义榜消费，SQLite C+SIMD brute-force）。
    * k 由 store 按榜单宽度派生（semanticTopK，>1M 条前 brute-force 即最优）。
    * 查询向量经内联字面量（vec0 对 embedding 列绑定参数整体拒绝，见 writeVector）。
+   * workspace：Q3=B 拍板（2026-08-20）metadata 过滤下推——跨域条目在 SQLite 层被
+   * 排除，本域语义榜不再被其它 workspace 挤占；undefined = 不过滤（全库检索语义，
+   * 供无 workspace 场景的工具使用）。
    */
-  knn(queryVector: Float32Array, k: number): Array<{ id: string; cosine: number }> {
+  knn(queryVector: Float32Array, k: number, workspace?: string): Array<{ id: string; cosine: number }> {
+    const filter = workspace === undefined ? '' : ` AND workspace = ${EmbeddingIndex.esc(workspace)}`
     const rows = this.deps.db
       .prepare(
-        `SELECT ${MID_COL}, distance FROM "${this.table}" WHERE embedding MATCH ${vecLiteral(queryVector)} AND k = ${k} ORDER BY distance`,
+        `SELECT ${MID_COL}, distance FROM "${this.table}" WHERE embedding MATCH ${vecLiteral(queryVector)} AND k = ${k}${filter} ORDER BY distance`,
       )
       .all() as Array<{ [MID_COL]: string; distance: number }>
     return rows.map((row) => ({ id: row[MID_COL], cosine: 1 - row.distance }))
   }
 
-  /** 新建条目增量嵌入（UPDATE-or-INSERT：同 id 重嵌覆盖不堆积） */
+  /** 新建条目增量嵌入（UPDATE-or-INSERT：同 id 重嵌覆盖不堆积；workspace 随条目写入） */
   async indexEntry(entry: MemoryEntry): Promise<void> {
     const vector = await this.deps.service.embed(entry.content)
-    this.writeVector(entry.id, vector)
+    this.writeVector(entry.id, vector, entry.workspace)
   }
 
   /** 归档/覆盖条目移除向量（同步行删；与持久层即时一致） */
@@ -189,23 +259,23 @@ export class EmbeddingIndex {
   }
 
   /**
-   * 清理其它维度表（Q2 拍板 2026-08-17）：维度切换后旧维度 vec0 表
-   * （vec_memory_<dim>）不再被引用（ensureAll 已按当前维度重嵌全部缺失条目）
-   * —— DROP 防表随维度切换无界堆积。安全过滤：只处理本插件的
-   * `vec_memory_%` 命名空间，且跳过当前表；名字经单引号转义防注入。
+   * 清理其它维度表（Q2 拍板 2026-08-17；Q3=B 升级 2026-08-20 兼容两代命名）：
+   * 维度切换/表升级后旧表不再被引用（迁移/ensureAll 已收敛当前维度数据）
+   * —— DROP 防表无界堆积。安全过滤：只处理本插件的 `vec_memory_%` /
+   * `vec2_memory_%` 命名空间，且跳过当前表；名字经单引号转义防注入。
    * 装配层在 ready 且本维度表已建后调用（数据文件冗余清理，非迁移路径）。
    */
   dropOtherDimensionTables(): void {
     const current = this.table
     const rows = this.deps.db
-      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_memory_%'`)
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'vec_memory_%' OR name LIKE 'vec2_memory_%')`)
       .all() as Array<{ name: string }>
     for (const row of rows) {
       if (row.name === current) continue
-      // 仅 DROP 纯维度表名 vec_memory_<digits>：sqlite-vec 会为每个 vec0 表建影子表
+      // 仅 DROP 纯维度表名 vec[_2]_memory_<digits>：sqlite-vec 会为每个 vec0 表建影子表
       // （vec_memory_<dim>_info/_rowid/_chunks 等），影子表受 SQLite 保护不可 DROP
       // （"may not be dropped"）——必须跳过；非本插件命名空间同样不碰。
-      if (!/^vec_memory_\d+$/.test(row.name)) continue
+      if (!/^vec\d*_memory_\d+$/.test(row.name)) continue
       const name = row.name.replace(/'/g, "''")
       this.deps.db.exec(`DROP TABLE IF EXISTS "${name}"`)
     }
@@ -267,6 +337,8 @@ export class EmbeddingIndex {
       return 0
     }
     let migrated = 0
+    // workspace 以 entries 表为权威源（旧 JSON 无此信息）；无归属 id 跳过防跨域污染
+    const wsOf = new Map(this.deps.listAll().map((entry) => [entry.id, entry.workspace]))
     for (const [id, value] of Object.entries(parsed)) {
       // Q2 拍板：迁移严格按当前表维度校验——历史配置维度遗留的错误维度向量
       // 不得落库（vec0 列维度写死，混维行会让 KNN MATCH 报维度错误）
@@ -275,7 +347,12 @@ export class EmbeddingIndex {
         this.deps.logWarn(`[dsh-memory] 旧嵌入索引含畸形或维度不匹配向量（跳过）：${id}`)
         continue
       }
-      this.writeVector(id, vector)
+      const ws = wsOf.get(id)
+      if (ws === undefined) {
+        this.deps.logWarn(`[dsh-memory] 旧嵌入索引含库中不存在的条目（跳过）：${id}`)
+        continue
+      }
+      this.writeVector(id, vector, ws)
       migrated++
     }
     return migrated
@@ -301,7 +378,7 @@ export class EmbeddingIndex {
           // 不留半批，由 catch 记录——缺失保持纯关键词检索（与批次错误语义一致）。
           this.deps.db.exec('BEGIN')
           try {
-            for (let j = 0; j < chunk.length; j++) this.writeVector(chunk[j]!.id, vectors[j]!)
+            for (let j = 0; j < chunk.length; j++) this.writeVector(chunk[j]!.id, vectors[j]!, chunk[j]!.workspace)
             this.deps.db.exec('COMMIT')
           } catch (error) {
             this.deps.db.exec('ROLLBACK')
@@ -322,7 +399,7 @@ export class EmbeddingIndex {
       for (const entry of missing) {
         if (processed >= limit) break
         const vector = await this.deps.service.embed(entry.content)
-        this.writeVector(entry.id, vector)
+        this.writeVector(entry.id, vector, entry.workspace)
         processed++
       }
       this.deps.db.exec('COMMIT')
