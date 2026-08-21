@@ -1,36 +1,32 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-20（四域专项：原子化/扩展观测/缓存结论文档化，641 全绿）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（生产可用性审计：新代码已上线运行、迁移完成；CI 推送启用；压测协议就绪）。
 
 ## 一、架构健康度
 
-- 模块总数：28 源模块 + client 面板 + 新增 `docs/CACHE_HIT.md` 结论页；无新增代码模块（extract 提示词演进、tools/host-rpc 观测面扩展）
-- 依赖方向：`index.ts`（组合根）→ 各模块，无环；向量表第二代 `vec2_memory_<dim>` 运行中（旧表构造时自动迁移）
-- 单元测试 **641 个全绿**（33 文件，typecheck 干净；上轮 638，本轮 +3：原子化 2、recall 计数 1；另 host-rpc/tools 断言扩展）
-- 实现均 TDD（先红后绿），每逻辑变更独立提交（5f8f26f 原子化 → 62ca814 扩展观测 → 本提交文档化）
+- 模块总数：28 源模块 + client 面板 + docs 三页（CACHE_HIT/COMPACTION_STRESS/COMPACTION）；无新增代码模块
+- 依赖方向：`index.ts`（组合根）→ 各模块，无环；**vec2_memory_2560 已在生产运行（旧表已清理，向量 2116 行持续增长）**
+- 单元测试 **641 个全绿** + typecheck 干净
+- **生产可用性实证（2026-08-22 00:2x）**：部署哈希一致 / 宿主 00:18:58 启动晚于部署 → 新代码运行中；entries 9154 条活性写入；因果边 6 条
 
-## 二、本次变更影响范围（四域专项：裁剪/折叠/拆解组合/缓存）
+## 二、本次变更影响范围（生产审计 + CI 上线）
 
-grilling 两轮拍板（8 决策）：Q1=A 不做入站批次裁剪；Q2=B 快照维持全量渲染（否决折叠）；Q3=A recall 观测计数；Q4=A 提取原子化 v1.2；Q5=A 组合卡缓做；Q6'=A 缓存零代码+文档化（原设想经查证为无操作，回炉否决）；Q7=A 实施推荐项。
-
-- **记忆自动拆解（5f8f26f）**：提取提示词 v1.2 新增规则 10 原子性——一条记忆=一个原子事实，复合陈述必须拆分；与规则 4 去重合并的边界显式化。对齐 Mem0（arXiv:2504.19413）/A-MEM（arXiv:2502.12110）实践
-- **扩展观测（62ca814）**：`RecallStats{calls,returnedTotal,dedupedSkipped}` 单一对象双通道（工具累加/runtime 读出）经 status 与 memory_status 透出"扩展观测"行
-- **缓存结论（docs/CACHE_HIT.md）**：字节稳定性三重保障实证（确定性排序/revision 仅真实变更递增——trackAccess 裸表写不触发/F5 限频）；DeepSeek KV 分块缓存使长前缀部分命中有效；查证后否决"同集合复用旧文本"（无操作戏）与 LLMLingua 引入
-- **组合现状盘点**：merge/supersede/session-summary 合并链已覆盖主场景，跨条语义合成卡缓做（YAGNI）
-- **接口契约变更**：RuntimeHealth/MemoryToolsDeps 新增 recallStats；memory_status schema 新增 recallStats 键（json+required 承载 null）；EXTRACTION_PROMPT_VERSION v1.2
-
-生产 profile 已部署本轮与上轮全部产物（写盘，重启生效）。
+- **审计结论**：生产环境可用。六项证据链（部署哈希/宿主启动时序/符号链接新 store/vec 迁移完成/数据活性/嵌入链实际工作）
+- **Q1=B 密钥延后（拍板）**：settings.yaml 为字面 sk-key（YAML 跨行折叠）——功能正常、明文落盘安全债保留；`env:BAILIAN_API_KEY` 用户级变量未设置，迁移脚本未执行。历史记忆"已迁 env:"与现状不符，以文件为准
+- **Q2=A CI 上线（拍板，push 已授权）**：`.github/workflows/ci.yml`（typecheck+test+coverage 门槛 80/75/80/70+docs 断链+markdownlint）随 master 推送 origin 生效
+- **Q3=B 压测协议就绪**：`docs/COMPACTION_STRESS.md`——前置核验（modelPolicies 精确匹配陷阱）/触发步骤/六观察点 SQL/通过标准；待用户执行长会话投喂
+- 无代码接口契约变更（本轮纯审计+文档+推送）
 
 ## 三、已知风险点（诚实自曝）
 
-1. **生产待重启验证**：vec2 表迁移、注入/提取/观测全链路均需重启后实测；迁移日志应出现"向量表升级迁移完成"
-2. **原子化的条目数增长**：v1.2 拆分规则会让条目数上升——由写端门/supersede≥0.7/反思水位线协同消化；若 injectStats/recallStats 显示噪声上升需回调提示词强度
-3. **命中率不可观测**：宿主不暴露缓存命中 API，插件只能保障必要条件不能报告实际命中（CACHE_HIT.md §4）
-4. **延续项**：密钥明文未迁移 / 压缩双阈值未压测 / CI 未上线 / 反思水位线首轮全窗 / reject 步骤偶发嵌入浪费
+1. 🔴 **明文密钥落盘（拍板保留）**：settings.yaml 字面 sk-key；泄露面=本机文件读取；迁移三步（设 env 变量→改 env: 引用→重启宿主）随时可做
+2. 🟡 **压缩压测未执行**：协议已就绪待跑（见 COMPACTION_STRESS.md）
+3. 🟡 **原子化 v1.2 条目增速**：entries 9154 持续增长，粒度效果需 injectStats/recallStats 数据积累复核
+4. 🟢 反思水位线首轮全窗成本（一次性）/ reject 步骤偶发嵌入浪费 / 缓存命中率宿主不可观测 / 水位线游标存在性未直读验证
 
 ## 四、下次最该做的事
 
-1. **重启 DSH 全链路验证**：向量迁移日志 → 注入观测/扩展观测行出现 → 长对话观察提取产出粒度（原子化效果）
-2. **数据面调优**：积累 injectStats/recallStats 一周复核 MIN_SCORE=0.4、FOLD_JACCARD=0.6、原子化强度三参数
-3. **密钥一键迁移**：执行 `node scripts/migrate-apikey-to-env.mjs`
-4. **压缩压测 + CI 上线**：延续前两轮
+1. **执行压缩压测**：按 COMPACTION_STRESS.md 投喂专用会话至 400K，采集 O1-O4
+2. **核对 GitHub CI 首跑结果**（push 后 Actions 页）
+3. **数据面调优窗口**：injectStats/recallStats 积累一周后校准 MIN_SCORE/FOLD_JACCARD/原子化强度
+4. **密钥迁移**：随时可做（三步，见 R1）
