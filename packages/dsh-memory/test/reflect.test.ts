@@ -1035,8 +1035,19 @@ describe('P1 反思水位线（metaTable 注入）', () => {
     expect(metaTable.get(REFLECT_CURSOR_KEY)).toBeUndefined()
   })
 
-  it('常量钉住：REFLECT_MAX_TOKENS=4096（10 对/批 × ~200 tok 裁决需 ≥2K，1024 曾致全批截断）', () => {
-    expect(REFLECT_MAX_TOKENS).toBe(4096)
+  it('常量钉住：REFLECT_MAX_TOKENS=8192（推理模型思考链计入输出预算，4096 仍被 mimo-high 吃满）', () => {
+    expect(REFLECT_MAX_TOKENS).toBe(8192)
+  })
+
+  // Q-fix 第二层（2026-08-22 生产实测）：mimo-v2.5 High 推理档的 <think> 链计入输出
+  // 预算——10 对逐对深思即耗尽数千 token，正式 JSON 未开写就截断。反思是结构化
+  // 判定任务，调用级降推理档 'low' 对症。
+  it('LLM 调用传 reasoningEffort=low（结构化判定无需深推理；防截断复发）', async () => {
+    const { llm, reflector } = makeWatermarkReflector(watermarkEntries(), '{"decisions":[]}')
+    await reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    const firstCall = llm.calls[0] as { reasoningEffort?: unknown }
+    expect(firstCall.reasoningEffort).toBeDefined()
+    expect(String(firstCall.reasoningEffort)).toBe('low')
   })
 
   it('跨重启恢复：新 reflector 实例从 meta 表读回游标，无新增时不打 LLM', async () => {

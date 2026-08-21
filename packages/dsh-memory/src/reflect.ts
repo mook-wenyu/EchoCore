@@ -20,7 +20,7 @@
  * （2026-08-18 调优后下界由 0.15 降至 0.08，并加 minTokenOverlap≥2 辅助门）。
  */
 
-import { BlockAssembler, createUserMessage, type LlmRuntime, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, createUserMessage, ReasoningEffortId, type LlmRuntime, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 
@@ -112,11 +112,12 @@ export function adjustThresholdByHitRate(hitRate: number): number {
 /** LLM 输出上限 */
 /**
  * 单批 LLM 输出 token 上限。
- * Q-fix（2026-08-22 生产实测）：每批 REFLECT_BATCH_SIZE=10 对，每条裁决含两个
- * 36 位 id + 键名 + 中文理由 ≈150-200 tok → 10 条需 1.5-2K；原 1024 必然中途
- * 截断 → JSON 断裂 → 解析为空 → 全批"裁 0 跳 0"且无失败痕迹。4096 留双倍余量。
+ * Q-fix 两轮（2026-08-22 生产实测）：① 1024 < 每批 10 对裁决所需 ~1.5-2K，截断
+ * 静默零裁决；② 提至 4096 仍截断——mimo-v2.5 High 推理档的 <think> 链计入输出
+ * 预算，10 对逐对深思即耗尽数千 token。8192 + 调用级 reasoningEffort='low'
+ * （见 callLlm）双保险；推理模型思考长度不可控，此值为兜底上限而非精确预算。
  */
-export const REFLECT_MAX_TOKENS = 4096
+export const REFLECT_MAX_TOKENS = 8192
 
 /**
  * peer 相似带下界：低于此值语义关联太弱，交由纯函数时剔除
@@ -723,6 +724,11 @@ export class MemoryReflector {
       system: REFLECTION_SYSTEM_PROMPT,
       messages: [userMessage],
       maxTokens: REFLECT_MAX_TOKENS,
+      // Q-fix 第二层（2026-08-22 生产实测）：推理模型（mimo-v2.5 High）的思考链
+      // 计入 max_tokens 输出预算——10 对逐对深思即耗尽数千 token，正式 JSON 未开写
+      // 就截断。反思是结构化判定任务（对已由相似度预筛），降为 low 档对症；
+      // 官方契约 GenerateOptions.reasoningEffort?: ReasoningEffortId（branded string）。
+      reasoningEffort: ReasoningEffortId('low'),
     })) {
       assembler.push(chunk)
     }
