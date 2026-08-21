@@ -104,12 +104,21 @@ function setup(opts?: {
   }
   // P2：稳定快照（恒启用，行为参数已常量化为 SNAPSHOT_* 常量）
   const snapshot = new MemoryStableSnapshot({ store, now: clock.now })
-  // 可选假嵌入（语义单榜路径测试）；结构对齐 EmbeddingHolder（state 门控 + embed + index.knn）
+  // 可选假嵌入（语义单榜路径测试）；结构对齐 EmbeddingHolder（state 门控 + embed + index.knn）。
+  // embedMarks 记录每次查询嵌入发起（Q2=B 并行性断言用：embed 标记应先于 next-resolved）。
+  const embedMarks: string[] = []
   const embedding =
     opts?.knnHits === undefined
       ? undefined
       : ({
-          service: { state: 'ready', embed: async () => new Float32Array(4) },
+          service: {
+            state: 'ready',
+            dimension: 4,
+            embed: async (text: string) => {
+              embedMarks.push(`embed:${text}`)
+              return new Float32Array(4)
+            },
+          },
           index: { knn: () => opts.knnHits!() },
         } as never)
   const injector = new MemoryInjector({ store, snapshot, logger, embedding })
@@ -120,8 +129,73 @@ function setup(opts?: {
   const sessionEvents = ctx.listener('session/event') as ((session: Session, event: SessionEvent) => void) | undefined
   const disposed = ctx.listener('agent/disposed') as ((payload: { agent: { id: string; session: Session } }) => void) | undefined
   if (preStep === undefined || sessionEvents === undefined) throw new Error('监听未注册')
-  return { ctx, store, injector, snapshot, preStep, sessionEvents, disposed, clock }
+  return { ctx, store, injector, snapshot, preStep, sessionEvents, disposed, clock, embedMarks }
 }
+
+// Q2=B（2026-08-20 拍板）：查询嵌入与下游决定并行发起 + 查询向量 LRU 缓存
+describe('MemoryInjector 嵌入并行与查询向量缓存（Q2=B）', () => {
+  it('并行性：查询嵌入在 await next() 让出前就已发起（旧串行实现 embed 晚于 next-resolved）', async () => {
+    let knnCalls = 0
+    const { preStep, store, embedMarks } = setup({
+      knnHits: () => {
+        knnCalls++
+        return []
+      },
+    })
+    await seed(store, { content: longContent('量子纠缠态测量协议') })
+    const marks: string[] = []
+    const payload = makePayload('s1', '完全无关的查询词')
+    const promise = preStep(payload, async () => {
+      // next 挂起一拍：给并行嵌入留出发起窗口（微任务排空）
+      await Promise.resolve()
+      await Promise.resolve()
+      marks.push(...embedMarks)
+      marks.push('next-resolved')
+      return enterDecision()
+    })
+    await promise
+    // 并行语义断言：embed 发生在 next 完成之前（旧实现 embed 在 next 之后才发起）
+    const embedIdx = marks.findIndex((m) => m.startsWith('embed:'))
+    expect(embedIdx).toBeGreaterThanOrEqual(0)
+    expect(embedIdx).toBeLessThan(marks.indexOf('next-resolved'))
+    void knnCalls
+  })
+
+  it('查询向量缓存：相同查询文本只嵌一次；服务实例变化后失效重嵌', async () => {
+    const ctx = new FakeCtx()
+    const table = new FakeTable()
+    const store = new MemoryStore(table)
+    const snapshot = new MemoryStableSnapshot({ store, now: () => 1_000_000 })
+    let embedCount = 0
+    const embed = async () => {
+      embedCount++
+      return new Float32Array(4)
+    }
+    // 服务引用可热换（模拟面板保存）：getter 动态读当前实例
+    let currentService: unknown = { state: 'ready', dimension: 4, embed }
+    const embedding = {
+      get service() {
+        return currentService
+      },
+      index: { knn: () => [] as Array<{ id: string; cosine: number }> },
+    }
+    const injector = new MemoryInjector({ store, snapshot, logger: { warn: () => {}, info: () => {} }, embedding: embedding as never })
+    injector.install(ctx as unknown as Context)
+    const preStep = ctx.listener('agent/pre-step') as (payload: unknown, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>
+    await seed(store, { content: longContent('量子纠缠态测量协议') })
+    // 注意：步内查询含近期消息窗口（P3），同会话连发会使查询文本变化——
+    // 用独立会话 id 保证三次查询文本完全一致，专测"缓存命中/服务失效"语义
+    await preStep(makePayload('s-a', '稳定重复查询词'), async () => enterDecision())
+    expect(embedCount).toBe(1)
+    // 相同查询第二次（独立会话）→ 缓存命中，不再嵌
+    await preStep(makePayload('s-b', '稳定重复查询词'), async () => enterDecision())
+    expect(embedCount).toBe(1)
+    // 服务实例热换（面板保存场景）→ 缓存按服务身份失效，重新嵌入
+    currentService = { state: 'ready', dimension: 4, embed }
+    await preStep(makePayload('s-c', '稳定重复查询词'), async () => enterDecision())
+    expect(embedCount).toBe(2)
+  })
+})
 
 describe('MemoryInjector pre-step 注入', () => {
   it('命中记忆时追加注入消息并保留下游消息', async () => {

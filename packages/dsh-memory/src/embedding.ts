@@ -500,12 +500,20 @@ export async function searchWithSemantic<T>(
   query: string,
   options: SemanticSearchExtra,
   logWarn: (message: string, error?: unknown) => void,
+  /**
+   * Q2=B 预取向量（可选）：调用方（注入器）与下游决定并行发起的嵌入结果。
+   * 提供且维度与当前服务一致时跳过内部 embed（省一次 RTT）；维度不匹配
+   * （热换错配守卫）或未提供时照常内部嵌入。
+   */
+  prefetched?: Float32Array,
 ): Promise<T[]> {
   if (embedding === undefined || index === undefined || embedding.state !== 'ready') {
     return store.search({ query, ...options })
   }
   try {
-    const queryVector = await embedding.embed(query)
+    // 热换维度守卫：预取向量维度 ≠ 当前服务维度 → 视为无效，走内部嵌入
+    const queryVector =
+      prefetched !== undefined && prefetched.length === embedding.dimension ? prefetched : await embedding.embed(query)
     return store.search({
       query,
       ...options,

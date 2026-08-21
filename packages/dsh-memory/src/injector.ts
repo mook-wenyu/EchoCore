@@ -73,6 +73,18 @@ const RECENT_QUERY_WINDOW = 3
 /** P3：拼接查询中单条消息的截断长度（字符——防查询过长稀释 relevance 分母） */
 const QUERY_SEGMENT_CHARS = 100
 
+/** Q2=B 查询向量缓存上限（条；满时淘汰最旧一条——Map 插入序即淘汰序） */
+const QUERY_VECTOR_CACHE_MAX = 32
+/** Q2=B 查询向量缓存 TTL（ms）：窗口内相同查询文本零嵌入；导出供测试以真实值驱动 */
+export const QUERY_VECTOR_TTL_MS = 60_000
+
+/** Q2=B 缓存条目：绑定服务实例身份——面板保存热换后按身份失效（防维度错配复用） */
+interface QueryVectorCacheEntry {
+  vector: Float32Array
+  service: object
+  expiresAt: number
+}
+
 /** 注入器依赖（store 可注入，便于单测） */
 export interface InjectorDeps {
   store: MemoryStore
@@ -102,8 +114,45 @@ export class MemoryInjector {
   private readonly injectedSeqs = new Map<string, Map<string, number>>()
   /** P3：会话 → 最近 RECENT_QUERY_WINDOW 条真实用户消息文本（滚动窗口） */
   private readonly recentQueries = new Map<string, string[]>()
+  /** Q2=B：查询向量 LRU（相同查询文本 TTL 内零嵌入；服务热换按身份失效） */
+  private readonly queryVectorCache = new Map<string, QueryVectorCacheEntry>()
 
   constructor(private readonly deps: InjectorDeps) {}
+
+  /** P3/Q2=B 步内查询文本：当前消息 + 近期窗口（各截断防稀释；两处调用点共用同一拼装） */
+  private buildStepQuery(session: Session, current: string): string {
+    const recent = this.recentQueries.get(session.id) ?? []
+    return [current, ...recent].map((segment) => segment.slice(0, QUERY_SEGMENT_CHARS)).join(' ')
+  }
+
+  /**
+   * 发起查询嵌入（Q2=B，不等待）：ready 门控通过即返回嵌入 promise；
+   * 缓存命中（同查询文本 + 同服务实例 + 未过期）直接同步返回零成本向量。
+   * 失败语义与 searchWithSemantic 对齐：调用方消费 promise 时，非
+   * EmbeddingUnavailableError 异常照常浮出（保持既有抛出语义）。
+   */
+  private prefetchQueryEmbedding(query: string): Promise<Float32Array | undefined> {
+    const holderService = this.deps.embedding?.service
+    const index = this.deps.embedding?.index
+    if (holderService === undefined || index === undefined || holderService.state !== 'ready') {
+      return Promise.resolve(undefined)
+    }
+    const cached = this.queryVectorCache.get(query)
+    if (cached !== undefined && cached.service === holderService && cached.expiresAt > Date.now()) {
+      // LRU 触碰置新（Map 插入序 = 淘汰序）
+      this.queryVectorCache.delete(query)
+      this.queryVectorCache.set(query, cached)
+      return Promise.resolve(cached.vector)
+    }
+    return holderService.embed(query).then((vector) => {
+      if (this.queryVectorCache.size >= QUERY_VECTOR_CACHE_MAX) {
+        const oldest = this.queryVectorCache.keys().next().value
+        if (oldest !== undefined) this.queryVectorCache.delete(oldest)
+      }
+      this.queryVectorCache.set(query, { vector, service: holderService, expiresAt: Date.now() + QUERY_VECTOR_TTL_MS })
+      return vector
+    })
+  }
 
   /** 注册 pre-step、session/event 与 agent/disposed 监听 */
   install(ctx: Context): void {
@@ -135,10 +184,21 @@ export class MemoryInjector {
     payload: PreStepPayload,
     next: () => Promise<PreStepDecision>,
   ): Promise<PreStepDecision> {
+    // M8 查询清洗：只取用户来源文本（先于 next 计算——Q2=B 并行嵌入的前提）
+    const current = textOfBatch(payload.messages)
+    // Q2=B（2026-08-20 拍板）：查询文本此刻已知——立即发起嵌入与下游决定并行，
+    // 省一个嵌入 RTT。防浮动拒绝：立即包装为 settled 结果（宿主 failLoud 对未处理
+    // rejection 直接杀进程）；真实错误在下方消费点重抛，保持既有抛出语义。
+    // 边界：decision 为 reject 时本次嵌入作废（可接受的偶发浪费；缓存缓解重复）。
+    const embedTask =
+      current.trim() === ''
+        ? undefined
+        : this.prefetchQueryEmbedding(this.buildStepQuery(payload.agent.session, current)).then(
+            (vector) => ({ ok: true as const, vector }),
+            (error) => ({ ok: false as const, error }),
+          )
     const decision = await next()
     if (decision.kind !== 'enter' || decision.messages.length === 0) return decision
-
-    const current = textOfBatch(payload.messages)
     if (current.trim() === '') return decision
 
     const session = payload.agent.session
@@ -146,10 +206,18 @@ export class MemoryInjector {
     // P3：会话上下文派生查询——当前消息 + 最近 RECENT_QUERY_WINDOW-1 条历史
     // （各截断防稀释；"当前消息换话题"时历史主题词仍参与召回）
     const recent = this.recentQueries.get(session.id) ?? []
-    const segments = [current, ...recent].map((segment) => segment.slice(0, QUERY_SEGMENT_CHARS))
-    const query = segments.join(' ')
+    const query = this.buildStepQuery(session, current)
     // 滚动窗口：记录当前消息（最新在前；窗口满时丢最旧）
     this.recentQueries.set(session.id, [current.slice(0, QUERY_SEGMENT_CHARS), ...recent].slice(0, RECENT_QUERY_WINDOW))
+
+    // 消费并行嵌入结果（Q2=B）：失败在此重抛（既有语义）；维度错配由
+    // searchWithSemantic 内部守卫兜回内部嵌入
+    let prefetched: Float32Array | undefined
+    if (embedTask !== undefined) {
+      const settled = await embedTask
+      if (!settled.ok) throw settled.error
+      prefetched = settled.vector
+    }
 
     // P4：语义增强检索（状态门控 + 显式降级；未启用时纯关键词，行为与 P3 前一致）
     // P1：withScore 返回带分条目——按置信度分档渲染。
@@ -167,6 +235,7 @@ export class MemoryInjector {
       query,
       { workspace, limit: TOP_K, minScore: MIN_SCORE, withScore: true },
       (message, error) => this.deps.logger.warn(message, error),
+      prefetched,
     )) as unknown as Array<{ entry: MemoryEntry; score: number; relevance: number }>
     const fresh = candidates.filter(
       (item) =>
