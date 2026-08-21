@@ -65,53 +65,28 @@ export function apply(ctx: Context, config: ConfigType): Promise<void> {
  * 由 settings seam 构建面板配置 RPC 上下文。
  * 无 seam（测试直连 mountMemory）：配置视图用装配传入值；持久化/重启拒绝——
  * 测试面不触碰真实配置源（index.test 只验证装配，配置端点契约见 host-rpc.test）。
+ * 导出仅供单测注入假 ctx 验证回退链（项目既有惯例：纯函数导出可测）。
  */
-function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig, ctx: Context): MemoryRpcContext {
+export function rpcContextFrom(seam: SettingsSeam | undefined, fallback: ResolvedConfig, ctx: Context): MemoryRpcContext {
   // DSH 宿主 agent-default-model 回退源：memory LLM 配置为空时经此获取宿主默认模型。
-  // ctx.agentDefaultModel 为 Cordis 服务注入（dsh-agent-default-model 插件提供），
-  // 宿主未挂载时 ctx.get 返回 undefined——回退函数统一返回 undefined（诚实返回）。
+  //
+  // 官方契约（@deepseek-ai/dsh-agent-default-model 源码实证，2026-08-22）：
+  // dsh-base 组合包注册共享服务 `ctx.agentDefaultModel`（Cordis Service，
+  // apiproxy/headless 均消费），currentSelection() 返回叠加 settings.yaml
+  // 用户层后的 { provider, model }。
+  //
+  // 历史（勿重蹈）：旧实现两路全错——① 猜测 `ctx.get('settings').get(ns)` 契约
+  // （不存在）；② 在 ESM 产物里用 CJS require 调 node:fs 读 YAML（ReferenceError
+  // 被空 catch 吞掉）——两层静默失效导致面板"运行反思"恒报"无可用模型路由"。
+  // 服务未挂载（非宿主环境/测试直连）时诚实返回 undefined，由调用方给出
+  // "无可用模型路由"显式告警（不引入猜测性 YAML 手写解析兜底）。
   const getDefaultModel = (): { provider: string; model: string } | undefined => {
-    // 方案1：尝试从 DSH settings 服务读取 agent-default-model 命名空间
-    try {
-      const svc = ctx.get('settings') as { get?: (ns: string) => { provider?: string; model?: string } | undefined } | undefined
-      if (svc !== undefined && typeof svc.get === 'function') {
-        const agentDefault = svc.get('agent-default-model')
-        if (agentDefault?.provider && agentDefault?.model) {
-          return { provider: agentDefault.provider, model: agentDefault.model }
-        }
-      }
-    } catch {}
-    // 方案2：直接读取 settings.yaml 文件（降级兜底）
-    try {
-      const fs = require('node:fs') as typeof import('node:fs')
-      const path = require('node:path') as typeof import('node:path')
-      const os = require('node:os') as typeof import('node:os')
-      const settingsPath = path.join(os.homedir(), '.dsh', 'settings.yaml')
-      if (fs.existsSync(settingsPath)) {
-        const content = fs.readFileSync(settingsPath, 'utf-8')
-        // 简单解析 YAML：找 agent-default-model 段的 provider/model
-        const lines = content.split('\n')
-        let inAgentDefault = false
-        let provider = ''
-        let model = ''
-        for (const line of lines) {
-          if (line.trim().startsWith('agent-default-model:')) {
-            inAgentDefault = true
-            continue
-          }
-          if (inAgentDefault) {
-            if (line.startsWith('  ') || line.startsWith('\t')) {
-              const trimmed = line.trim()
-              if (trimmed.startsWith('provider:')) provider = trimmed.split(':')[1]?.trim().replace(/['"]/g, '') ?? ''
-              if (trimmed.startsWith('model:')) model = trimmed.split(':')[1]?.trim().replace(/['"]/g, '') ?? ''
-            } else {
-              break
-            }
-          }
-        }
-        if (provider && model) return { provider, model }
-      }
-    } catch {}
+    const svc = (ctx as { agentDefaultModel?: { currentSelection?: () => { provider?: string; model?: string } } })
+      .agentDefaultModel
+    const selection = svc?.currentSelection?.()
+    if (selection?.provider !== undefined && selection.provider !== '' && selection?.model !== undefined && selection.model !== '') {
+      return { provider: selection.provider, model: selection.model }
+    }
     return undefined
   }
   if (seam === undefined) {
