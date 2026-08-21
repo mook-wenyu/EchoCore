@@ -1,6 +1,6 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（"运行反思"三层根因修复：官方路由服务/inject 登记/失败原因可观测；Playwright 实测路由已通、批次执行存在真实错误待重启后显形）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（"运行反思"四层根因全部修复：路由服务/inject 登记/失败可观测/max_tokens 截断；Playwright 实测端到端已通——审 60·选择器与 LLM 批次全链路工作）。
 
 ## 一、架构健康度
 
@@ -20,8 +20,8 @@
 ## 三、已知风险点（诚实自曝）
 
 1. 🔴 **明文密钥落盘（前轮拍板保留）**
-2. 🟡 **"运行反思"三层根因修复完成，待最终重启验证**：① getDefaultModel 改官方服务 ctx.agentDefaultModel（55d222a）；② inject 补登 agentDefaultModel——Cordis 守卫拒绝未声明访问（ee4fc22）；③ 失败原因可观测：lastError 透传面板，不再把批次执行错误误标为路由问题（6fd0241）。**Playwright 实测**：修正默认模型为已注册路由（opencode-go/mimo-v2.5，原 opencode-new/x-preview-f-free 未注册适配器）后，路由解析成功、反思真实运行约 5-6 分钟后失败——真实错误被当时运行的旧码吞掉，重启加载 ③ 后下一轮点击将显示真实 error.message；另 agent-default-model 配置已同步修正
-3. 🟢 原子化条目增速观察 / meta 双键残留 / reflectCursor 未初始化（等首个维护周期）/ reject 偶发嵌入浪费
+2. ✅ **"运行反思"四层根因全部修复（2026-08-22 Playwright 实测端到端打通）**：① getDefaultModel 改官方服务 ctx.agentDefaultModel（55d222a）；② inject 补登 agentDefaultModel——Cordis 守卫（ee4fc22）；③ 失败原因可观测 lastError 透传（6fd0241）；④ **零裁决根因=REFLECT_MAX_TOKENS 1024 截断**——每批 10 对裁决需 ~1.5-2K token，截断 JSON 解析为空静默呈现"裁0跳0"；修复=max-tokens finish 显式失败 + 上限 4096（6114e83）。实测轨迹：修正默认模型路由（opencode-new 未注册→opencode-go/mimo-v2.5）后 审60·裁0·跳0 → ④ 修复后待重启复跑预期产出真实裁决；agent-default-model 配置已同步修正
+3. 🟢 原子化条目增速观察 / meta 双键残留 / reject 偶发嵌入浪费 / 反思 LLM 保守判 none 的裁决质量需多轮观察
 
 ## 四、下次最该做的事
 
