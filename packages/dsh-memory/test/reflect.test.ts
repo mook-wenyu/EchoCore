@@ -20,6 +20,7 @@ import {
   REFLECT_CURSOR_KEY,
   REFLECT_FOCUS_BUDGET,
   REFLECT_INTERVAL_MS,
+  REFLECT_MAX_TOKENS,
   REFLECT_SEMANTIC_THRESHOLD,
   REFLECT_SEMANTIC_THRESHOLD_LOCAL,
   REFLECT_SEMANTIC_THRESHOLD_REMOTE,
@@ -72,7 +73,7 @@ class FakeLlm {
 }
 
 /** 把一段文本编码为流分片 */
-function textStream(text: string, reasonKind: 'stop' | 'aborted' | 'error' = 'stop'): StreamChunk[] {
+function textStream(text: string, reasonKind: 'stop' | 'aborted' | 'error' | 'max-tokens' = 'stop'): StreamChunk[] {
   return [
     { type: 'block-start', index: 0, blockType: 'text' },
     { type: 'text-delta', index: 0, text },
@@ -1022,6 +1023,20 @@ describe('P1 反思水位线（metaTable 注入）', () => {
     const result = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
     expect(result).toBeUndefined()
     expect(metaTable.get(REFLECT_CURSOR_KEY)).toBeUndefined()
+  })
+
+  // Q-fix（2026-08-22 生产实测）：max-tokens 截断曾静默放行——输出 JSON 断裂被解析为
+  // 空数组，面板呈现"审 N·裁 0"且无任何失败痕迹（生产 6 批全零裁决根因）。
+  it('max-tokens 截断 → 显式失败：runOnce undefined + lastError 可观测 + 游标不动', async () => {
+    const { reflector, metaTable } = makeWatermarkReflector(watermarkEntries(), '{"decisions":[{"focusId":"a"', 'max-tokens')
+    const result = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    expect(result).toBeUndefined()
+    expect(reflector.lastError).toContain('max_tokens')
+    expect(metaTable.get(REFLECT_CURSOR_KEY)).toBeUndefined()
+  })
+
+  it('常量钉住：REFLECT_MAX_TOKENS=4096（10 对/批 × ~200 tok 裁决需 ≥2K，1024 曾致全批截断）', () => {
+    expect(REFLECT_MAX_TOKENS).toBe(4096)
   })
 
   it('跨重启恢复：新 reflector 实例从 meta 表读回游标，无新增时不打 LLM', async () => {

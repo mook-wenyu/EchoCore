@@ -110,7 +110,13 @@ export function adjustThresholdByHitRate(hitRate: number): number {
 }
 
 /** LLM 输出上限 */
-export const REFLECT_MAX_TOKENS = 1024
+/**
+ * 单批 LLM 输出 token 上限。
+ * Q-fix（2026-08-22 生产实测）：每批 REFLECT_BATCH_SIZE=10 对，每条裁决含两个
+ * 36 位 id + 键名 + 中文理由 ≈150-200 tok → 10 条需 1.5-2K；原 1024 必然中途
+ * 截断 → JSON 断裂 → 解析为空 → 全批"裁 0 跳 0"且无失败痕迹。4096 留双倍余量。
+ */
+export const REFLECT_MAX_TOKENS = 4096
 
 /**
  * peer 相似带下界：低于此值语义关联太弱，交由纯函数时剔除
@@ -721,8 +727,14 @@ export class MemoryReflector {
       assembler.push(chunk)
     }
     const finishKind = assembler.finish.kind
+    // Q-fix（2026-08-22）：max-tokens 截断必须显式失败——截断的 JSON 会被解析器
+    // 静默当 0 裁决，全批"裁 0 跳 0"无任何痕迹（生产实测 6 批全零裁决根因）。
+    // 显式抛出走 runOnce catch → lastError → 面板可见真实原因。
     if (finishKind === 'aborted' || finishKind === 'error') {
       throw new Error(`反思调用未正常完成（${finishKind} finish）`)
+    }
+    if (finishKind === 'max-tokens') {
+      throw new Error('反思调用因 max_tokens 截断——输出不完整已丢弃（批次对数过多或 REFLECT_MAX_TOKENS 不足）')
     }
     const textOut = assembler
       .blocks()
