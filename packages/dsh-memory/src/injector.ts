@@ -152,7 +152,10 @@ export class MemoryInjector {
     this.recentQueries.set(session.id, [current.slice(0, QUERY_SEGMENT_CHARS), ...recent].slice(0, RECENT_QUERY_WINDOW))
 
     // P4：语义增强检索（状态门控 + 显式降级；未启用时纯关键词，行为与 P3 前一致）
-    // P1：withScore 返回带综合分条目——按置信度分档渲染。
+    // P1：withScore 返回带分条目——按置信度分档渲染。
+    // Q1=A 解耦（2026-08-20 拍板）：档位判据 = **纯相关性 relevance**（RRF/IDF
+    // 归一化 0..1，双榜印证≥0.7 完整渲染 / 单榜 0.4-0.7 摘要渲染），时间重要性
+    // 不再参与门槛（修复 imp<6 完美相关记忆单榜即被丢弃的缺陷）。
     // 双重断言理由：searchWithSemantic 的泛型从 store 形参签名推断（单签名
     // `search(options): T[]`），可选 withScore 走重载 0 → T=MemoryEntry；运行时
     // 实际走 store.search 重载 1（withScore: true）返回带分数组——断言只收窄
@@ -164,7 +167,7 @@ export class MemoryInjector {
       query,
       { workspace, limit: TOP_K, minScore: MIN_SCORE, withScore: true },
       (message, error) => this.deps.logger.warn(message, error),
-    )) as unknown as Array<{ entry: MemoryEntry; score: number }>
+    )) as unknown as Array<{ entry: MemoryEntry; score: number; relevance: number }>
     const fresh = candidates.filter(
       (item) =>
         // 表层去重：已注入且未被压缩遮蔽的不再注入
@@ -175,10 +178,10 @@ export class MemoryInjector {
     )
     if (fresh.length === 0) return decision
 
-    // P1 三档渲染：高置信（≥0.7）完整行；中置信（0.4-0.7）摘要行（仅 content
-    // 前 80 字符 + 记忆 id——压缩 metadata 减少注入体积）；低置信已被 minScore 排除
+    // P1 三档渲染（Q1=A 解耦后语义）：relevance ≥0.7（双榜印证）完整行；
+    // 0.4-0.7（单榜）摘要行；<0.4 已被 minScore 排除
     const lines: Array<{ id: string; line: string }> = []
-    for (const { entry, score } of fresh) {
+    for (const { entry, relevance } of fresh) {
       const view = {
         id: entry.id,
         kind: entry.kind,
@@ -188,7 +191,7 @@ export class MemoryInjector {
         createdAt: entry.createdAt,
       }
       const line =
-        score >= INJECT_HIGH_CONFIDENCE_SCORE
+        relevance >= INJECT_HIGH_CONFIDENCE_SCORE
           ? formatMemoryLine(view)
           : formatMemoryLineCondensed(view, INJECT_MID_SUMMARY_CHARS)
       lines.push({ id: entry.id, line })

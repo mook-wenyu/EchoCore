@@ -189,8 +189,23 @@ export function buildDfMap(
 }
 
 /**
+ * 带分检索行（Q1=A 解耦，2026-08-20 用户拍板）：
+ * - relevance：**纯相关性**（RRF 归一化 0..1 / IDF 加权 relevance）——minScore
+ *   门槛与注入三档置信档位建在其上；时间重要性不再稀释召回面（修复 imp<6 的
+ *   完美相关记忆单榜即被丢弃的缺陷：0.5×0.75=0.375<0.4）；
+ * - score：排序分 = relevance × timeImportanceFactor——时间/重要度只影响先后，
+ *   不再参与门槛。
+ */
+export interface ScoredEntry {
+  entry: MemoryEntry
+  score: number
+  relevance: number
+}
+
+/**
  * IDF 加权关键词评分（保留 0-1 标定，轻量 BM25 化）。
- * 对每条候选计算 idfWeightedRelevance × timeImportanceFactor，过滤弱命中与低分。
+ * 对每条候选计算 idfWeightedRelevance，过噪声下限与 minScore 门槛后返回；
+ * 排序分 = relevance × timeImportanceFactor（解耦语义见 ScoredEntry）。
  */
 export function scoreWithIdf(
   matches: MemoryEntry[],
@@ -198,16 +213,17 @@ export function scoreWithIdf(
   cache: Map<string, Set<string>>,
   now: number,
   minScore: number,
-): Array<{ entry: MemoryEntry; score: number }> {
+): ScoredEntry[] {
   // 先一次性统计 df（候选集内分布），再逐条算分
   const df = buildDfMap(matches, queryTokens, cache)
-  const scored: Array<{ entry: MemoryEntry; score: number }> = []
+  const scored: ScoredEntry[] = []
   for (const entry of matches) {
-    const rel = idfWeightedRelevance(queryTokens, getCachedTokens(cache, entry), (t) => df.get(t) ?? 0, matches.length)
+    const relevance = idfWeightedRelevance(queryTokens, getCachedTokens(cache, entry), (t) => df.get(t) ?? 0, matches.length)
     // 噪声下限：原始 relevance < 0.3 的弱命中不入检索（F3 BM25 噪声下限）
-    if (rel < MIN_RELEVANCE_SCORE) continue
-    const score = rel * timeImportanceFactor(entry, now)
-    if (score >= minScore) scored.push({ entry, score })
+    if (relevance < MIN_RELEVANCE_SCORE) continue
+    // Q1=A 解耦：门槛建在纯相关性上；时间/重要度只调排序
+    if (relevance < minScore) continue
+    scored.push({ entry, relevance, score: relevance * timeImportanceFactor(entry, now) })
   }
   return scored
 }
@@ -264,7 +280,7 @@ export function buildSemanticRank(
 
 /**
  * RRF 融合评分（B1 排名融合，免疫两路分数尺度差异）。
- * 两路排名（关键词 relevance / 语义 cosine）经 1/(k+rank) 叠加后×时间重要性因子。
+ * Q1=A 解耦：relevance = rrfScore 纯分（门槛建在其上）；排序分 = relevance × TIF。
  */
 export function scoreWithRrf(
   matches: MemoryEntry[],
@@ -274,16 +290,17 @@ export function scoreWithRrf(
   options: SearchOptions,
   limit: number | undefined,
   minScore: number,
-): Array<{ entry: MemoryEntry; score: number }> {
+): ScoredEntry[] {
   // 关键词榜排名（用于 RRF）
   const kwRank = buildKeywordRank(matches, queryTokens, cache)
   // 语义榜排名（KNN 或全量余弦）
   const semRank = buildSemanticRank(matches, options, limit)
   // 为每条候选算 RRF 融合分（未上榜 rank=undefined 视为 0 贡献）
-  const scored: Array<{ entry: MemoryEntry; score: number }> = []
+  const scored: ScoredEntry[] = []
   for (const entry of matches) {
-    const score = rrfScore(kwRank.get(entry.id), semRank.get(entry.id)) * timeImportanceFactor(entry, now)
-    if (score >= minScore) scored.push({ entry, score })
+    const relevance = rrfScore(kwRank.get(entry.id), semRank.get(entry.id))
+    if (relevance < minScore) continue
+    scored.push({ entry, relevance, score: relevance * timeImportanceFactor(entry, now) })
   }
   return scored
 }

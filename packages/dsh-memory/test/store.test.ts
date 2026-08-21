@@ -312,6 +312,28 @@ describe('MemoryStore.search', () => {
     expect(scored[0]?.score).toBe(0)
   })
 
+  it('Q1=A 解耦（2026-08-20 拍板）：低重要度单榜第一不再被 TIF 压出门槛（relevance≥minScore 即入选）', async () => {
+    const store = new MemoryStore(new FakeTable(), nowFn)
+    // imp2 fresh：TIF = (0.6+0.4×1)×(0.5+2/20)=0.60 → 旧耦合分 = 0.5×0.60=0.30 < 0.4 被丢；
+    // 解耦后 relevance=0.5 ≥ minScore 0.4 入选，排序分仍为 relevance×TIF
+    await store.create(input({ content: '量子纠缠态测量协议', importance: 2 }))
+    const scored = store.search({
+      query: '怎么管理多包项目',
+      limit: 5,
+      minScore: 0.4,
+      withScore: true,
+      queryEmbedding: [1, 0],
+      lookupEmbedding: () => [1, 0], // cosine≈1 → 语义单榜第一 → RRF 归一化 relevance=0.5
+    })
+    expect(scored).toHaveLength(1)
+    const item = scored[0]!
+    expect(item.relevance).toBeGreaterThan(0.45)
+    expect(item.relevance).toBeLessThanOrEqual(0.55)
+    // 排序分 = relevance × TIF（imp2 fresh ≈ 0.5×0.60=0.30）——门槛与排序量纲分离
+    expect(item.score).toBeLessThan(item.relevance)
+    expect(item.score).toBeGreaterThan(0.2)
+  })
+
   it('kind 过滤生效', async () => {
     const store = new MemoryStore(new FakeTable(), nowFn)
     await store.create(input({ kind: 'todo', content: '待办：重构评分模块' }))

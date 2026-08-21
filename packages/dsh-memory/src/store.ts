@@ -270,9 +270,9 @@ export class MemoryStore {
   // 检索（委托 search 子模块，保持 100% 行为）
   // ────────────────────────────────────────────────────────────────────────
 
-  search(options: { query: string; workspace?: string; kind?: MemoryKind; tag?: string; status?: MemoryStatus; limit?: number; minScore?: number; includeArchived?: boolean; includeSuperseded?: boolean; queryEmbedding?: ArrayLike<number>; withScore: true; lookupEmbedding?: (id: string) => number[] | undefined; semanticRank?: (q: ArrayLike<number>, k: number) => Array<{ id: string; cosine: number }> }): Array<{ entry: MemoryEntry; score: number }>
+  search(options: { query: string; workspace?: string; kind?: MemoryKind; tag?: string; status?: MemoryStatus; limit?: number; minScore?: number; includeArchived?: boolean; includeSuperseded?: boolean; queryEmbedding?: ArrayLike<number>; withScore: true; lookupEmbedding?: (id: string) => number[] | undefined; semanticRank?: (q: ArrayLike<number>, k: number) => Array<{ id: string; cosine: number }> }): import('./store/search.js').ScoredEntry[]
   search(options: { query: string; workspace?: string; kind?: MemoryKind; tag?: string; status?: MemoryStatus; limit?: number; minScore?: number; includeArchived?: boolean; includeSuperseded?: boolean; queryEmbedding?: ArrayLike<number>; withScore?: boolean; lookupEmbedding?: (id: string) => number[] | undefined; semanticRank?: (q: ArrayLike<number>, k: number) => Array<{ id: string; cosine: number }> }): MemoryEntry[]
-  search(options: import('./store/search.js').SearchOptions): MemoryEntry[] | Array<{ entry: MemoryEntry; score: number }> {
+  search(options: import('./store/search.js').SearchOptions): MemoryEntry[] | import('./store/search.js').ScoredEntry[] {
     const query = options.query.trim()
     const limit = options.limit ?? 8
     const minScore = options.minScore ?? 0.15
@@ -289,15 +289,15 @@ export class MemoryStore {
     trackAccess(top, { table: this.table, lastTrackedAt: this.lastTrackedAt, now, iso: () => this.iso() })
     if (options.withScore === true) {
       const topScored = scored.slice(0, limit)
-      return top.map((entry, i) => ({ entry, score: topScored[i]?.score ?? 0 }))
+      return top.map((entry, i) => ({ entry, score: topScored[i]?.score ?? 0, relevance: topScored[i]?.relevance ?? 0 }))
     }
     return top
   }
 
   /** 空查询搜索：委托 handleEmptyQuery 并处理 withScore 分流 */
-  private handleEmptySearch(matches: MemoryEntry[], options: import('./store/search.js').SearchOptions, limit: number): MemoryEntry[] | Array<{ entry: MemoryEntry; score: number }> {
+  private handleEmptySearch(matches: MemoryEntry[], options: import('./store/search.js').SearchOptions, limit: number): MemoryEntry[] | import('./store/search.js').ScoredEntry[] {
     const top = handleEmptyQuery(matches, options, limit)
-    if (options.withScore === true) return top.map((entry) => ({ entry, score: 0 }))
+    if (options.withScore === true) return top.map((entry) => ({ entry, score: 0, relevance: 0 }))
     return top
   }
 
@@ -308,7 +308,7 @@ export class MemoryStore {
     now: number,
     options: import('./store/search.js').SearchOptions,
     minScore: number,
-  ): Array<{ entry: MemoryEntry; score: number }> {
+  ): import('./store/search.js').ScoredEntry[] {
     const useSemantic =
       options.semanticRank !== undefined || (options.queryEmbedding !== undefined && options.lookupEmbedding !== undefined)
     if (useSemantic) {

@@ -83,7 +83,13 @@ function longContent(padding: string, overheadChars = 8230): string {
  * 快照恒启用；"可被实时注入"的记忆须为快照未收录的长尾（见 longContent）。
  * 快照时钟可拨动（F5 重建降频测试需推进 SNAPSHOT_MIN_REBUILD_INTERVAL_MS）。
  */
-function setup() {
+function setup(opts?: {
+  /**
+   * 假嵌入持有者的 KNN 桩（Q1=A 解耦测试用）：提供时注入器走语义融合路径，
+   * 每次检索以本工厂的返回值作为语义榜（惰性求值——可在 seed 后再定榜）。
+   */
+  knnHits?: () => Array<{ id: string; cosine: number }>
+}) {
   const ctx = new FakeCtx()
   const table = new FakeTable()
   const store = new MemoryStore(table)
@@ -98,7 +104,15 @@ function setup() {
   }
   // P2：稳定快照（恒启用，行为参数已常量化为 SNAPSHOT_* 常量）
   const snapshot = new MemoryStableSnapshot({ store, now: clock.now })
-  const injector = new MemoryInjector({ store, snapshot, logger })
+  // 可选假嵌入（语义单榜路径测试）；结构对齐 EmbeddingHolder（state 门控 + embed + index.knn）
+  const embedding =
+    opts?.knnHits === undefined
+      ? undefined
+      : ({
+          service: { state: 'ready', embed: async () => new Float32Array(4) },
+          index: { knn: () => opts.knnHits!() },
+        } as never)
+  const injector = new MemoryInjector({ store, snapshot, logger, embedding })
   injector.install(ctx as unknown as Context)
   const preStep = ctx.listener('agent/pre-step') as
     | ((payload: unknown, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>)
@@ -388,25 +402,40 @@ describe('MemoryInjector 置信度分档（P1）', () => {
     return text
   }
 
-  it('高置信（≥0.7）：完整行渲染（含重要度与来源会话）', async () => {
+  it('高置信（≥0.7）：完整行渲染（含重要度与来源会话）——纯相关性驱动，与重要度无关', async () => {
     const { preStep, store } = setup()
-    // 长尾内容（> 快照预算不进快照）+ importance 10 → timeImportance 1.0
+    // 长尾内容（> 快照预算不进快照）；Q1=A 解耦后档位只看 relevance：
+    // 查询双 token 全命中 → IDF relevance 1.0 ≥0.7 完整档（importance 不参与门槛）
     await seed(store, { content: `pnpm workspace ${'长记忆内容短语'.repeat(2000)}`, importance: 10 })
-    // 查询双 token 全命中 → relevance 1.0 × 1.0 = 1.0 ≥0.7 全量档
     const text = injectedText(await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision()))
     expect(text).toContain('重要度 10')
     expect(text).toContain('来自会话')
   })
 
-  it('中置信（0.4-0.7）：摘要行渲染（无重要度/来源会话，content 截断）', async () => {
-    const { preStep, store } = setup()
-    // importance 3 → timeImportance 0.65 → relevance 1.0 × 0.65 = 0.65（0.4-0.7 摘要档）
-    await seed(store, { content: `pnpm workspace ${'长记忆内容短语'.repeat(2000)}`, importance: 3 })
-    const text = injectedText(await preStep(makePayload('s1', 'pnpm workspace'), async () => enterDecision()))
+  it('中置信（0.4-0.7）：摘要行渲染——语义单榜 relevance=0.5（与重要度无关）', async () => {
+    // Q1=A 解耦后档位判据 = 纯相关性：语义单榜第一经 RRF 归一化恒 0.5 ∈[0.4,0.7)
+    // → 摘要渲染，即使 importance 10（重要性不再抬高置信档位）
+    let hits: Array<{ id: string; cosine: number }> = []
+    const { preStep, store } = setup({ knnHits: () => hits })
+    const seeded = await seed(store, { content: longContent('量子纠缠态测量协议'), importance: 10 })
+    hits = [{ id: seeded.id, cosine: 0.9 }]
+    const text = injectedText(await preStep(makePayload('s1', '完全无关的查询词'), async () => enterDecision()))
     expect(text).toContain('记忆 #')
     expect(text).not.toContain('重要度')
     expect(text).not.toContain('来自会话')
     expect(text).toContain('…') // 摘要截断省略号
+  })
+
+  it('Q1=A 解耦回归：低重要度语义单榜第一仍可注入（门槛不再乘 TIF）', async () => {
+    // imp1 fresh：旧耦合分 = relevance 0.5 × TIF(imp1)=0.55 → 0.275 < 0.4 被丢；
+    // 解耦后门槛建在 relevance=0.5 上 → 注入（摘要档）。这是解耦修复的直接行为证明。
+    let hits: Array<{ id: string; cosine: number }> = []
+    const { preStep, store } = setup({ knnHits: () => hits })
+    const seeded = await seed(store, { content: longContent('量子纠缠态测量协议'), importance: 1 })
+    hits = [{ id: seeded.id, cosine: 0.9 }]
+    const text = injectedText(await preStep(makePayload('s1', '完全无关的查询词'), async () => enterDecision()))
+    expect(text).toContain('记忆 #')
+    expect(text).toContain('…')
   })
 
   it('低置信（<0.4）：不注入', async () => {
