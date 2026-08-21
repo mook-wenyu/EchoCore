@@ -81,9 +81,11 @@ export interface MemoryPanelConfigView {
   llmModel: string
 }
 
-/** 反思执行结果视图（与宿主 handleReflect 对齐） */
+/** 反思执行结果视图（与宿主 handleReflect 对齐；reason=未执行原因——失败可观测） */
 export interface ReflectResultView {
   ran: boolean
+  /** ran=false 时的原因：no_model_route / reflector_not_connected / 反思批次失败：<err> */
+  reason?: string
   reviewed: number
   decisions: number
   merged: number

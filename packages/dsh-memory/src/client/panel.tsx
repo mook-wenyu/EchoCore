@@ -296,7 +296,13 @@ export function MemoryPanel(props: MemoryPanelProps): React.ReactElement {
       await refreshStats()
       // 消费 ReflectResultView（在 refresh 之后设置，避免被 refresh 清空）
       if (result.ran === false) {
-        setError('无可用模型路由：请在 DSH 设置→模型页面配置默认模型（provider/model），或在记忆面板配置中设置 llm.provider + llm.model，然后发一条消息触发路由缓存')
+        // Q-fix（2026-08-22）：真实原因优先透出——此前一律硬编码"无可用模型路由"，
+        // 把 LLM 批次执行错误误标成路由问题，误导排障
+        if (result.reason !== undefined && !result.reason.includes('no_model_route')) {
+          setError(`反思未执行：${result.reason}`)
+        } else {
+          setError('无可用模型路由：请在 DSH 设置→模型页面配置默认模型（provider/model），或在记忆面板配置中设置 llm.provider + llm.model，然后发一条消息触发路由缓存')
+        }
       } else if (result.reviewed === 0) {
         setNotice('已执行：无候选对（0 审）')
       } else if (result.decisions > 0) {

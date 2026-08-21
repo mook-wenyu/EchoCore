@@ -466,7 +466,29 @@ describe('MemoryPanel P0 反思增强（TDD）', () => {
     }
   })
 
-  it('ReflectResult ran:false → 提示“无可用模型路由/LLM 未就绪”', async () => {
+  it('ReflectResult ran:false + reason → 透出真实原因（不再一律硬编码路由提示）', async () => {
+    const reflect = vi.fn(async () => ({ ran: false, reason: '反思批次失败：LLM 400 Bad Request', reviewed: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 }))
+    const status = vi.fn(async () => ({
+      total: 0,
+      active: 0,
+      archived: 0,
+      byKind: { fact: 0, preference: 0, decision: 0, todo: 0, insight: 0 },
+      writeFailures: 0,
+      embeddingState: 'ready',
+      lastMaintenanceAt: null,
+      rejectedCount: 0,
+    }))
+    const view = render(React.createElement(MemoryPanel, { api: fakeApi({ status, reflect }), close: () => {} }))
+    try {
+      await waitFor(() => expect(screen.getByText('运行反思')).toBeTruthy())
+      fireEvent.click(screen.getByText('运行反思'))
+      await waitFor(() => expect(screen.getByText(/反思未执行：反思批次失败：LLM 400 Bad Request/)).toBeTruthy())
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('ReflectResult ran:false 无 reason（旧宿主）→ 回退路由提示文案', async () => {
     const reflect = vi.fn(async () => ({ ran: false, reviewed: 0, decisions: 0, merged: 0, archived: 0, skipped: 0 }))
     const status = vi.fn(async () => ({
       total: 0,

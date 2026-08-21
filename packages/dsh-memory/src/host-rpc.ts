@@ -70,6 +70,8 @@ export interface MemoryRpcContext {
 /** 反思触发形状（面板 RPC 手动触发；route 缺省回退反思器缓存——面板无会话） */
 export interface ReflectTrigger {
   runOnce(route: { provider: string; model: string } | undefined, opts?: { force?: boolean }): Promise<ReflectionSummary | undefined>
+  /** 最近一次批次失败原因（Q-fix 2026-08-22：undefined 时区分"无路由"与"执行失败"——失败可观测；getter 属性形态） */
+  lastError?: string | undefined
 }
 
 /** 构造 RPC 分发器（O1：runtime 健康指标可选注入——status 端点覆盖 store 占位；reflector 可选——reflect 端点） */
@@ -144,7 +146,12 @@ async function handleReflect(
 ): Promise<{ ran: boolean; reason?: string; reviewed?: number; decisions?: number; merged?: number; archived?: number; skipped?: number }> {
   if (reflector === undefined) return { ran: false, reason: 'reflector_not_connected' }
   const summary = await reflector.runOnce(route, { force: true })
-  if (summary === undefined) return { ran: false, reason: 'no_route_or_no_candidates' }
+  if (summary === undefined) {
+    // Q-fix（2026-08-22）：区分"无路由"与"批次执行失败"——此前一律 no_route_or_no_candidates，
+    // 面板把 LLM 执行错误误标成"请配置默认模型"，误导排障方向
+    const lastError = reflector.lastError
+    return { ran: false, reason: lastError !== undefined ? `反思批次失败：${lastError}` : 'no_model_route' }
+  }
   return {
     ran: true,
     reviewed: summary.reviewed,

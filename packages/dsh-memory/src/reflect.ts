@@ -544,6 +544,13 @@ export class MemoryReflector {
    */
   /** 重入互斥：当前运行中的批次 promise（定时 + 手动 force 并发合并为一次执行） */
   private running: Promise<ReflectionSummary | undefined> | undefined
+  /** 最近一次批次失败原因（成功路径清除；RPC/面板透出用——失败可观测） */
+  private lastErrorValue: string | undefined
+
+  /** 最近一次批次失败原因（未失败过/已成功 → undefined） */
+  get lastError(): string | undefined {
+    return this.lastErrorValue
+  }
 
   /**
    * 执行一个反思批次。route 缺省回退缓存的上次 route；无可用 route 且无缓存则
@@ -588,8 +595,14 @@ export class MemoryReflector {
         } else if (summary.decisions > 0) {
           this.cumulativeValue.emptyRounds = 0
         }
+        this.lastErrorValue = undefined
         return summary
       } catch (error) {
+        // Q-fix（2026-08-22）：失败原因必须可观测——此前 catch 仅 warn 到宿主控制台
+        // （用户不可见），RPC 层把 undefined 一律译成"无可用模型路由"，误导排障方向
+        // （实测：路由正常、批次 LLM 执行抛错，面板却提示配路由）。lastError 经
+        // ReflectTrigger.lastError 透传到面板；成功路径清除。
+        this.lastErrorValue = error instanceof Error ? error.message : String(error)
         this.deps.logger.warn('[dsh-memory] 反思批次执行失败：', error)
         return undefined
       }

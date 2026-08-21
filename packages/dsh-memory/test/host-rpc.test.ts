@@ -433,6 +433,33 @@ describe('memory RPC reflect 端点与自进化/因果观测', () => {
     expect((result.value as { ran: boolean }).ran).toBe(false)
   })
 
+  it('Q-fix：runOnce undefined + lastError → reason=反思批次失败:<err>（不再误标为路由问题）', async () => {
+    const { store, rpc } = setup()
+    const reflector = {
+      async runOnce() {
+        return undefined
+      },
+      lastError: 'LLM 400 Bad Request',
+    }
+    const handler = createMemoryRpcHandler(store, rpc, undefined, reflector)
+    const result = await handler('reflect', {})
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const value = result.value as { ran: boolean; reason?: string }
+    expect(value.ran).toBe(false)
+    expect(value.reason).toBe('反思批次失败：LLM 400 Bad Request')
+  })
+
+  it('Q-fix：runOnce undefined 且无 lastError → reason=no_model_route', async () => {
+    const { store, rpc } = setup()
+    const reflector = { async runOnce() { return undefined } }
+    const handler = createMemoryRpcHandler(store, rpc, undefined, reflector)
+    const result = await handler('reflect', {})
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect((result.value as { reason?: string }).reason).toBe('no_model_route')
+  })
+
   it('reflect：接线后 force 触发并返回观察量（面板无会话 → route 回退反思器缓存）', async () => {
     const { store, rpc } = setup()
     const reflector = {
