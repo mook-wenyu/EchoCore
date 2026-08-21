@@ -9,12 +9,14 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { DatabaseSync } from 'node:sqlite'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 
 import {
   MemoryReflector,
   PEER_MIN_JACCARD,
   PEER_MIN_TOKEN_OVERLAP,
+  REFLECT_CURSOR_KEY,
   REFLECT_INTERVAL_MS,
   REFLECT_SEMANTIC_THRESHOLD,
   REFLECT_SEMANTIC_THRESHOLD_LOCAL,
@@ -26,6 +28,7 @@ import {
   parseReflectionDecisions,
   selectReflectionPairs,
 } from '../src/reflect.js'
+import { SqliteKvTable } from '../src/sqlite-kv.js'
 import { MemoryStore } from '../src/store.js'
 import type { MemoryEntry } from '../src/types.js'
 import { FakeTable } from './helpers.js'
@@ -900,6 +903,115 @@ describe('阈值自适应中间档 0.70（hitRate [0.1,0.3] →0.70）', () => {
     expect(getSemanticThresholdForDim(384)).toBe(0.68)
     adjustThresholdByHitRate(0.35)
     expect(getSemanticThresholdForDim(384)).toBe(0.75)
+  })
+})
+
+/**
+ * P1 反思水位线（2026-08-20 用户拍板）：自动路径只审严格新于游标的焦点（peer 全窗
+ * 不变），游标持久化于 meta:reflectCursor 跨重启生效；手动 force 无视水位线全窗复审；
+ * 失败不推进游标。语义依据：Mem0（arXiv:2504.19413）增量处理范式——每轮只处理新
+ * 交换，避免把同一窗口重复送 LLM 浪费 token。
+ */
+describe('P1 反思水位线（metaTable 注入）', () => {
+  /** 可变时钟 + 真 sqlite meta 表的被测对象组装 */
+  function makeWatermarkReflector(entries: MemoryEntry[], json: string, reasonKind: 'stop' | 'error' = 'stop') {
+    const db = new DatabaseSync(':memory:')
+    const metaTable = new SqliteKvTable<string, string>(db, 'meta')
+    const table = new FakeTable()
+    const store = new MemoryStore(table, () => NOW)
+    for (const entry of entries) void table.put(entry.id, entry)
+    const llm = new FakeLlm(textStream(json, reasonKind))
+    const warns: unknown[] = []
+    const infos: unknown[] = []
+    let nowMs = NOW
+    const reflector = new MemoryReflector({
+      store,
+      llm: llm as never,
+      logger: { warn: (...args: unknown[]) => warns.push(args), info: (...args: unknown[]) => infos.push(args) },
+      now: () => nowMs,
+      metaTable,
+    })
+    return { table, store, llm, reflector, warns, infos, metaTable, advanceMs: (ms: number) => (nowMs += ms) }
+  }
+
+  /** 水位线场景条目：old1/old2 构成带内相似对（首轮可触发 LLM）；new1 后到（新于游标） */
+  function watermarkEntries() {
+    return [
+      makeEntry({ id: 'wmOld1', content: 'alpha beta gamma delta epsilon', importance: 5, createdAt: new Date(NOW - 2 * MS_PER_DAY).toISOString() }),
+      makeEntry({ id: 'wmOld2', content: 'alpha beta gamma delta', importance: 5, createdAt: new Date(NOW - MS_PER_DAY).toISOString() }),
+    ]
+  }
+
+  it('自动路径增量审：首轮全窗并落游标；新增条目后二轮只以新条目为焦点', async () => {
+    const { table, llm, reflector, metaTable, advanceMs } = makeWatermarkReflector(watermarkEntries(), '{"decisions":[]}')
+    // 首轮（自动，非 force）：窗口两条均无游标约束 → 全窗审，LLM 一次
+    const first = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    expect(first?.reviewed).toBeGreaterThan(0)
+    expect(llm.calls).toHaveLength(1)
+    // 游标 = 窗口最新条目 wmOld2（createdAt NOW-1d），已持久化
+    const cursorRaw = metaTable.get(REFLECT_CURSOR_KEY) as unknown as string
+    expect(JSON.parse(cursorRaw)).toEqual({ createdAt: new Date(NOW - MS_PER_DAY).toISOString(), id: 'wmOld2' })
+
+    // 过周期门控 + 新增一条新于游标的条目
+    advanceMs(REFLECT_INTERVAL_MS + 1_000)
+    await table.put(
+      'wmNew1',
+      makeEntry({ id: 'wmNew1', content: 'alpha beta gamma delta zeta', importance: 5, createdAt: new Date(NOW).toISOString() }),
+    )
+    const second = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    expect(second?.reviewed).toBeGreaterThan(0)
+    expect(llm.calls).toHaveLength(2)
+    const secondText = JSON.stringify(llm.calls[1])
+    expect(secondText).toContain('焦点 #wmNew1') // 新条目作焦点
+    expect(secondText).not.toContain('焦点 #wmOld') // 旧条目不再占焦点（仍可作对比 peer）
+    // 游标推进为 wmNew1
+    expect(JSON.parse(metaTable.get(REFLECT_CURSOR_KEY) as unknown as string)).toEqual({
+      createdAt: new Date(NOW).toISOString(),
+      id: 'wmNew1',
+    })
+  })
+
+  it('无新增快路径：窗口均不新于游标 → reviewed=0 且不打 LLM（info 可观测）', async () => {
+    const { llm, reflector, infos, advanceMs } = makeWatermarkReflector(watermarkEntries(), '{"decisions":[]}')
+    await reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    advanceMs(REFLECT_INTERVAL_MS + 1_000)
+    const summary = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    expect(summary?.reviewed).toBe(0)
+    expect(llm.calls).toHaveLength(1) // 二轮未再打 LLM
+    expect(infos.some((args) => String(args).includes('均不新于游标'))).toBe(true)
+  })
+
+  it('force 无视水位线：游标存在且无新增时仍全窗复审（手动点击语义）', async () => {
+    const { llm, reflector } = makeWatermarkReflector(watermarkEntries(), '{"decisions":[]}')
+    await reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    const forced = await reflector.runOnce({ provider: 'deepseek', model: 'm' }, { force: true })
+    expect(forced?.reviewed).toBeGreaterThan(0)
+    expect(llm.calls).toHaveLength(2) // force 打破"不打 LLM"快路径
+  })
+
+  it('失败不落盘：LLM 流错误 → runOnce 自收容返回 undefined，游标保持未写', async () => {
+    const { reflector, metaTable } = makeWatermarkReflector(watermarkEntries(), '{"decisions":[]}', 'error')
+    const result = await reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    expect(result).toBeUndefined()
+    expect(metaTable.get(REFLECT_CURSOR_KEY)).toBeUndefined()
+  })
+
+  it('跨重启恢复：新 reflector 实例从 meta 表读回游标，无新增时不打 LLM', async () => {
+    const shared = makeWatermarkReflector(watermarkEntries(), '{"decisions":[]}')
+    await shared.reflector.runOnce({ provider: 'deepseek', model: 'm' })
+    shared.advanceMs(REFLECT_INTERVAL_MS + 1_000)
+    // 模拟重启：同 meta 表新建实例（进程内态全丢）
+    const db2 = shared.metaTable // 同一表实例即同一存储
+    const reborn = new MemoryReflector({
+      store: shared.store,
+      llm: shared.llm as never,
+      logger: { warn: () => {}, info: () => {} },
+      now: () => NOW + REFLECT_INTERVAL_MS + 2_000,
+      metaTable: db2,
+    })
+    const summary = await reborn.runOnce({ provider: 'deepseek', model: 'm' })
+    expect(summary?.reviewed).toBe(0)
+    expect(shared.llm.calls).toHaveLength(1) // 重启后首轮未打 LLM（游标已恢复）
   })
 })
 

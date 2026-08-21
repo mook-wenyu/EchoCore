@@ -22,6 +22,7 @@
 
 import { BlockAssembler, createUserMessage, type LlmRuntime, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
+import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 // P0 卡死修复后 pairSim 改用预取向量+预计算范数的内联点积（与 cosineSimilarity 数学
 // 恒等），本模块不再直接依赖 embed-index 运行时导出
@@ -127,7 +128,18 @@ export interface ReflectionDeps {
   embedding?: { getVector(id: string): Float32Array | undefined }
   /** 延迟取向量索引（hot-swap 守卫；非测试场景由装配层注入） */
   getEmbeddingIndex?: () => { getVector(id: string): Float32Array | undefined } | undefined
+  /**
+   * 水位线持久化表（P1，2026-08-20 用户拍板；可选）：SqliteKvTable meta 表实例。
+   * 键 REFLECT_CURSOR_KEY='reflectCursor'，值 JSON {createdAt,id}——上次成功反思窗口
+   * 最新条目游标。自动路径只审严格新于游标的焦点（peer 全窗不变），避免每轮把同一
+   * 窗口重复送 LLM（Mem0 arXiv:2504.19413 增量处理范式同构）；手动 force 无视水位线
+   * 全窗复审。缺省（未注入）= 水位线关闭，行为与旧版全窗一致（测试兼容面）。
+   */
+  metaTable?: KvTable<string, string>
 }
+
+/** 反思水位线在 meta 表中的键名（与维护游标 lastCursor 同表不同键，互不干扰） */
+export const REFLECT_CURSOR_KEY = 'reflectCursor'
 
 /** 本轮反思观察量 */
 export interface ReflectionSummary {
@@ -450,9 +462,54 @@ export class MemoryReflector {
   private lastSummaryValue: ReflectionSummary | null = null
   /** 2b：跨轮累计观测量（轻量质量钩子，见 ReflectionCumulative 说明；进程内态） */
   private cumulativeValue: ReflectionCumulative = { runs: 0, decisions: 0, merged: 0, archived: 0, skipped: 0, emptyRounds: 0 }
+  /**
+   * 水位线游标（P1）：上次成功反思窗口最新条目 (createdAt,id)。
+   * 懒加载自 metaTable（跨重启持久）；未注入 metaTable 时恒 null（水位线关闭）。
+   */
+  private reflectCursorValue: { createdAt: string; id: string } | null = null
+  /** 游标是否已尝试懒加载（防每轮重复读表） */
+  private cursorLoaded = false
 
   constructor(deps: ReflectionDeps) {
     this.deps = deps
+  }
+
+  /** 当前水位线游标（可观测；未注入 metaTable 或从未成功反思时 null） */
+  get reflectCursor(): { createdAt: string; id: string } | null {
+    return this.reflectCursorValue
+  }
+
+  /** 懒加载持久化游标（首次 runOnce 前执行一次；损坏/缺失不阻断，视为无水位线） */
+  private loadCursorIfNeeded(): void {
+    if (this.cursorLoaded) return
+    this.cursorLoaded = true
+    const meta = this.deps.metaTable
+    if (meta === undefined) return
+    try {
+      const raw = meta.get(REFLECT_CURSOR_KEY)
+      if (raw === undefined || raw === null || raw === '') return
+      const parsed = JSON.parse(raw as unknown as string) as { createdAt?: unknown; id?: unknown }
+      if (typeof parsed.createdAt === 'string' && typeof parsed.id === 'string') {
+        this.reflectCursorValue = { createdAt: parsed.createdAt, id: parsed.id }
+      }
+    } catch (error) {
+      // 损坏游标仅告警并按"无水位线"处理（下轮全窗复审后重写游标自愈）
+      this.deps.logger.warn('[dsh-memory] 反思水位线游标损坏（按无水位线处理）：', error)
+    }
+  }
+
+  /** 推进并持久化游标为窗口最新条目（listRecent 首位）；空窗口/未注表不动作。失败仅告警。 */
+  private async advanceCursorToNewest(candidates: MemoryEntry[]): Promise<void> {
+    const newest = candidates[0]
+    if (newest === undefined) return
+    this.reflectCursorValue = { createdAt: newest.createdAt, id: newest.id }
+    const meta = this.deps.metaTable
+    if (meta === undefined) return
+    try {
+      await meta.put(REFLECT_CURSOR_KEY, JSON.stringify(this.reflectCursorValue))
+    } catch (error) {
+      this.deps.logger.warn('[dsh-memory] 反思水位线持久化失败（下轮可能重复审旧窗口）：', error)
+    }
   }
 
   /** 最近一次成功执行时刻 ISO（未运行 null） */
@@ -499,8 +556,10 @@ export class MemoryReflector {
         this.deps.logger.warn('[dsh-memory] 无可用模型路由，跳过反思（RPC 无会话场景）')
         return undefined
       }
+      // 水位线懒加载（P1）：自动路径以游标为焦点下界（只审新增）；force 全窗复审
+      this.loadCursorIfNeeded()
       try {
-        const summary = await this.runReflection(resolved)
+        const summary = await this.runReflection(resolved, { focusNewerThan: force ? undefined : this.reflectCursorValue })
         const nowIso = new Date(this.deps.now()).toISOString()
         this.lastRunAtValue = nowIso
         this.lastRunAtMs = this.deps.now()
@@ -534,12 +593,36 @@ export class MemoryReflector {
     return run
   }
 
-  /** 执行反思主体：拉候选 → 选焦点对 → 渲染 → 单次 LLM → 逐条执行 */
-  private async runReflection(route: { provider: string; model: string }): Promise<ReflectionSummary> {
+  /**
+   * 执行反思主体：拉候选 → 选焦点对 → 渲染 → LLM 批次 → 逐条执行。
+   * opts.focusNewerThan（P1 水位线）：提供时仅严格新于该游标的条目可作焦点
+   * （(createdAt,id) 字典序比较，与 listRecent 排序/maintenance 游标同语义）；
+   * peer 仍取全窗——旧条目可作为新焦点的对比上下文。成功结束（含执行完裁决）
+   * 后把游标推进为窗口最新条目；LLM 失败抛出走 runOnce 的 catch，游标不动。
+   */
+  private async runReflection(
+    route: { provider: string; model: string },
+    opts?: { focusNewerThan?: { createdAt: string; id: string } | null },
+  ): Promise<ReflectionSummary> {
     const candidates = this.deps.store.listRecent(REFLECT_WINDOW, 'active')
     // hot-swap 守卫：优先用 getter（延迟读 holder.index），回退静态 embedding
     const embeddingIndex = this.deps.getEmbeddingIndex?.() ?? this.deps.embedding
-    const pairs = await selectReflectionPairs(candidates, embeddingIndex)
+    // 水位线增量：计算焦点资格集（严格新于游标）；空集 ⇒ 无焦点 ⇒ 自然走零 LLM 快路径
+    let focusEligible: ReadonlySet<string> | undefined
+    const floor = opts?.focusNewerThan
+    if (floor !== undefined && floor !== null) {
+      focusEligible = new Set(
+        candidates
+          .filter((e) => e.createdAt > floor.createdAt || (e.createdAt === floor.createdAt && e.id > floor.id))
+          .map((e) => e.id),
+      )
+      if (focusEligible.size === 0) {
+        this.deps.logger.info(
+          `[dsh-memory] 反思水位线：窗口 ${candidates.length} 条均不新于游标（${floor.createdAt}/${floor.id.slice(0, 8)}），跳过本轮不打 LLM`,
+        )
+      }
+    }
+    const pairs = await selectReflectionPairs(candidates, embeddingIndex, { focusEligible })
     const reviewed = pairs.filter((pair) => pair.peers.length > 0).length
     // 可观测：向量覆盖率（语义救援能力的直观度量）
     // 2026-08-18 调优：向量覆盖仅 21.8% 时双侧命中 p²≈3.5%，救援失效；暴露覆盖率便于
@@ -577,6 +660,8 @@ export class MemoryReflector {
     for (const decision of decisions) {
       await this.applyDecision(decision, summary)
     }
+    // 水位线推进（P1）：本轮窗口已审毕，游标 = 窗口最新条目；失败路径不会到达此处
+    await this.advanceCursorToNewest(candidates)
     return summary
   }
 

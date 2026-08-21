@@ -276,6 +276,10 @@ export async function mountMemory(
   // SqliteKvTable 泛型自动 CREATE TABLE IF NOT EXISTS，无迁移成本）
   const edgeTable = new SqliteKvTable<MemoryCausalEdge>(db, 'memory_causal_edges')
   const causalStore = new MemoryCausalStore(edgeTable, () => Date.now())
+  // meta 表（P1 游标持久化，2026-08-20）：维护游标 lastCursor + 反思水位线 reflectCursor
+  // 共用一表不同键。此前 maintenance 未接 metaTable（装配缺陷）——生产游标分片静默
+  // 退化为进程内态、重启归零；本次一并补线。
+  const metaTable = new SqliteKvTable<string>(db, 'meta')
 
   // 嵌入后端持有者 + 实时生效器接线（面板保存热换嵌入后端，不重启插件——
   // 重启与 apply 秒级异步段竞态，2026-08-16 实测 fatal load failure，见上方
@@ -384,6 +388,8 @@ export async function mountMemory(
     // 热换后 getter 每次读取最新值（与 store hooks/injector 同模式）
     embedding: holder.index,
     getEmbeddingIndex: () => holder.index,
+    // P1 水位线（2026-08-20 拍板）：自动路径只审新增焦点，跨重启持久于 meta:reflectCursor
+    metaTable,
   })
   const causalExtractor = new MemoryCausalExtractor({ store, causal: causalStore, llm: ctx.llm, logger, now: () => Date.now() })
   // 后台整理任务（O8-M）：定时合并重复、过期降级、标签整理（间隔已常量化，恒启用）；
@@ -395,6 +401,9 @@ export async function mountMemory(
     reflector,
     causal: causalExtractor,
     backfill: (budget) => holder.index?.backfill(budget) ?? Promise.resolve(0),
+    // 补线（装配缺陷修复）：维护游标 lastCursor 此前未持久化（重启归零、44 周期
+    // 全库轮询实际从未跨重启续跑）；现接入 meta 表恢复设计语义。
+    metaTable,
   })
   maintenance.install(ctx)
 
