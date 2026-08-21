@@ -1,31 +1,31 @@
 # STATUS · EchoCore
 
-> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（"运行反思"六层修复：路由/inject/可观测/截断拦截/推理档/批大小结构性收敛——单批输出需求已压至预算内，待重启复跑）。
+> 会话收尾仪表盘（AGENTS.md §9）。最后更新：2026-08-22（反思链路端到端打通并首轮产出：审60·裁174·合并2·跳172；质量实证→候选排除模板条目+跳过原因细分）。
 
 ## 一、架构健康度
 
 - 模块总数：28 源模块 + client 面板 + docs 三页；无新增代码模块
 - 依赖方向：`index.ts`（组合根）→ 各模块，无环
-- 单元测试 **640 全绿 / 10 门控跳过**（DSH_BENCH×2 组）+ typecheck 干净；GitHub CI 随 push 验证
-- 生产：新代码链路已验证（vec2 迁移/压缩触发/观测面），本轮修复待重启生效
+- 单元测试 **649 全绿 / 10 门控跳过** + typecheck 干净；CI 随 push 验证
+- **反思链路生产实证**：路由解析 ✓ → 批次 LLM 调用 ✓ → 裁决执行 ✓（merged=2 真实归档）；批大小 8 / maxTokens 32768 / reasoningEffort=low
 
-## 二、本次变更影响范围（"运行反思"无可用路由根因修复）
+## 二、本次变更影响范围（反思链路六层修复 + 首轮产出与质量实证）
 
-**根因（双层全错，源码级实证）**：`getDefaultModel` 旧实现两路皆废——① 猜测 `ctx.get('settings').get('agent-default-model')` 契约不存在；② ESM 产物里调 CJS `require('node:fs')` 读 YAML，ReferenceError 被空 `catch {}` 静默吞掉 → 恒返回 undefined → 面板点击"运行反思"恒报"无可用模型路由"。settings.yaml 中数据一直存在（opencode-new/x-preview-f-free）。
+**六层根因修复全记录**：① getDefaultModel 改官方 ctx.agentDefaultModel 服务（55d222a）；② inject 补登 agentDefaultModel——Cordis 守卫（ee4fc22）；③ 失败可观测 lastError 透传面板（6fd0241，用户复测确认生效）；④ max_tokens 截断显式失败+上限 1024→4096（6114e83）；⑤ 推理模型思考链计入输出预算——reasoningEffort='low'+8192（db6e5b0）；⑥ 批大小两轮拍板最终=8 + 上限 32768 + 截断错误附 usage 诊断（a88c033/fe39542/663f035）。配置层：agent-default-model 由未注册的 opencode-new 修正为 opencode-go/mimo-v2.5。
 
-**修复（55d222a）**：改用官方契约 `ctx.agentDefaultModel.currentSelection()`——dsh-base 组合包注册的共享 Cordis 服务（apiproxy/headless 同款消费），返回叠加 settings.yaml 用户层后的选择。删除猜测性 YAML 手写解析兜底（ESM 下必死）；服务未挂载诚实返回 undefined；服务抛错向 RPC 边界传播（禁静默兜底）。新增 test/default-model.test.ts 四用例含**产物级回归钉住**（构建产物中不得再现 require 兜底字面量）。
+**首轮产出（用户复测）**：审 60 · 裁 174 · 合并 2 · 归档 0 · 跳过 172；跳过率 49.7%；语义命中率 75.5%。
 
-**接口契约变更**：rpcContextFrom 导出（供单测）；defaultModel 回退链行为变更（从恒空→正确解析宿主默认模型）。
+**质量实证与改进（64461be）**：cos≥0.97 的 Top 相似对全是"会话快照"模板条目（结构雷同词面虚高、语义上是独立审计事实不该互合并）——LLM 大量 none 属正确拒绝。两改：① 候选排除 snapshot/session-summary 标签条目（归档已有专属自动链）；② ReflectionSummary 增 skipNone/skipInvalid/skipSuperseded 细分计数。接口契约：ReflectionSummary 新增可选字段。
 
 ## 三、已知风险点（诚实自曝）
 
-1. 🔴 **明文密钥落盘（前轮拍板保留）**
-2. 🟡 **"运行反思"五层根因修复，待最终重启复跑**：① 官方路由服务（55d222a）；② inject 补登（ee4fc22）；③ 失败可观测 lastError 透传（6fd0241）——**用户复测确认生效：面板显形真实错误**；④ max_tokens 截断拦截+上限 4096（6114e83）；⑤ 推理模型思考链计入输出预算——reasoningEffort='low' + 上限 8192（db6e5b0）。另有配置层修正：agent-default-model 原指向未注册 provider（opencode-new），已改为 opencode-go/mimo-v2.5。选择器已实证正常（离线复现 60 焦点全带 peer）
-3. 🟢 原子化条目增速观察 / meta 双键残留 / reject 偶发嵌入浪费 / 反思 LLM 保守判 none 的裁决质量需多轮观察
+1. 🔴 明文密钥落盘（前轮拍板保留）
+2. 🟡 反思质量待细分数据校准：模板排除后下一轮的 skipNone/skipInvalid 分布才是模型保守度的真实读数；skipInvalid 高 ⇒ id 幻觉需提示词加固
+3. 🟢 原子化条目增速观察 / meta 双键残留 / reject 偶发嵌入浪费 / 每轮 8 批 LLM 成本（~8 次调用/force 轮）
 
 ## 四、下次最该做的事
 
-1. **重启 DSH 并复点"运行反思"**：预期正常执行（不再报无可用路由）；水位线首启后 meta 应出现 reflectCursor
-2. **数据面调优窗口**：injectStats/recallStats 积累一周后校准三参数
-3. **密钥迁移**：随时可做
+1. **重启后跑一轮反思**：读 skipNone/skipInvalid 细分——invalid 高则提示词加固 id 引用规则
+2. **数据面调优窗口**：injectStats/recallStats/反思细分积累一周后统一校准
+3. **密钥迁移**：随时可做；meta 双键清理可并入下次代码变更
 4. **CI 维护**：actions 升 v5 消 Node20 弃用警告（低优先）
